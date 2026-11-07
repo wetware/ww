@@ -430,6 +430,26 @@ impl<'a> Decoder<'a> {
     }
 }
 
+/// Single-block decoding of the version-1 bounded inline profile.
+///
+/// This namespace does not define a universal DAG-CBOR value model or a future
+/// persistent-collection interface.
+pub mod inline_v1 {
+    /// Enumerate CID links in a Map envelope or standalone inline-profile value.
+    ///
+    /// Map envelopes use Map budgets with their envelope excluded. If Map
+    /// decoding fails, standalone decoding starts at depth zero; for example,
+    /// `[2, {}]` is accepted as a list even though it is not a version-1 Map.
+    /// Both paths enforce the existing canonical encoding and profile limits.
+    /// Links preserve traversal order and repeated occurrences.
+    ///
+    /// This decodes one block only. It does not verify a content hash, fetch
+    /// descendants, validate graph closure, or establish retention.
+    pub fn links(bytes: &[u8]) -> anyhow::Result<Vec<cid::Cid>> {
+        super::links(bytes)
+    }
+}
+
 /// Strict profile link traversal for release-stage validation. Accepts Map
 /// envelopes with Map budgets, or standalone profile values with root depth 0.
 pub(crate) fn links(bytes: &[u8]) -> Result<Vec<Cid>> {

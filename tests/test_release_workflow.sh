@@ -43,12 +43,9 @@ if grep -Eq '\b(kubectl|ssh|scp|rsync|rollout|patch|scale)\b|set[[:space:]]+imag
   fail "image-release job must not contain a deployment transport or mutation command"
 fi
 
-# The IPFS publisher is the only workflow job that retains VPS transport for
-# this POC. Keeping SSH/kubectl out of every other job prevents a new deploy
-# job, namespaced mutation, or wrapper from silently restoring CI ownership of
-# ww-master.
+# Public jobs must not acquire infrastructure transport authority.
 if grep -Eq '\b(kubectl|ssh|scp|rsync)\b' <<<"$non_publish_workflow"; then
-  fail "only the IPFS publisher may use remote or Kubernetes transport"
+  fail "public workflow must not use remote or Kubernetes transport"
 fi
 
 grep -Fq "github.event_name == 'workflow_dispatch'" <<<"$release_job" \
@@ -106,44 +103,15 @@ grep -Fq 'docker load -i tested-image.tar' <<<"$release_job" || fail 'GHCR must 
 grep -Fq "            - 'scripts/**'" "$WORKFLOW" || fail 'installer-only changes must trigger release validation'
 grep -Fq 'test_release_descriptor_package.sh' "$WORKFLOW" || fail 'descriptor package validation missing'
 
-# Release secrets belong only to the guarded signing step. These assertions
-# inspect source boundaries; environment protection settings require operator
-# verification before activation.
-signing_step="$(awk '
-  /^    - name: Sign exact release checksum manifest$/ { capture = 1; print; next }
-  capture && /^    - / { exit }
-  capture { print }
-' "$WORKFLOW")"
-[[ -n "$signing_step" ]] || fail 'release manifest signing step missing'
-for condition in "github.repository == 'wetware/ww'" "github.ref == 'refs/heads/master'" \
-  "github.event_name == 'push'" "github.event_name == 'workflow_dispatch'" \
-  "needs.test.result == 'success'" "needs.validate-release.result == 'success'" \
-  "needs.release_image.result == 'success'"; do
-  grep -Fq "$condition" <<<"$signing_step" || fail "signing admission lost: $condition"
-done
-# shellcheck disable=SC2016
-grep -Fq 'WW_RELEASE_SIGNING_KEY: ${{ secrets.WW_RELEASE_SIGNING_KEY }}' <<<"$signing_step" \
-  || fail 'signing key must be a step-scoped secret'
-[[ "$(grep -Fc 'secrets.WW_RELEASE_SIGNING_KEY' "$WORKFLOW")" == 1 ]] \
-  || fail 'signing key must not be exposed to other steps'
-! grep -Fq 'secrets.WW_RELEASE_SIGNING_KEY' <<<"$non_publish_workflow" \
-  || fail 'build or PR jobs received a release signing key'
-grep -Fq '    environment: release-signing' "$WORKFLOW" \
-  || fail 'signing requires a protected environment boundary'
-grep -Fq 'set +x' <<<"$signing_step" || fail 'signing must disable tracing'
-grep -Fq 'umask 077' <<<"$signing_step" || fail 'private key file permissions missing'
-grep -Fq 'unset WW_RELEASE_SIGNING_KEY WW_RELEASE_TRUSTED_KEYS' <<<"$signing_step" \
-  || fail 'signing subprocesses must not inherit the key secret'
-# shellcheck disable=SC2016
-grep -Fq 'mktemp -d "$RUNNER_TEMP/ww-signing.XXXXXXXX"' <<<"$signing_step" \
-  || fail 'private key must remain outside build and release artifacts'
-transport_step="$(awk '
-  /^    - name: Finalize authenticated release package$/ { capture = 1; next }
-  capture && /^    - / { exit }
-  capture { print }
-' "$WORKFLOW")"
-grep -Fq "if: steps.release-signature.outcome == 'success'" <<<"$transport_step" \
-  || fail 'package finalization must require successful manifest authentication'
+# Official signing and publication policy belong to private wetware/infra.
+# Public CI builds artifacts and verifies them with disposable fixture keys.
+if grep -Eq 'secrets\.WW_RELEASE_SIGNING_KEY|environment: release-signing|wetware/infra|request-release\.py|ww-release-publisher' "$WORKFLOW"; then
+  fail 'public workflow retains private signing, source, or publisher access'
+fi
+grep -Fq 'cargo build --locked -p ww-release --features package --bin ww-release-package' "$WORKFLOW" \
+  || fail 'public offline package tool build missing'
+grep -Fq 'name: Validate public release package library' "$WORKFLOW" \
+  || fail 'public package feature tests missing'
 
 # Freeze the existing job-level admission controls during the maintenance hold.
 # This covers ordinary Rust/metrics CI, release validation, GHCR and Pages.

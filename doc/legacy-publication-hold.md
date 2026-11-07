@@ -1,7 +1,10 @@
 # Legacy IPFS publication hold
 
 `.github/workflows/rust.yml` keeps `jobs.publish.if: ${{ false }}`. The held job
-prepares signed release artifacts and then refuses infrastructure publication.
+only refuses infrastructure publication. Public CI builds and validates artifacts.
+Official signing/publication moved to inactive private infra workflows; the
+[operator contract](https://github.com/wetware/infra/blob/master/ops/vps/publisher-contract.md)
+retains the activation gates.
 The obsolete official publisher scripts are removed. `make publish` refuses
 before builds or external calls. `publish-std` remains a separate developer
 command; it does not authorize official release publication.

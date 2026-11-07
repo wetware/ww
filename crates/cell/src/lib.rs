@@ -15,6 +15,7 @@ pub mod loaders;
 pub mod metrics;
 pub mod mount;
 pub mod p3;
+pub mod packaging;
 pub mod proc;
 pub mod routing_key;
 pub mod sched;

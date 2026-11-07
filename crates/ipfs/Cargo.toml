@@ -21,7 +21,13 @@ sha2 = "0.10"
 cache = { package = "ww-cache", path = "../cache" }
 tokio = { workspace = true, features = ["fs", "io-util", "time"] }
 tracing = { workspace = true }
+chrono = { version = "0.4.42", features = ["serde"] }
+libp2p-identity = { workspace = true, features = ["peerid"] }
+# Preserve the exact V2-only record verification pin used by the Host.
+rust-ipns = { git = "https://github.com/wetware/rust-ipfs", rev = "c6770c290e4aa03f5cf6e550f44ac518308b7094", default-features = false, features = ["ed25519", "rsa"] }
 
 [dev-dependencies]
+hex = { workspace = true }
+libp2p-identity = { workspace = true, features = ["ed25519", "rand"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }

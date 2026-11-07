@@ -18,12 +18,12 @@ use chrono::Utc;
 use cid::{multihash::Multihash, Cid, Version};
 use ipfs::map::{Map, Value};
 use ipld_dagpb::PbNode;
-use libp2p::identity::PeerId;
+use libp2p_identity::PeerId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ipns::{canonical_name, parse_name, SignedRecord, MAX_RECORD_SIZE};
-use crate::release::auth::{TrustedKeys, MAX_MANIFEST_BYTES};
+use crate::auth::{TrustedKeys, MAX_MANIFEST_BYTES};
+use ipfs::ipns::{canonical_name, parse_name, SignedRecord, MAX_RECORD_SIZE};
 
 pub const COMPATIBILITY_PROFILE: &str = "wetware-host-pid0-p3-v1";
 pub const BINDING_PATH: &str = "RELEASE-DESCRIPTOR";

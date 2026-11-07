@@ -314,23 +314,14 @@ esac
         self.manifest.write_bytes(self.manifest.read_bytes().replace(b'# sha256', b'# blake3'))
         self.run_signer()
 
-    def test_signer_ci_admission(self):
-        self.env.update(GITHUB_ACTIONS='true', GITHUB_REPOSITORY='wetware/ww',
-                        GITHUB_REF='refs/heads/master', GITHUB_EVENT_NAME='push')
+    def test_reusable_signer_does_not_allocate_workflow_authority(self):
+        # The caller owns CI admission. The reusable signer receives explicit
+        # fixture keys and still verifies the exact bytes against public trust.
+        self.env.update(GITHUB_ACTIONS='true', GITHUB_REPOSITORY='example/release',
+                        GITHUB_REF='refs/heads/candidate', GITHUB_EVENT_NAME='workflow_dispatch')
         self.run_signer(success=True)
-        self.env['GITHUB_EVENT_NAME'] = 'workflow_dispatch'
-        self.run_signer(success=True)
-        for name, value in [('GITHUB_EVENT_NAME', 'pull_request'),
-                            ('GITHUB_EVENT_NAME', 'pull_request_target'),
-                            ('GITHUB_EVENT_NAME', 'workflow_run'),
-                            ('GITHUB_REF', 'refs/pull/412/merge'),
-                            ('GITHUB_REF', 'refs/heads/staging'),
-                            ('GITHUB_REPOSITORY', 'attacker/ww')]:
-            with self.subTest(name=name, value=value):
-                saved = self.env[name]
-                self.env[name] = value
-                self.run_signer()
-                self.env[name] = saved
+        self.keys.write_bytes(self.other_keys.read_bytes())
+        self.run_signer()
 
 
 if __name__ == '__main__':

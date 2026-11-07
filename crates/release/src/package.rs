@@ -1,13 +1,19 @@
 //! Bounded offline construction and acquisition of authenticated release graphs.
 //!
-//! The spool is immutable candidate data. Publication authority remains in the
-//! existing `ipfs::release::Owner` journal. File chunks and retention stages are
-//! bounded independently of the complete release size.
+//! The spool is immutable candidate data. Publication authority belongs to the
+//! caller. Construction and acquisition validate the complete bounded graph;
+//! neither operation selects publication authority or claims retention.
 
+use crate::{
+    auth::TrustedKeys,
+    descriptor::{
+        Artifact, AuthenticatedRelease, DeploymentArtifact, Descriptor, HostArtifact, Provenance,
+        BINDING_PATH, COMPATIBILITY_PROFILE, DESCRIPTOR_LINK_NAME,
+    },
+};
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use cid::Cid;
-use ipfs::release::{Owner, Retention};
 use ipld_dagpb::{PbLink, PbNode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,19 +23,9 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use ww::release::{
-    auth::TrustedKeys,
-    descriptor::{
-        Artifact, AuthenticatedRelease, DeploymentArtifact, Descriptor, HostArtifact, Provenance,
-        BINDING_PATH, COMPATIBILITY_PROFILE, DESCRIPTOR_LINK_NAME,
-    },
-};
 
 const CHUNK_BYTES: usize = 1024 * 1024;
 const BLOCK_BYTES: usize = 2 * 1024 * 1024;
-const STAGE_BYTES: usize = 32 * 1024 * 1024;
-const STAGE_BLOCKS: usize = 16_384;
-const STAGE_LINKS: usize = 65_536;
 const FANOUT: usize = 16;
 const MAX_BLOCKS: usize = 32_768;
 const MAX_GRAPH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -46,104 +42,6 @@ pub struct Metadata {
     pub version: String,
     pub source: Provenance,
     pub hosts: BTreeMap<String, Provenance>,
-}
-
-/// Encode workflow and rerun order without allowing a rerun to overtake a later run.
-pub fn release_sequence(run_number: i64, run_attempt: i64) -> Result<u64> {
-    ensure!(
-        (1..(1 << 47)).contains(&run_number) && (1..(1 << 16)).contains(&run_attempt),
-        "release workflow counter exceeds the signed sequence profile"
-    );
-    Ok(((run_number as u64) << 16) | run_attempt as u64)
-}
-
-/// Bind each staged Host to its original producer receipts before preparation.
-pub fn metadata(
-    artifacts: &Path,
-    tree: &Path,
-    channel: String,
-    sequence: u64,
-    builder: String,
-) -> Result<Metadata> {
-    let valid_revision = |revision: &str| {
-        revision.len() == 40
-            && revision
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
-    let revision = fs::read_to_string(tree.join("REVISION"))?.trim().to_owned();
-    ensure!(
-        valid_revision(&revision) && sequence > 0,
-        "invalid release revision or sequence"
-    );
-    let mut hosts = BTreeMap::new();
-    for (platform, target) in [
-        ("linux-x86_64", "x86_64-unknown-linux-gnu"),
-        ("linux-aarch64", "aarch64-unknown-linux-gnu"),
-        ("macos-aarch64", "aarch64-apple-darwin"),
-        ("macos-x86_64", "x86_64-apple-darwin"),
-        ("linux-musl-x86_64", "x86_64-unknown-linux-musl"),
-    ] {
-        let directory = artifacts.join(format!("ww-{platform}"));
-        for name in ["REVISION", "SHA256SUMS", "PROVENANCE.json"] {
-            let path = directory.join(name);
-            ensure!(
-                fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()),
-                "invalid producer receipt: {}",
-                path.display()
-            );
-        }
-        let actual_revision = fs::read_to_string(directory.join("REVISION"))?
-            .trim()
-            .to_owned();
-        ensure!(
-            valid_revision(&actual_revision),
-            "invalid Host build revision"
-        );
-        let binary = tree.join(ww::release::descriptor::platform_path(target)?);
-        ensure!(
-            fs::symlink_metadata(&binary).is_ok_and(|metadata| metadata.is_file()),
-            "invalid staged Host: {}",
-            binary.display()
-        );
-        let mut host = File::open(binary)?;
-        let mut hash = Sha256::new();
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let len = host.read(&mut buffer)?;
-            if len == 0 {
-                break;
-            }
-            hash.update(&buffer[..len]);
-        }
-        ensure!(
-            fs::read_to_string(directory.join("SHA256SUMS"))?
-                == format!("{}  ww\n", hex::encode(hash.finalize())),
-            "Host checksum receipt mismatch"
-        );
-        let receipt: serde_json::Value =
-            serde_json::from_slice(&fs::read(directory.join("PROVENANCE.json"))?)?;
-        let receipt: Provenance =
-            serde_json::from_value(receipt).context("Host provenance receipt mismatch")?;
-        ensure!(
-            receipt.repository == ww::release::descriptor::SOURCE_REPOSITORY
-                && receipt.revision == actual_revision
-                && !receipt.builder.is_empty(),
-            "Host provenance receipt mismatch"
-        );
-        hosts.insert(target.into(), receipt);
-    }
-    Ok(Metadata {
-        channel,
-        sequence,
-        version: fs::read_to_string(tree.join("VERSION"))?.trim().to_owned(),
-        source: Provenance {
-            repository: ww::release::descriptor::SOURCE_REPOSITORY.into(),
-            revision,
-            builder,
-        },
-        hosts,
-    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -184,9 +82,9 @@ pub fn prepare(tree: &Path, spool: &Path, metadata: Metadata) -> Result<Descript
             == format!("{}\n", metadata.source.revision).as_bytes(),
         "REVISION differs from release source"
     );
-    let kernel = ww::packaging::read_payload(&tree.join("fhs/boot/kernel.wasm"))?;
-    let status = ww::packaging::read_payload(&tree.join("fhs/bin/status.wasm"))?;
-    ww::packaging::verify_fhs(&tree.join("fhs"), &kernel, &status)?;
+    let kernel = cell::packaging::read_payload(&tree.join("fhs/boot/kernel.wasm"))?;
+    let status = cell::packaging::read_payload(&tree.join("fhs/bin/status.wasm"))?;
+    cell::packaging::verify_fhs(&tree.join("fhs"), &kernel, &status)?;
     let mut builder = Builder::new(spool)?;
     ensure!(
         !spool.canonicalize()?.starts_with(tree.canonicalize()?),
@@ -195,7 +93,7 @@ pub fn prepare(tree: &Path, spool: &Path, metadata: Metadata) -> Result<Descript
     builder.scan(tree, "", 0, true)?;
     let mut hosts = Vec::new();
     for (target, provenance) in metadata.hosts {
-        let path = ww::release::descriptor::platform_path(&target)?;
+        let path = crate::descriptor::platform_path(&target)?;
         hosts.push(HostArtifact {
             target,
             artifact: builder
@@ -244,7 +142,7 @@ pub fn prepare(tree: &Path, spool: &Path, metadata: Metadata) -> Result<Descript
         manifest.push_str(&format!("{}  {path}\n", hex::encode(file.sha256)));
     }
     ensure!(
-        manifest.len() <= ww::release::auth::MAX_MANIFEST_BYTES,
+        manifest.len() <= crate::auth::MAX_MANIFEST_BYTES,
         "release manifest exceeds limit"
     );
     fs::write(tree.join("CHECKSUMS.txt"), manifest)?;
@@ -255,7 +153,7 @@ pub fn prepare(tree: &Path, spool: &Path, metadata: Metadata) -> Result<Descript
 pub fn finalize(tree: &Path, spool: &Path, keys: &TrustedKeys) -> Result<Package> {
     let descriptor_bytes = read_bounded(&tree.join(DESCRIPTOR_FILE), ipfs::map::MAX_BLOCK_BYTES)?;
     let binding = read_bounded(&tree.join(BINDING_PATH), 256)?;
-    let descriptor_cid = ww::release::descriptor::binding_cid(&binding)?;
+    let descriptor_cid = crate::descriptor::binding_cid(&binding)?;
     Descriptor::decode(descriptor_cid, &descriptor_bytes)?;
     let mut builder = Builder::new(spool)?;
     ensure!(
@@ -276,15 +174,6 @@ pub fn finalize(tree: &Path, spool: &Path, keys: &TrustedKeys) -> Result<Package
     Ok(package)
 }
 
-#[derive(Debug)]
-struct Stage {
-    root: Cid,
-    blocks: Vec<Cid>,
-}
-struct Index {
-    root: Cid,
-    stages: Vec<Stage>,
-}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootIndex {
@@ -292,10 +181,13 @@ struct RootIndex {
     root: Cid,
 }
 
-/// An immutable candidate graph on disk. Only one bounded stage enters memory.
+/// An immutable candidate graph on disk, validated before it is returned.
+///
+/// Opening or fetching content does not authenticate release authority. Call
+/// [`Self::authenticate`] with independently trusted keys before using artifacts.
 pub struct Package {
     spool: PathBuf,
-    index: Index,
+    root: Cid,
 }
 impl Package {
     pub fn open(spool: &Path) -> Result<Self> {
@@ -308,10 +200,7 @@ impl Package {
         Builder::new(spool)?.package(index.root)
     }
     pub fn root(&self) -> Cid {
-        self.index.root
-    }
-    pub fn stage_count(&self) -> usize {
-        self.index.stages.len()
+        self.root
     }
     fn save(&self) -> Result<()> {
         fs::write(
@@ -323,8 +212,17 @@ impl Package {
         )?;
         Ok(())
     }
-    fn read_block(&self, cid: &Cid) -> Result<Vec<u8>> {
+    /// Read one bounded block and verify its supported codec and SHA-256 CID.
+    pub fn read_block(&self, cid: &Cid) -> Result<Vec<u8>> {
         read_block(&self.spool, cid)
+    }
+
+    /// Enumerate links from one verified package block.
+    ///
+    /// DAG-CBOR package blocks must be version-1 Map envelopes. Standalone
+    /// inline-profile values accepted by `ipfs::map::inline_v1` are not accepted.
+    pub fn links(&self, cid: &Cid) -> Result<Vec<Cid>> {
+        links(cid, &self.read_block(cid)?)
     }
 
     /// Acquire candidate blocks from Kubo without claiming retention or authority.
@@ -368,7 +266,7 @@ impl Package {
     /// Verify authority, descriptor links, reconstructed payload hashes/sizes,
     /// and exact artifact paths before beginning any publication operation.
     pub fn authenticate(&self, keys: &TrustedKeys) -> Result<AuthenticatedRelease> {
-        let manifest = self.file_bytes("CHECKSUMS.txt", ww::release::auth::MAX_MANIFEST_BYTES)?;
+        let manifest = self.file_bytes("CHECKSUMS.txt", crate::auth::MAX_MANIFEST_BYTES)?;
         let signature = self.file_bytes("CHECKSUMS.txt.sig", 64)?;
         let binding = self.file_bytes(BINDING_PATH, 256)?;
         let descriptor_cid = self.resolve(DESCRIPTOR_LINK_NAME)?;
@@ -430,69 +328,6 @@ impl Package {
         Ok(release)
     }
 
-    pub async fn retain<R: Retention + ?Sized>(
-        &self,
-        owner: &mut Owner,
-        generation: u64,
-        backend: &R,
-    ) -> Result<()> {
-        let release = owner
-            .releases()?
-            .iter()
-            .find(|release| release.publication.generation == generation)
-            .context("unknown release generation")?;
-        ensure!(
-            release.publication.root == self.root(),
-            "package differs from candidate root"
-        );
-        if matches!(
-            release.state,
-            ipfs::release::ReleaseState::Retained | ipfs::release::ReleaseState::Published
-        ) {
-            return Ok(());
-        }
-        for stage in &self.index.stages {
-            // A pending later stage must be reconciled before any other root.
-            // Earlier acknowledged stages need no backend call on an exact retry.
-            if owner
-                .releases()?
-                .iter()
-                .find(|release| release.publication.generation == generation)
-                .is_some_and(|release| release.stages.contains(&stage.root))
-            {
-                continue;
-            }
-            let blocks = self.stage_blocks(stage)?;
-            owner
-                .retain_stage(generation, stage.root, &blocks, backend)
-                .await?;
-        }
-        owner.finish_retention(generation)
-    }
-
-    /// Seed immutable transport content into a staging Kubo. This does not
-    /// announce IPNS or replace the infrastructure owner's retention evidence.
-    pub async fn seed(&self, client: &ipfs::HttpClient) -> Result<()> {
-        for stage in &self.index.stages {
-            client
-                .import_composed(&stage.root, &self.stage_blocks(stage)?)
-                .await?;
-        }
-        Ok(())
-    }
-    fn stage_blocks(&self, stage: &Stage) -> Result<Vec<(Cid, Vec<u8>)>> {
-        let mut total = 0;
-        stage
-            .blocks
-            .iter()
-            .map(|cid| {
-                let bytes = self.read_block(cid)?;
-                total += bytes.len() + 64;
-                ensure!(total <= STAGE_BYTES, "release stage byte limit exceeded");
-                Ok((*cid, bytes))
-            })
-            .collect()
-    }
     fn verify_artifact(&self, artifact: &Artifact) -> Result<()> {
         ensure!(
             self.resolve(&artifact.path)? == artifact.root,
@@ -823,84 +658,42 @@ impl Builder {
         Ok(entries)
     }
     fn package(&self, root: Cid) -> Result<Package> {
-        let mut planner = Planner {
-            spool: &self.spool,
-            visited: BTreeSet::new(),
-            metadata: BTreeMap::new(),
-            emitted: BTreeSet::new(),
-            total: 0,
-            visits: 0,
-            stages: Vec::new(),
-        };
-        let fragment = planner.walk(root, 0)?;
-        planner.emit(root, fragment)?;
+        validate_graph(&self.spool, root)?;
         Ok(Package {
             spool: self.spool.clone(),
-            index: Index {
-                root,
-                stages: planner.stages,
-            },
+            root,
         })
-    }
-    #[cfg(test)]
-    fn finish(&self, root: Cid) -> Result<Package> {
-        let package = self.package(root)?;
-        package.save()?;
-        Ok(package)
     }
 }
 
-struct Fragment {
-    blocks: BTreeSet<Cid>,
-    charge: usize,
-    links: usize,
+// Stage emission and its traversal-work policy belong to the private planner.
+// This pass bounds unique content and examined edges independently. Memoized
+// heights preserve the depth limit when a shared subtree is reached again.
+fn validate_graph(spool: &Path, root: Cid) -> Result<()> {
+    GraphValidation::default().walk(spool, root, 0)?;
+    Ok(())
 }
-struct Planner<'a> {
-    spool: &'a Path,
+
+#[derive(Default)]
+struct GraphValidation {
     visited: BTreeSet<Cid>,
-    metadata: BTreeMap<Cid, (usize, usize)>,
-    emitted: BTreeSet<Cid>,
+    heights: BTreeMap<Cid, usize>,
     total: u64,
     visits: usize,
-    stages: Vec<Stage>,
 }
-impl Planner<'_> {
-    fn emit(&mut self, root: Cid, fragment: Fragment) -> Result<()> {
-        if self.emitted.contains(&root) {
-            return Ok(());
-        }
-        ensure!(
-            !fragment.blocks.is_empty()
-                && fragment.charge <= STAGE_BYTES
-                && fragment.blocks.len() <= STAGE_BLOCKS
-                && fragment.links <= STAGE_LINKS,
-            "invalid release stage"
-        );
-        ensure!(
-            self.stages.len() < ipfs::release::MAX_STAGES,
-            "release stage count exceeded"
-        );
-        self.emitted.insert(root);
-        self.stages.push(Stage {
-            root,
-            blocks: fragment.blocks.into_iter().collect(),
-        });
-        Ok(())
-    }
-    fn walk(&mut self, root: Cid, depth: usize) -> Result<Fragment> {
+
+impl GraphValidation {
+    fn walk(&mut self, spool: &Path, root: Cid, depth: usize) -> Result<usize> {
         self.visits += 1;
         ensure!(
             depth <= MAX_DEPTH && self.visits <= MAX_BLOCKS * 4,
             "release graph traversal bound exceeded"
         );
-        if self.emitted.contains(&root) {
-            return Ok(Fragment {
-                blocks: BTreeSet::new(),
-                charge: 0,
-                links: 0,
-            });
+        if let Some(height) = self.heights.get(&root) {
+            ensure!(depth + height <= MAX_DEPTH, "release graph depth exceeded");
+            return Ok(*height);
         }
-        let bytes = read_block(self.spool, &root)?;
+        let bytes = read_block(spool, &root)?;
         if self.visited.insert(root) {
             self.total = self
                 .total
@@ -911,45 +704,12 @@ impl Planner<'_> {
                 "release graph exceeds bounds"
             );
         }
-        let root_links = links(&root, &bytes)?;
-        let mut link_count = root_links.len();
-        let root_link_count = link_count;
-        self.metadata.insert(root, (bytes.len() + 64, link_count));
-        let mut children = Vec::new();
-        for child in root_links {
-            children.push((child, self.walk(child, depth + 1)?));
+        let mut height = 0;
+        for child in links(&root, &bytes)? {
+            height = height.max(self.walk(spool, child, depth + 1)? + 1);
         }
-        let mut blocks = BTreeSet::from([root]);
-        let mut charge = bytes.len() + 64;
-        for (_, fragment) in &children {
-            for cid in &fragment.blocks {
-                if blocks.insert(*cid) {
-                    let (child_charge, child_links) = self
-                        .metadata
-                        .get(cid)
-                        .context("missing planned block metadata")?;
-                    charge += child_charge;
-                    link_count += child_links;
-                }
-            }
-        }
-        if charge > STAGE_BYTES || blocks.len() > STAGE_BLOCKS || link_count > STAGE_LINKS {
-            for (child, fragment) in children {
-                if !fragment.blocks.is_empty() {
-                    self.emit(child, fragment)?;
-                }
-            }
-            blocks = BTreeSet::from([root]);
-            charge = bytes.len() + 64;
-            link_count = root_link_count;
-        }
-        // A sibling may have emitted a shared subgraph while this fragment was
-        // collected. Supplying it again remains valid and is explicitly bounded.
-        Ok(Fragment {
-            blocks,
-            charge,
-            links: link_count,
-        })
+        self.heights.insert(root, height);
+        Ok(height)
     }
 }
 

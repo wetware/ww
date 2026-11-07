@@ -70,17 +70,16 @@ and package validation. A staging tree is not an authorized release.
 `scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS` signs the
 exact staged manifest and verifies the result against independent trusted keys.
 It rejects an existing signature destination and a private key inside the release
-tree. `ww-release-publisher prepare` constructs the binding before signing.
+tree. `ww-release-package prepare` constructs the binding before signing.
 `finalize` authenticates the signed tree before producing the transport root.
 The worker verifies against its independently provisioned keyring before local
 commitment; the verifier comes from the installed executable, never the release tree.
 
-The workflow references the proposed `release-signing` protected environment.
-Only the signing step receives `WW_RELEASE_SIGNING_KEY`. Repository, master ref,
-event type, and successful prerequisite jobs gate that step. Only master pushes
-and master workflow dispatches qualify. The signer also rejects PRs, forks, tags,
-and other branches. These checks complement environment protections; they do
-not establish that production protections have been configured.
+Official signing admission now belongs to private `wetware/infra`. Its inactive
+protected signing job validates the reviewed public artifact handoff before key
+access. Public CI receives no release-signing secret. The reusable signing script
+checks explicit files and independent trust; it does not allocate CI authority.
+Environment protections and signing custody require separate approval.
 
 Private key material exists only in an owner-accessible temporary directory
 outside the artifact tree. The step disables tracing, uses `umask 077`, clears
@@ -115,7 +114,7 @@ use ephemeral runners and restrict access to runner storage.
    `/etc/wetware/release-keys`, owned by an administrator and not writable by
    untrusted users. For a user-managed installation, provision a protected local
    path and pass `--trusted-release-keys` explicitly. Releases cannot rotate keys.
-5. After separate CI approval, configure environment secret
+5. After separate CI approval in `wetware/infra`, configure environment secret
    `WW_RELEASE_SIGNING_KEY` with the private PEM and environment variable
    `WW_RELEASE_TRUSTED_KEYS` with the public keyring. A final LF is optional in
    the CI variable; the workflow adds one if absent. Restrict `release-signing`
@@ -131,9 +130,9 @@ use ephemeral runners and restrict access to runner storage.
    #737/#738's publication owner when that integration is ready. Do not activate
    a competing owner or journal from this work.
 
-For offline qualification, run `ww-release-publisher prepare`, then
+For offline qualification, run `ww-release-package prepare`, then
 `scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS`, followed
-by `ww-release-publisher finalize`. Keep the private PEM outside the release
+by `ww-release-package finalize`. Keep the private PEM outside the release
 directory and use independently supplied public trust. These commands do not
 announce a release or authorize production publication.
 

@@ -358,7 +358,7 @@ jobs:
     - name: Stage and validate canonical FHS
       run: |
         make package-check
-        cargo build --locked --bin ww-release-publisher
+        cargo build --locked -p ww-release --features package --bin ww-release-package
         bash tests/test_release_package.sh target/debug/examples/stage_fhs target/fhs
 
     - uses: actions/upload-artifact@v7
@@ -369,7 +369,7 @@ jobs:
           std/status/bin/status.wasm
           target/fhs/
           target/debug/examples/stage_fhs
-          target/debug/ww-release-publisher
+          target/debug/ww-release-package
           examples/*/bin/
           target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm
           target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
@@ -528,19 +528,8 @@ jobs:
         fi
         cat proof.stdout
 
-    - name: Qualify release publisher against infrastructure Kubo
-      run: |
-        set -euo pipefail
-        directory="$RUNNER_TEMP/release-kubo043"
-        mkdir -p "$directory"
-        curl --fail --location --retry 5 \
-          https://github.com/ipfs/kubo/releases/download/v0.43.1/kubo_v0.43.1_linux-amd64.tar.gz \
-          --output "$directory/kubo.tar.gz"
-        echo "3f2bf974ab2a3ec6d997fac7d8cb46f59983a7cddd0b55ef998e6ce379155fb2  $directory/kubo.tar.gz" | sha256sum --check --strict
-        tar -xzf "$directory/kubo.tar.gz" -C "$directory"
-        chmod +x target/debug/ww-release-publisher
-        python3 tests/test_release_publisher.py --binary target/debug/ww-release-publisher \
-          --ipfs "$directory/kubo/ipfs" --fhs target/fhs
+    - name: Validate public release package library
+      run: cargo test --locked -p ww-release --features package
 
   test-stdlib:
     name: Test standalone standard library
@@ -770,9 +759,9 @@ jobs:
       run: |
         chmod +x artifacts/wasm-artifacts/target/debug/examples/stage_fhs
         bash scripts/assemble_release.sh artifacts release-tree "${{ github.sha }}"
-        cp artifacts/wasm-artifacts/target/debug/ww-release-publisher ./ww-release-publisher
-        chmod +x ./ww-release-publisher
-        bash tests/test_release_descriptor_package.sh ./ww-release-publisher artifacts release-tree
+        cp artifacts/wasm-artifacts/target/debug/ww-release-package ./ww-release-package
+        chmod +x ./ww-release-package
+        bash tests/test_release_descriptor_package.sh ./ww-release-package artifacts release-tree
         chmod +x artifacts/ww-linux-musl-x86_64/ww
         WW_TEST_BINARY=artifacts/ww-linux-musl-x86_64/ww WW_TEST_FHS=release-tree/fhs python3 tests/test_host_install.py
         python3 tests/test_install.py --binary artifacts/ww-linux-musl-x86_64/ww --fhs release-tree/fhs
@@ -804,7 +793,7 @@ jobs:
           artifacts/ww-*/REVISION
           artifacts/ww-*/SHA256SUMS
           artifacts/ww-*/PROVENANCE.json
-          ww-release-publisher
+          ww-release-package
           tested-image.tar
         retention-days: 1
 
@@ -854,88 +843,13 @@ jobs:
   publish:
     name: Publish to IPFS
     needs: [changes, test, validate-release, release_image]
-    # Both publication paths consume the same validated artifact set.
-    # IPFS publication is independent of manual infrastructure promotion for
-    # this POC. The published release may therefore lead or lag production.
-    # Maintenance hold for the VPS recast. Historical runs and existing writers
-    # require a separate fence: doc/legacy-publication-hold.md.
+    # Public CI produces validated artifacts. Official release operations moved
+    # to the private operator repository. Preserve the existing publication hold.
+    # Historical writers require the separate fence in doc/legacy-publication-hold.md.
     if: ${{ false }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: release-signing
-
     steps:
-    - uses: actions/checkout@v5
-      with:
-        submodules: recursive
-        fetch-depth: 0
-
-    - uses: actions/download-artifact@v8
-      with:
-        name: validated-release
-
-    - name: Prepare authenticated release descriptor
-      env:
-        WW_RELEASE_CHANNEL: ${{ vars.WW_RELEASE_IPNS_NAME }}
-        WW_RELEASE_RUN_NUMBER: ${{ github.run_number }}
-        WW_RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
-      run: |
-        set -euo pipefail
-        chmod +x ./ww-release-publisher
-        # Admit only the current master tip before the trusted signer is used.
-        test "$(git rev-parse origin/master)" = "${{ github.sha }}"
-        test "$(scripts/check_release_ancestry.sh "${{ github.sha }}" '')" = publish
-        sequence=$(./ww-release-publisher sequence "$WW_RELEASE_RUN_NUMBER" "$WW_RELEASE_RUN_ATTEMPT")
-        ./ww-release-publisher metadata --artifacts artifacts --tree release-tree \
-          --channel "$WW_RELEASE_CHANNEL" --sequence "$sequence" \
-          --builder "github-actions:${{ github.run_id }}:${{ github.run_attempt }}" > metadata.json
-        ./ww-release-publisher prepare --tree release-tree --spool release-spool --metadata metadata.json
-
-    # Requires a separately approved protected environment and key provisioning.
-    # No release private key is available to build, test, or PR jobs.
-    - name: Sign exact release checksum manifest
-      id: release-signature
-      if: >-
-        github.repository == 'wetware/ww' && github.ref == 'refs/heads/master'
-        && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-        && needs.test.result == 'success' && needs.validate-release.result == 'success'
-        && needs.release_image.result == 'success'
-      env:
-        WW_RELEASE_SIGNING_KEY: ${{ secrets.WW_RELEASE_SIGNING_KEY }}
-        WW_RELEASE_TRUSTED_KEYS: ${{ vars.WW_RELEASE_TRUSTED_KEYS }}
-      run: |
-        set +x
-        set -euo pipefail
-        umask 077
-        SIGNING_DIR=$(mktemp -d "$RUNNER_TEMP/ww-signing.XXXXXXXX")
-        trap 'rm -rf "$SIGNING_DIR"' EXIT
-        printf '%s\n' "$WW_RELEASE_SIGNING_KEY" > "$SIGNING_DIR/private.pem"
-        printf '%s' "$WW_RELEASE_TRUSTED_KEYS" > "$SIGNING_DIR/trusted-keys"
-        if [ "$(tail -c 1 "$SIGNING_DIR/trusted-keys" | od -An -tu1 | tr -d ' ')" != 10 ]; then
-          printf '\n' >> "$SIGNING_DIR/trusted-keys"
-        fi
-        unset WW_RELEASE_SIGNING_KEY WW_RELEASE_TRUSTED_KEYS
-        bash scripts/sign_release.sh release-tree/CHECKSUMS.txt release-tree/CHECKSUMS.txt.sig \
-          "$SIGNING_DIR/private.pem" "$SIGNING_DIR/trusted-keys"
-
-    - name: Finalize authenticated release package
-      if: steps.release-signature.outcome == 'success'
-      env:
-        WW_RELEASE_TRUSTED_KEYS: ${{ vars.WW_RELEASE_TRUSTED_KEYS }}
-      run: |
-        set -euo pipefail
-        umask 077
-        trust=$(mktemp "$RUNNER_TEMP/ww-public-trust.XXXXXXXX")
-        trap 'rm -f "$trust"' EXIT
-        printf '%s' "$WW_RELEASE_TRUSTED_KEYS" > "$trust"
-        if [ "$(tail -c 1 "$trust" | od -An -tu1 | tr -d ' ')" != 10 ]; then
-          printf '\n' >> "$trust"
-        fi
-        ./ww-release-publisher finalize --tree release-tree --spool release-spool \
-          --trusted-keys "$trust" > candidate.json
-
     - name: Refuse unintegrated infrastructure publication
-      if: steps.release-signature.outcome == 'success'
       run: |
-        echo 'Publication remains on hold. Integrate the reviewed infra#37 worker and transport before activation.' >&2
+        echo 'Official publication is private and remains inactive pending explicit activation approval.' >&2
         exit 1

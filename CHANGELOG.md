@@ -51,6 +51,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cleanup certification. Post-publication descriptor work observes cancellation.
 
 ### Removed
+- Public `ipfs::release` publication-policy and journal APIs. Official publication
+  moves to private `wetware/infra`; public `ww-release` retains formats,
+  authentication, offline packages and consumer freshness. Existing protocol,
+  FHS and IPNS paths remain available through reexports. Production remains held.
 - Obsolete kernel-selector migration handling and tests for retired CLI flags
   and routing identifiers. `--kernel` now receives Clap's ordinary unknown-argument
   error; `WW_KERNEL` has no effect. PID0 selection still uses `/boot/kernel.wasm`
@@ -60,16 +64,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
-- **Authenticated release descriptors and dedicated publisher (#738).** Bind
-  canonical IPLD descriptors to the existing Ed25519 manifest authority, preserve
-  actual platform build provenance, and verify Host/FHS compatibility and bytes.
-  `ww-release-publisher` retains bounded complete graphs before the existing
-  owner commits local release order, then announces through eventually consistent
-  IPNS. Consumers preserve independent transport and release freshness floors,
-  including across key rotation. Shared APIs use `ww::release`; packaging and
-  publication compile only in the dedicated executable. Legacy official publisher
-  scripts are removed; `make publish` refuses. Production publication remains on
-  hold pending the infra#37 integration.
+- **Authenticated release descriptors and package library (#738).** Public
+  `ww-release` binds canonical descriptors to Ed25519 manifests, preserves actual
+  producer provenance, verifies Host/FHS bytes and compatibility, and maintains
+  consumer freshness floors. Its `package` feature supplies `ww-release-package`
+  for offline construction and verification. Existing `ww::release` paths reexport
+  the same protocol types. Official publication, the sole durable Owner/journal
+  and protected signing move to private `wetware/infra`. Public CI builds and
+  validates artifacts. `make publish` refuses; production publication remains held.
 - **Durable release foundation (#737).** A bounded immutable host IPLD Map
   uses canonical DAG-CBOR and explicit blockstore persistence. A separate
   release owner journals staged retention and publication intent,

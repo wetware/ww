@@ -5,6 +5,7 @@ members = [
     "crates/cache",
     "crates/cell",
     "crates/ipfs",
+    "crates/release",
     "crates/authority",
     "crates/membrane",
     "crates/rpc",
@@ -65,7 +66,6 @@ default-run = "ww"
 # Dependencies needed for both host and guest
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-base64 = "0.22.1"
 serde_json = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
@@ -77,7 +77,6 @@ rand = { workspace = true }
 base58 = { workspace = true }
 libc = "0.2.177"
 tempfile = { workspace = true }
-walkdir = "2"
 auth = { path = "crates/guest/auth" }
 blake3 = { workspace = true }
 
@@ -85,7 +84,7 @@ blake3 = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libp2p = { workspace = true, features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic"] }
 ipfs = { path = "crates/ipfs" }
-ipld-dagpb = "=0.2.2"
+ww-release = { path = "crates/release" }
 clap = { version = "4.5.51", features = ["derive", "env"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 nix = { version = "0.30.1", features = ["socket"] }
@@ -116,11 +115,8 @@ indicatif = "0.17"
 name = "ww"
 path = "src/cli/main.rs"
 
-[[bin]]
-name = "ww-release-publisher"
-path = "src/bin/ww-release-publisher.rs"
-
 [dev-dependencies]
+walkdir = "2"
 sha2 = "0.10"
 membrane = { package = "wetware-membrane", path = "crates/membrane" }
 cell = { path = "crates/cell", features = ["test-support"] }

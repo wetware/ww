@@ -2,7 +2,7 @@ use super::*;
 use chrono::Duration;
 use ed25519_dalek::{Signer, SigningKey};
 use ipld_dagpb::PbLink;
-use libp2p::identity::Keypair;
+use libp2p_identity::Keypair;
 use rust_ipns::Record;
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -119,7 +119,7 @@ fn signed(key: &Keypair, root: Cid, sequence: u64, lifetime: i64) -> Vec<u8> {
         format!("/ipfs/{root}"),
         Utc::now() + Duration::seconds(lifetime),
         sequence,
-        crate::ipns::RECORD_TTL,
+        std::time::Duration::from_secs(5 * 60),
     )
     .unwrap()
     .encode()
