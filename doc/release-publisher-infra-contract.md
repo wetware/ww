@@ -29,11 +29,33 @@ not public package interfaces.
 
 ## Artifact handoff
 
-Public CI exports `validated-release`: the validated release tree, five original
-Host receipt sets, public package tool and tested image. Infra selects an exact
-successful public workflow run, attempt, source revision, artifact ID and digest.
-Infra preserves each Host's actual producer provenance. Its protected signer
-uses a separately pinned public tool revision and independent trust.
+Public CI exports one raw `release-input.car`. The CAR contains the validated
+`release-tree/` and five original Host receipt directories under `artifacts/`.
+Each receipt directory contains `REVISION`, `SHA256SUMS` and `PROVENANCE.json`.
+The existing image job receives the tested `tested-image.tar` as a separate raw
+artifact. Generic upstream Host and WASM build artifacts retain their existing
+GitHub artifact format.
+
+Infra selects an exact successful public workflow run, attempt, source revision,
+artifact ID and SHA-256 digest. Admission builds `ww-release-package` from a
+separately pinned public source revision before importing the CAR and unpacking
+the tree. Infra preserves and validates each Host's original producer provenance.
+The CAR contains no package-tool executable; the protected signer uses the source-built
+tool and independent public trust.
+
+Public `pack-tree` and `unpack-tree` transfer bounded unsigned filesystem content.
+Public `export-car` and `import-car` transfer a complete single-root block graph.
+The unsigned input root differs from the final signed release root. Private
+metadata allocation, `prepare`, signing and `finalize` produce the signed root.
+CAR transport preserves the contained block bytes and CIDs.
+
+The private signer exports the finalized graph and its handoff receipt as two
+raw artifacts. Their basenames include the infra run ID and attempt. The receipt
+binds the CAR digest, original admission, pinned tool revision and signed
+root/descriptor/sequence. The publication job checks both immutable artifact
+IDs/digests against the same signing job. It imports the CAR, independently
+authenticates the candidate, and compares the receipt before deriving a request.
+Neither private handoff accepts ZIP payloads or falls back to ZIP extraction.
 
 The final private manifest pins both public crates to one exact Git SHA and owns
 its Cargo lockfile and root patches. Public code never fetches private source or

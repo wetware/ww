@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use cache::{PathWriteNotOwned, PathWriteSourcePanic};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+pub mod car;
 pub mod cid_identity;
 mod composed;
 pub mod ipns;

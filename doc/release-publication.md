@@ -79,8 +79,8 @@ implementation does not substitute the broader inline-profile decoder.
 | Component | Owner and interface |
 | --- | --- |
 | `ww-release` default features | `auth`, `descriptor`, authenticated selection and consumer freshness |
-| `ww-release` feature `package` | `Metadata`, `prepare`, `finalize`, `Package` and offline `ww-release-package` |
-| `ipfs` | Map, CID identity, pure `ipns` records, bounded Kubo/IPLD transport |
+| `ww-release` feature `package` | `Metadata`, `prepare`, `finalize`, `Package`, CAR/tree transfer functions and offline `ww-release-package` |
+| `ipfs` | Map, CID identity, pure `ipns` records, bounded CARv1 framing and Kubo/IPLD transport |
 | `cell::packaging` | Production FHS component validation and staging |
 | `ww` | Host deployment `Publisher`, `RecordStore`, `Republisher`; compatibility reexports |
 | Private `ww-release-publisher` | Official metadata/sequence policy, stage planning, single durable Owner and announcement |
@@ -103,6 +103,21 @@ bounds distinct blocks and examined edges and checks cached subtree height.
 Private stage partitioning and its traversal budget remain private policy.
 Acquisition does not authenticate a release; callers must supply independent
 trust to `authenticate`.
+
+Four free functions support offline transfer without adding publication policy:
+`pack_tree`, `unpack_tree`, `read_car`, and `write_car`. Unsigned input trees use
+the same UnixFS builder as release packages. Signed CAR export preserves the
+existing release root and every reachable block. CAR import checks bounded
+framing, CID integrity and exact graph closure before returning a package.
+Unsigned tree materialization also bounds expanded bytes, file/directory counts,
+path depth and total traversal work; shared blocks do not bypass those bounds.
+
+The transfer profile uses one CARv1 root and deterministic encoded-CID block
+ordering. It rejects duplicate, missing and unreachable blocks. CAR framing
+has a separate bounded allowance above the existing 8 GiB payload budget.
+`ipfs::car::{Reader,Writer,Limits}` supplies shared streaming framing. Kubo import
+continues to use bounded CAR stages and its existing acknowledgement contract.
+Neither CAR import nor a staging Kubo pin supplies publication retention authority.
 
 ```sh
 cargo test --locked -p ww-release

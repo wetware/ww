@@ -68,7 +68,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ww-release` binds canonical descriptors to Ed25519 manifests, preserves actual
   producer provenance, verifies Host/FHS bytes and compatibility, and maintains
   consumer freshness floors. Its `package` feature supplies `ww-release-package`
-  for offline construction and verification. Existing `ww::release` paths reexport
+  for offline construction, bounded CAR transfer, and verification. CAR transfer
+  preserves release CIDs and shares the existing UnixFS builder and graph checks.
+  Existing `ww::release` paths reexport
   the same protocol types. Official publication, the sole durable Owner/journal
   and protected signing move to private `wetware/infra`. Public CI builds and
   validates artifacts. `make publish` refuses; production publication remains held.

@@ -24,6 +24,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Pack an unsigned content tree into a fresh immutable spool.
+    PackTree {
+        #[arg(long)]
+        tree: PathBuf,
+        #[arg(long)]
+        spool: PathBuf,
+    },
+    /// Materialize an unsigned package tree into a fresh private directory.
+    UnpackTree {
+        #[arg(long)]
+        spool: PathBuf,
+        #[arg(long)]
+        tree: PathBuf,
+    },
+    /// Import a complete bounded CAR into a fresh spool, without authentication.
+    ImportCar {
+        #[arg(long)]
+        car: PathBuf,
+        #[arg(long)]
+        spool: PathBuf,
+    },
+    /// Export exactly one package's reachable graph as deterministic CARv1.
+    ExportCar {
+        #[arg(long)]
+        spool: PathBuf,
+        #[arg(long)]
+        car: PathBuf,
+    },
     /// Build the descriptor and manifest binding before offline signing.
     Prepare {
         #[arg(long)]
@@ -86,6 +114,24 @@ fn package_result(package: &Package, trust: &TrustedKeys) -> Result<serde_json::
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::PackTree { tree, spool } => {
+            let package = package::pack_tree(&tree, &spool)?;
+            emit(&serde_json::json!({ "root": package.root().to_string() }))
+        }
+        Command::UnpackTree { spool, tree } => {
+            let package = Package::open(&spool)?;
+            package::unpack_tree(&package, &tree)?;
+            emit(&serde_json::json!({ "root": package.root().to_string() }))
+        }
+        Command::ImportCar { car, spool } => {
+            let package = package::read_car(&car, &spool)?;
+            emit(&serde_json::json!({ "root": package.root().to_string() }))
+        }
+        Command::ExportCar { spool, car } => {
+            let package = Package::open(&spool)?;
+            package::write_car(&package, &car)?;
+            emit(&serde_json::json!({ "root": package.root().to_string() }))
+        }
         Command::Prepare {
             tree,
             spool,

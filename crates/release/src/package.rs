@@ -33,6 +33,9 @@ const MAX_FILES: usize = 1024;
 const MAX_DEPTH: usize = 64;
 const DESCRIPTOR_FILE: &str = "RELEASE-DESCRIPTOR.cbor";
 
+mod transport;
+pub use transport::{pack_tree, read_car, unpack_tree, write_car};
+
 /// Build-process assertions. Each Host retains its actual source revision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -391,6 +394,16 @@ impl Package {
         Ok(result)
     }
     fn visit_file(&self, root: Cid, mut visit: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let mut remaining = MAX_BLOCKS;
+        self.visit_file_with_budget(root, &mut remaining, &mut visit)
+    }
+
+    fn visit_file_with_budget(
+        &self,
+        root: Cid,
+        remaining: &mut usize,
+        mut visit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         fn walk(
             package: &Package,
             cid: Cid,
@@ -409,18 +422,9 @@ impl Package {
                 return Ok(bytes.len() as u64);
             }
             let node = pb_node(cid, &bytes)?;
-            let (size, sizes) = file_metadata(
-                node.data
-                    .as_deref()
-                    .context("missing UnixFS file metadata")?,
-            )?;
-            ensure!(
-                sizes.len() == node.links.len(),
-                "UnixFS block size count differs from links"
-            );
+            let (size, sizes) = file_children(&node)?;
             let mut total = 0u64;
             for (link, expected) in node.links.iter().zip(sizes) {
-                ensure!(link.name.as_deref() == Some(""), "named UnixFS file link");
                 let actual = walk(package, link.cid, depth + 1, remaining, visit)?;
                 ensure!(actual == expected, "UnixFS child size mismatch");
                 total = total.checked_add(actual).context("file size overflow")?;
@@ -429,8 +433,7 @@ impl Package {
             ensure!(total == size, "UnixFS file size mismatch");
             Ok(total)
         }
-        let mut remaining = MAX_BLOCKS;
-        walk(self, root, 0, &mut remaining, &mut visit)?;
+        walk(self, root, 0, remaining, &mut visit)?;
         Ok(())
     }
 }
@@ -832,6 +835,25 @@ fn file_metadata(mut bytes: &[u8]) -> Result<(u64, Vec<u64>)> {
         bytes = &bytes[1..];
         sizes.push(read_varint(&mut bytes)?);
     }
+    Ok((size, sizes))
+}
+
+fn file_children(node: &PbNode) -> Result<(u64, Vec<u64>)> {
+    let (size, sizes) = file_metadata(
+        node.data
+            .as_deref()
+            .context("missing UnixFS file metadata")?,
+    )?;
+    ensure!(
+        sizes.len() == node.links.len(),
+        "UnixFS block size count differs from links"
+    );
+    ensure!(
+        node.links
+            .iter()
+            .all(|link| link.name.as_deref() == Some("")),
+        "named UnixFS file link"
+    );
     Ok((size, sizes))
 }
 

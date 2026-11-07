@@ -3,6 +3,9 @@ use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 
+#[path = "transport_tests.rs"]
+mod transport;
+
 fn provenance(revision: char) -> Provenance {
     Provenance {
         repository: "https://github.com/wetware/ww".into(),

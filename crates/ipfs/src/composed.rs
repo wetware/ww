@@ -3,7 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use cid::Cid;
 use http_body_util::BodyExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{BootClient, HttpClient, KuboApiError, KuboOperationTimeout};
 
@@ -283,15 +283,8 @@ struct JsonCid {
 /// CARv1 framing; DAG-CBOR and CID serialization use existing dependencies.
 /// https://ipld.io/specs/transport/car/carv1/
 fn encode_car(root: &Cid, blocks: &[(Cid, Vec<u8>)]) -> Result<Vec<u8>> {
-    #[derive(Serialize)]
-    struct Header<'a> {
-        roots: [&'a Cid; 1],
-        version: u64,
-    }
-    let header = serde_ipld_dagcbor::to_vec(&Header {
-        roots: [root],
-        version: 1,
-    })?;
+    let header = crate::car::header_bytes(*root)?;
+    // Preserve the existing conservative charge before allocating CAR bytes.
     let mut size = header.len() + 10;
     for (cid, block) in blocks {
         ensure!(
@@ -308,24 +301,20 @@ fn encode_car(root: &Cid, blocks: &[(Cid, Vec<u8>)]) -> Result<Vec<u8>> {
             "Composed CAR exceeds {MAX_IMPORT_BYTES} bytes"
         );
     }
-    let mut car = Vec::with_capacity(size);
-    write_varint(header.len(), &mut car);
-    car.extend_from_slice(&header);
+    let mut car = crate::car::Writer::new(
+        Vec::with_capacity(size),
+        *root,
+        crate::car::Limits {
+            max_header_bytes: 1024,
+            max_block_bytes: MAX_BLOCK_BYTES,
+            max_blocks: usize::MAX,
+            max_total_bytes: MAX_IMPORT_BYTES as u64,
+        },
+    )?;
     for (cid, block) in blocks {
-        let cid = cid.to_bytes();
-        write_varint(cid.len() + block.len(), &mut car);
-        car.extend_from_slice(&cid);
-        car.extend_from_slice(block);
+        car.write_block(cid, block)?;
     }
-    Ok(car)
-}
-
-fn write_varint(mut value: usize, output: &mut Vec<u8>) {
-    while value >= 128 {
-        output.push(value as u8 | 0x80);
-        value >>= 7;
-    }
-    output.push(value as u8);
+    car.finish()
 }
 
 #[cfg(test)]

@@ -7,8 +7,8 @@ Nothing in `crates/` ships in the namespace directly.
 |-------|------|
 | `authority/` | Epoch guards, authenticated sessions, and authority policy. |
 | `cell/` | Host-side WASM execution, filesystem integration, and production FHS packaging validation. |
-| `ipfs/` | Kubo/IPLD transport, bounded inline Map, CID identity and pure IPNS record verification. |
-| `release/` | Release formats, authentication and consumer freshness; optional offline package construction/tool. |
+| `ipfs/` | Kubo/IPLD transport, bounded CARv1 framing, inline Map, CID identity and pure IPNS record verification. |
+| `release/` | Release formats, authentication and consumer freshness; optional offline package construction and CAR transfer. |
 | `membrane/` | Hook-level capability policy and recursive wrapping. |
 | `rpc/` | Cap'n Proto and libp2p transport implementations. |
 | `atom/` | On-chain Atom -- linearizable register backed by a smart contract. |

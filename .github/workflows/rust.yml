@@ -783,18 +783,34 @@ jobs:
         cp release-tree/fhs/bin/status.wasm std/status/bin/status.wasm
         docker build --build-arg WW_BUILD_GIT_SHA="${{ github.sha }}" -f Containerfile -t ww-validated:source .
         bash tests/test_container_boot.sh ww-validated:source release-tree/fhs
-    - name: Save tested image and release tree
-      run: docker save ww-validated:deploy -o tested-image.tar
-    - uses: actions/upload-artifact@v7
+    - name: Archive validated release inputs as CAR
+      run: |
+        set -euo pipefail
+        mkdir release-input
+        cp -R release-tree release-input/release-tree
+        for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 linux-musl-x86_64; do
+          mkdir -p "release-input/artifacts/ww-$platform"
+          for receipt in REVISION SHA256SUMS PROVENANCE.json; do
+            cp "artifacts/ww-$platform/$receipt" "release-input/artifacts/ww-$platform/$receipt"
+          done
+        done
+        ./ww-release-package pack-tree --tree release-input --spool release-input-spool
+        ./ww-release-package export-car --spool release-input-spool --car release-input.car
+    - name: Upload validated release input CAR
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
-        name: validated-release
-        path: |
-          release-tree/
-          artifacts/ww-*/REVISION
-          artifacts/ww-*/SHA256SUMS
-          artifacts/ww-*/PROVENANCE.json
-          ww-release-package
-          tested-image.tar
+        path: release-input.car
+        archive: false
+        if-no-files-found: error
+        retention-days: 1
+    - name: Save tested image
+      run: docker save ww-validated:deploy -o tested-image.tar
+    - name: Upload tested container image
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      with:
+        path: tested-image.tar
+        archive: false
+        if-no-files-found: error
         retention-days: 1
 
   release_image:
@@ -812,9 +828,11 @@ jobs:
       contents: read
       packages: write
     steps:
-    - uses: actions/download-artifact@v8
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
-        name: validated-release
+        name: tested-image.tar
+        skip-decompress: true
+        digest-mismatch: error
     - name: Load the tested image
       run: docker load -i tested-image.tar
     - name: Login to GHCR
