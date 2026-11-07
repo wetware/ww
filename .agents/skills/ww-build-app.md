@@ -81,7 +81,7 @@ Based on discovery, produce a concrete design.  Cover:
   anything that could be attenuated.  Reference `doc/capabilities.md`.
 - **Membrane design**: which typed graft fields and `extras` each process
   receives, and which `Membrane` crosses each spawn or listener boundary.
-  Reference `doc/architecture.md`, section "The Membrane pattern".
+  Reference `doc/architecture.md`, section "Authority model".
 - **Coordination model**: standalone, multi-node, or epoch-managed?
 
 Present the architecture as a structured outline or diagram.

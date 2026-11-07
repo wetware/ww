@@ -88,7 +88,7 @@ pub(super) async fn doctor() -> Result<()> {
             println!("  ~/.ww ....................... OK");
         }
         _ => {
-            println!("  ~/.ww ....................... NOT FOUND (run: ww perform install)");
+            println!("  ~/.ww ....................... NOT FOUND (run: ww install --release <CID>)");
         }
     }
 
@@ -128,13 +128,15 @@ pub(super) async fn doctor() -> Result<()> {
             } else {
                 println!("  Background daemon ........... REGISTERED (not running)");
                 if cfg!(target_os = "macos") {
-                    println!("    Start: launchctl load {}", plist.display());
+                    println!("    Activate: launchctl enable gui/UID/io.wetware.ww; launchctl bootstrap gui/UID {}", plist.display());
                 } else {
                     println!("    Start: systemctl --user start ww");
                 }
             }
         } else {
-            println!("  Background daemon ........... NOT REGISTERED (run: ww perform install)");
+            println!(
+                "  Background daemon ........... NOT REGISTERED (optional; run: ww daemon install)"
+            );
         }
     }
 
@@ -147,8 +149,7 @@ pub(super) async fn doctor() -> Result<()> {
     match &ns_dir {
         Some(d) if d.is_dir() => match ww::ns::list_configs(d) {
             Ok(configs) if configs.is_empty() => {
-                println!("  ~/.ww/etc/ns/ ............... EMPTY (no namespaces configured)");
-                println!("    Fix: ww perform install (or: ww ns add ww --ipns <key>)");
+                println!("  ~/.ww/etc/ns/ ............... EMPTY (optional; baseline FHS works without namespaces)");
             }
             Ok(configs) => {
                 for config in &configs {
@@ -170,7 +171,7 @@ pub(super) async fn doctor() -> Result<()> {
             }
         },
         _ => {
-            println!("  ~/.ww/etc/ns/ ............... NOT FOUND (run: ww perform install)");
+            println!("  ~/.ww/etc/ns/ ............... NOT CONFIGURED (optional)");
         }
     }
 

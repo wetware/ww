@@ -13,9 +13,9 @@
       "group": "THE HOST",
       "title": "The `ww` command",
       "subtitle": "Starts and controls a Wetware node.",
-      "files": ["src/cli/main.rs", "src/cli/daemon_cmd.rs"],
-      "what": "The CLI parses `ww run`, `ww shell`, `ww perform`, namespace, and daemon commands. Bare `ww run` captures the installed FHS independently of CWD. The CLI freezes namespace images and positional operations, starts host services, and applies process and operator policy to deployment outcomes.",
-      "built": "The binary lives at `src/cli/main.rs`. It uses the existing immutable capture and composition machinery. `src/cli/daemon_cmd.rs` preserves host-only identity, namespace, Kubo API, and Routing V1 configuration in generated services. Deployment owns generation transitions; the CLI retains terminal behavior and process exit policy."
+      "files": ["src/cli/main.rs", "src/cli/installation.rs", "src/cli/upgrade_cmd.rs", "src/cli/daemon_cmd.rs"],
+      "what": "The CLI separates installation, FHS update, native upgrade, software removal, and daemon registration. Install creates no service or publication; FHS update never restarts the Host. Native replacement retains its operational admission gates. Bare `ww run` captures the installed FHS independently of CWD and freezes namespace images and positional operations.",
+      "built": "The binary lives at `src/cli/main.rs`. Scoped installation and authenticated upgrade commands share durable ownership and locking. Daemon registration uses the same startup arguments as `run` and creates a disabled service. Deployment owns generation transitions; the CLI retains terminal behavior and process exit policy."
     },
     {
       "key": "loader",

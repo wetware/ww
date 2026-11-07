@@ -15,7 +15,7 @@ release authority.
 `CHECKSUMS.txt.sig` contains exactly 64 raw signature bytes. The signer uses pure
 Ed25519 over the exact published `CHECKSUMS.txt` bytes. It does not prehash the
 manifest, encode the signature as text, or normalize newlines. There is no
-unsigned fallback, including with `--version CID`.
+unsigned fallback, including with `--release CID`.
 
 `CHECKSUMS.txt` is at most 1 MiB. Its first line is exactly `# sha256` followed
 by LF. Each remaining line contains 64 lowercase hexadecimal SHA-256 digits,
@@ -46,18 +46,40 @@ trusted OpenSSL installation on `PATH`; the OS-provided tool might be LibreSSL.
 
 ## Consumers and producers
 
-`scripts/install.sh` authenticates the manifest, then verifies the selected Host,
-kernel, and status bytes with SHA-256. All three payloads must pass before the
+`scripts/install.sh` authenticates the manifest, independently binds it to the
+requested release root, then verifies the selected Host, kernel, and status bytes
+with SHA-256. All three payloads must pass before the
 installer executes the candidate or changes installed state. Existing ownership,
 component validation, and recovery checks still apply.
 
-`ww perform upgrade` remains disabled before network access or file changes.
-`ww oci import` now refuses before download, stdout export, or container loading.
+The shell fetches the raw root with `ipfs block get`, hashes it locally, and
+compares its canonical CIDv1 DAG-PB SHA-256 identity with `--release`.
+A bounded directory parser requires a unique direct `CHECKSUMS.txt` link whose
+raw CID equals the authenticated manifest's SHA-256 identity. The current
+package producer stores manifests of at most 1 MiB as single raw blocks.
+The parser accepts plain directories of at most 2 MiB and 1024 sorted unique
+ASCII names. It rejects unknown fields, noncanonical varints, ambiguous links,
+CIDv0 roots, and wrapped or chunked manifests. Unsupported formats fail closed;
+no downloaded verifier executes as a fallback. Manifest-only verification for
+signing remains independent of a release root.
+
+With `--recover`, the same binding check precedes execution of the signed Host.
+The shell stages no FHS payloads. The native recovery
+entry point independently authenticates the typed release and checks that its
+own executable matches a recorded transaction generation before recovery.
+
+`ww upgrade` authenticates descriptor selection and delegates to #739. Native
+replacement still refuses until compatibility and startup-admission gates pass;
+see [native upgrades](native-upgrades.md). `ww image update` authenticates the
+selected FHS and never replaces the native Host or restarts services.
+
+`ww oci import` refuses before download, stdout export, or container loading.
 The legacy OCI archive is absent from current packages and had no authentication.
-`ww perform install --payload` handles explicitly supplied local packages; it
-is not a release downloader. Its caller must trust the executed Host and local
-payload. Container registry distribution and deployment-head authority are
-separate from this IPFS release contract.
+The hidden shell bootstrap handoff requires the staged manifest, signature, and
+independent keyring. The native installer authenticates all three payloads again
+before component validation. No unsigned fresh-install path is exposed. Exact
+recorded-artifact repair does not authorize a different release. Container
+registry distribution and deployment-head authority remain separate.
 
 `ww::release::auth::TrustedKeys` accepts separately supplied keyring bytes.
 `authenticate` returns an `AuthenticatedManifest` only after strict Ed25519
@@ -181,8 +203,10 @@ The frozen binding order is:
 `AuthenticatedRelease` verifies the signature, binding bytes, descriptor CID,
 schema, and manifest artifact bindings. Selection checks platform and Host/PID0
 compatibility. Artifact verification checks exact reconstructed bytes before use.
-The shell installer keeps its existing signed-manifest path during migration;
-it does not interpret descriptors or persist consumer freshness state.
+The shell installer keeps its signed-manifest staging path during migration;
+it does not interpret descriptors or persist consumer freshness state. Automatic
+discovery is disabled. Recovery delegates typed verification to the staged Host
+only after independently verifying root-to-manifest membership and Host bytes.
 
 The Rust consumer records raw signed IPNS evidence and the signed release proof
 in one locked durable watermark. IPNS sequence and release sequence are separate
@@ -210,8 +234,8 @@ payload-only checksum entries. Do not derive authority from those files.
 
 The local OS, installer code, OpenSSL, hashing commands, trust file, and signing
 machine are trusted. Concurrent hostile local mutation is outside this boundary.
-Manifest size is checked after download; IPFS transport can consume disk/time
-before rejection. Artifact transport likewise retains its existing resource limits.
+Root and manifest sizes are checked after download; IPFS transport can consume
+disk/time before rejection. Artifact transport retains its existing resource limits.
 No claim is made about compromised signing keys, CI administrators, or runners.
 
 OpenSSL performs shell Ed25519 verification. A shared small-order corpus closes

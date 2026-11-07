@@ -154,33 +154,41 @@ ww master commit
        |        +--> ghcr.io/wetware/ww:master-<git-sha>
        |        +--> ghcr.io/wetware/ww@sha256:<digest>
        |
-       +--> IPFS release tree ----------> immutable CID
-                                            |
-                                            +--> ww-release IPNS
+       +--> offline release package ---> immutable CID
+
+private publication owner (activation held)
+       +--> retained signed release ---> ww-release IPNS
 ```
 
 The SHA-tagged GHCR image and its immutable digest identify the same image.
-IPNS is mutable discovery for an otherwise content-addressed release tree. Its
-publisher uses Git ancestry plus compare-and-set checks so an older workflow
-cannot supersede a newer published revision.
+IPNS is mutable discovery for an otherwise content-addressed release tree.
+Private `wetware/infra` owns official publication. The public IPFS publication
+job remains unconditionally held. Delayed older writes can temporarily supersede
+newer discovery values; Git ancestry checks do not establish network compare-and-set.
+See [release publication](release-publication.md) for the reproduced limitation,
+consumer freshness policy, and activation gates.
 
 The release name is
 `k51qzi5uqu5dg9eci41ad4b1wyf9kocngntfviq12qjuvusra3nt94xlx98me1`.
 
-IPFS remains a required publication path while `scripts/install.sh` installs
-from IPNS. It must not be made non-blocking until a GitHub Release has been
+IPFS remains a required distribution path: `scripts/install.sh` requires an
+explicit immutable `--release CID`; automatic channel discovery is unavailable.
+It must not be made non-blocking until a GitHub Release has been
 published and the installer has migrated to that distribution path.
 
 ## Default host IPNS publication
 
-`ww perform install` creates `~/.ww/identity` and `~/.ww/etc/ns/ww` when absent.
-The default namespace contains the IPNS name derived from that key and an
-immutable bootstrap CID. `ww perform update` preserves identity, reuses that
-namespace unless its bootstrap is absent, and renders the daemon with explicit
-`--ipfs-url` and `--ipns-routing-url` values. The
-running daemon signs the configured bootstrap CID before namespace resolution.
-If initial publication has a temporary failure, the daemon uses the immutable
-bootstrap for that boot and retries publication in the background.
+`ww install` creates the Host, baseline FHS, and identity. It does not create
+`~/.ww/etc/ns/ww` or configure publication. `ww image update` changes only the
+owned baseline; it never restarts the Host or rewrites namespaces. Existing
+namespace configuration remains intact.
+
+An operator can explicitly configure the `ww` namespace with the Host's own
+IPNS name and an immutable bootstrap CID. On startup, the Host signs that
+configured target before namespace resolution. If initial publication has a
+temporary failure, the Host uses the immutable bootstrap for that boot and
+retries publication in the background. Software installation does not grant
+this publication authority.
 
 The publisher stores its canonical raw record at
 `~/.ww/ipns/publish/<canonical-base36-name>.record`. It reconciles valid newer

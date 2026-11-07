@@ -2,6 +2,7 @@
 """Real Host installer tests. Only IPFS transport uses a local fixture."""
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -10,8 +11,8 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from kubo_fixture import isolated_kubo
-from release_auth_fixture import generate_key, sign_manifest
+from release_auth_fixture import (bootstrap_arguments, cid_text, generate_key,
+                                  manifest_root, sign_manifest)
 
 REPO = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
@@ -50,9 +51,13 @@ class Installation(unittest.TestCase):
 set -eu
 case "$1" in
   id) exit 0 ;;
+  block)
+    [ "$2" = get ] && [ "$3" = "$TEST_RELEASE_CID" ] || exit 91
+    cat "$TEST_ROOT_BLOCK" ;;
   cat)
-    case "$2" in /ipfs/test-release/*) ;; *) exit 91 ;; esac
-    p=${2#/ipfs/test-release/}
+    prefix=/ipfs/$TEST_RELEASE_CID/
+    case "$2" in "$prefix"*) ;; *) exit 91 ;; esac
+    p=${2#"$prefix"}
     if [ "${FAIL_FETCH:-}" = "$p" ]; then printf truncated; exit 1; fi
     cat "$TEST_RELEASE/$p" ;;
   *) echo "unexpected IPFS operation: $*" >&2; exit 92 ;;
@@ -65,19 +70,33 @@ esac
             stub.chmod(0o755)
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(('WW_', 'IPFS_'))}
-        self.env.update(HOME=str(self.home), TEST_RELEASE=str(self.release),
+        self.env.update(HOME=str(self.home), TEST_RELEASE=str(self.release), TEST_RELEASE_CID=self.release_cid,
+                        TEST_ROOT_BLOCK=str(self.root / 'root.block'),
                         PATH=str(self.stubs) + os.pathsep + os.environ['PATH'],
-                        NO_COLOR='1', WW_CWASM_DIR=str(self.root / 'cwasm'), IPFS_API=os.environ['IPFS_API'],
-                        IPFS_ROUTING_API=os.environ['IPFS_ROUTING_API'])
+                        NO_COLOR='1', WW_CWASM_DIR=str(self.root / 'cwasm'),
+                        IPFS_API='http://127.0.0.1:1', IPFS_ROUTING_API='http://127.0.0.1:1')
 
     def checksums(self):
+        records = [(name, self.release / name) for name in PAYLOADS]
+        if HOST_PATH == 'bin/ww/linux/x86_64/ww':
+            # The release validation lane runs its static musl artifact on GNU
+            # Linux; authorize the same fixture bytes for that native target.
+            records.insert(1, ('bin/ww/linux/musl-x86_64/ww', self.release / HOST_PATH))
         (self.release / 'CHECKSUMS.txt').write_text('# sha256\n' + ''.join(
-            f'{digest(self.release / name)}  {name}\n' for name in PAYLOADS))
+            f'{digest(path)}  {name}\n' for name, path in records))
         sign_manifest(self.private, self.release / 'CHECKSUMS.txt')
+        self.bind_manifest()
+
+    def bind_manifest(self):
+        block = manifest_root((self.release / 'CHECKSUMS.txt').read_bytes())
+        (self.root / 'root.block').write_bytes(block)
+        self.release_cid = cid_text(block)
+        if hasattr(self, 'env'):
+            self.env['TEST_RELEASE_CID'] = self.release_cid
 
     def install(self, success=True):
         result = subprocess.run(['sh', str(REPO / 'scripts/install.sh'),
-                                 '--version', 'test-release',
+                                 '--release', self.release_cid,
                                  '--trusted-release-keys', str(self.trusted_keys)], env=self.env,
                                 text=True, capture_output=True, timeout=120)
         if success:
@@ -91,6 +110,9 @@ esac
                                  (self.release / 'fhs' / name).read_bytes())
             subprocess.run([str(installed), '--version'], env=self.env,
                            capture_output=True, check=True, timeout=15)
+            locator = json.loads((self.home / '.ww/installed-release.json').read_text())
+            self.assertEqual(locator['version'], 1)
+            self.assertEqual(locator['release'], self.release_cid)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -127,11 +149,8 @@ esac
         self.assertEqual((self.home / '.ww/identity').read_bytes(), identity)
         self.assertEqual(self.snapshot(), before)
         services = list(self.home.rglob('*.plist')) + list(self.home.rglob('*.service'))
-        self.assertEqual(len(services), 1)
-        service = services[0].read_text()
-        self.assertIn(str(self.home / '.ww/bin/ww'), service)
-        self.assertNotIn(str(self.home / '.ww/fhs'), service)
-        self.assertNotIn('ww-install.', service)
+        self.assertEqual(services, [])
+        self.assertFalse((self.home / '.ww/etc/ns/ww').exists())
 
     def test_missing_payloads_and_checksums_do_not_replace(self):
         for name in PAYLOADS + ['CHECKSUMS.txt', 'CHECKSUMS.txt.sig']:
@@ -172,6 +191,7 @@ esac
                         original + original.splitlines()[1] + '\n'):
             (self.release / 'CHECKSUMS.txt').write_text(content)
             sign_manifest(self.private, self.release / 'CHECKSUMS.txt')
+            self.bind_manifest()
             self.install(False)
             self.assertEqual(self.snapshot(), {})
 
@@ -190,47 +210,44 @@ esac
         self.install(False)
         self.assert_native_refusal_preserved(before)
 
-    def test_managed_payload_can_change(self):
+    def test_installer_cannot_update_the_managed_payload(self):
         self.install()
-        identity = (self.home / '.ww/identity').read_bytes()
+        before = self.snapshot()
         # A legal custom section changes bytes without changing behavior.
         with (self.release / 'fhs/bin/status.wasm').open('ab') as output:
             output.write(b'\x00\x05\x01xabc')
         self.checksums()
-        self.install()
-        self.assertEqual((self.home / '.ww/identity').read_bytes(), identity)
+        result = self.install(False)
+        self.assertIn('ww image update', result.stderr)
+        self.assertEqual(self.snapshot(), before)
 
     def test_direct_executable_remains_regular(self):
         destination = self.home / '.ww/bin/ww'
         destination.parent.mkdir(parents=True)
         shutil.copy2(BINARY, destination)
-        result = subprocess.run([str(destination), 'perform', 'install', '--payload',
-                                 str(FHS)], env=self.env, text=True,
+        bootstrap = bootstrap_arguments(self.root / 'bootstrap', destination, FHS)
+        result = subprocess.run([str(destination), 'install', *bootstrap], env=self.env, text=True,
                                 capture_output=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(destination.is_symlink())
         subprocess.run([str(destination), '--version'], env=self.env,
                        check=True, capture_output=True)
 
-    def test_embedded_install_seeds_match_package(self):
-        result = subprocess.run([str(BINARY), 'perform', 'install'], env=self.env,
+    def test_unsigned_fresh_install_refuses_without_writes(self):
+        before = self.snapshot()
+        result = subprocess.run([str(BINARY), 'install'], env=self.env,
                                 text=True, capture_output=True, timeout=120)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        for name in ('boot/kernel.wasm', 'bin/status.wasm'):
-            self.assertEqual((self.home / '.ww/fhs' / name).read_bytes(),
-                             (FHS / name).read_bytes())
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_native_refusal_preserved(before)
 
-    def test_native_upgrade_refuses_without_writes(self):
+    def test_legacy_upgrade_is_a_usage_error_without_writes(self):
         self.install()
         before = self.snapshot()
         result = subprocess.run([str(self.home / '.ww/bin/ww'), 'perform', 'upgrade'],
                                 env=self.env, capture_output=True, text=True, timeout=15)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('installer', result.stderr.lower())
+        self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(self.snapshot(), before)
 
 
 if __name__ == '__main__':
-    with isolated_kubo() as kubo:
-        os.environ.update(kubo)
-        unittest.main(argv=[__file__] + remaining, verbosity=2)
+    unittest.main(argv=[__file__] + remaining, verbosity=2)

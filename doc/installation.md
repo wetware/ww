@@ -6,15 +6,23 @@ key rotation, and the production activation hold. The installer requires
 OpenSSL 3.x or 4.x and a running Kubo node:
 
 ```sh
-sh scripts/install.sh                    # resolves releases.wetware.run
-sh scripts/install.sh --version <CID>    # immutable signed release
-sh scripts/install.sh --trusted-release-keys /trusted/path/release-keys
+sh scripts/install.sh --release <CID>
+sh scripts/install.sh --release <CID> --trusted-release-keys /trusted/path/release-keys
 ```
 
 The installer authenticates the exact checksum manifest with Ed25519 before
 trusting any checksum. Missing signatures and unsigned historic releases fail
 closed. The default trust path is `/etc/wetware/release-keys`; fetched release
 content cannot supply this trust anchor.
+Automatic channel selection refuses until trusted channel freshness is integrated.
+The shell independently hashes the raw release root and verifies that its direct
+`CHECKSUMS.txt` link identifies the authenticated manifest. Signed payload hashes
+then bind the staged executable to the requested root before its first execution.
+Kubo supplies bytes; its path-resolution results do not grant execution authority.
+Shell bootstrap accepts the current package producer format: canonical lowercase
+base32 CIDv1 DAG-PB SHA-256 roots with a single raw-block manifest. CIDv0 roots,
+chunked manifests, and other unsupported layouts fail closed. The native
+`--release` selector additionally verifies the typed descriptor and compatibility.
 
 The installer downloads the Host, `fhs/boot/kernel.wasm`, and
 `fhs/bin/status.wasm` to a temporary directory. It requires an exact SHA-256
@@ -22,75 +30,170 @@ checksum entry for each file. The candidate Host validates both components
 before changing installed files. Kernel validation uses the production kernel
 contract. Status validation uses the ordinary Cell contract.
 
-The Host indexes the existing flat standard namespace (`bin/main.wasm` and
-`bin/status.wasm`) in the configured Kubo node before installing files. The
-namespace uses the explicit package bytes and contains no `boot/kernel.wasm`.
-Set `IPFS_API` for a non-default Kubo API and `IPFS_ROUTING_API` for its Routing
-V1 gateway. Startup still requires the gateway Routing V1 API.
+The shell hands the authenticated package to `ww install`. Installation writes
+`~/.ww/bin/ww`, `~/.ww/fhs/boot/kernel.wasm`, `~/.ww/fhs/bin/status.wasm`, and a
+private ownership receipt. It creates `~/.ww/identity` only for a fresh
+installation. Existing valid identity remains unchanged; malformed identity or
+missing identity in a recorded installation causes refusal.
 
-The installer writes the executable to `~/.ww/bin/ww` and the payload to
-`~/.ww/fhs`. Identity, installation metadata, namespace configuration, IPNS
-records, watermarks, caches and logs remain outside the FHS. The installer
-preserves existing identity. A malformed or unreadable identity causes refusal.
+Installation does not register a daemon, create `etc/ns/ww`, import a standard
+namespace, publish a name, or contact Kubo after the package is staged. Existing
+namespace and service configuration remains unchanged. Private identity, keys,
+IPNS records, watermarks, caches, logs, and application data stay outside the FHS.
 
-Installation generates a service definition and prints its activation command.
-It does not activate an OS service. On macOS:
+The native bootstrap handoff reauthenticates the staged manifest with the
+independent keyring before parsing or installing component payloads.
+`ww install --release <CID>` authenticates an immutable release through the
+shared release descriptor and installs its selected platform Host and FHS.
+`--trusted-release-keys` defaults to `/etc/wetware/release-keys`.
+`--check` validates without installing; `--json` prints one versioned result.
+
+## Separate software and service operations
+
+| Command | Effect |
+|---|---|
+| `ww install` | Create or repair the same recorded Host/FHS package and identity. No service registration or publication. |
+| `ww image update --release <CID>` | Authenticate and update only the owned baseline FHS. No Host replacement or restart. |
+| `ww upgrade --release <CID>` | Authenticate native selection and enter the #739 engine. Native replacement remains blocked by the operational gates below. |
+| `ww upgrade --rollback` | Request retained native recovery through the same engine and admission gates. |
+| `ww uninstall` | Remove owned software and daemon registration; preserve user state and recovery evidence. |
+| `ww daemon install [RUN OPTIONS] [MOUNT...]` | Register a disabled service using existing identity and startup paths. No image import or identity generation. |
+| `ww daemon uninstall` | Stop/unload, disable, verify, back up configuration, then remove owned registration. |
+
+`perform` and all four former subcommands are removed without aliases. There is
+no top-level `update`. Deployment following remains `run --stem` or
+`run --ipns-stem`; publishers retain authority to advance those sources.
+
+Register a service separately, with the same options as `run`:
 
 ```sh
-launchctl load "$HOME/Library/LaunchAgents/io.wetware.ww.plist"
+ww daemon install --http-listen 127.0.0.1:2080
 ```
 
-On Linux:
+A fresh registration is disabled and stopped. An identical owned registration
+preserves manager state. A different existing definition causes refusal; remove
+registration explicitly before reconfiguring. Custom identity must already
+exist. Generate a new key at an unused path with `ww keygen --output PATH`.
+The service stores absolute local paths and explicit environment-derived options.
+There is no daemon-only default HTTP listener.
+
+On Linux, activate explicitly:
 
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now ww
+ww healthcheck --ready
 ```
 
-Check `http://127.0.0.1:2080/status` after activation. Installation success
-means files and service configuration were installed; it does not prove that
-the service reached readiness on the operator's machine.
+On macOS, use the logged-in GUI domain:
 
-## Existing files
+```sh
+launchctl enable "gui/$(id -u)/io.wetware.ww"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.wetware.ww.plist"
+ww healthcheck --ready
+```
 
-Private `~/.ww/installation.json` records hashes for five managed files:
-executable, kernel, status, namespace configuration and service definition.
-The installer replaces a file only when its bytes match recorded ownership.
-A directly executed regular `~/.ww/bin/ww` is retained. Symlinks at managed
-paths or their installation ancestors cause refusal.
+Registration requires that GUI domain; there is no implicit headless fallback.
+The plist and persistent launchd override both disable fresh registration.
+Service-manager acceptance does not prove Host readiness.
 
-Unknown FHS files remain untouched. A collision at a managed path or a custom
-service definition causes an actionable refusal. Back up identity, IPNS state,
-credentials and custom configuration before manual reinstallation. Historical
-installation migration and configuration translation are unsupported.
+## Existing files and recovery
 
-Each file replacement uses a temporary file in its destination directory and
-an atomic rename. The complete installation is **not atomic**. The metadata
-records an incomplete update while files are replaced. Rerun the same shell
-installer and immutable release CID to recover. Preserve the original identity;
-the installer refuses to replace a missing identity in a recorded installation.
-There is no automatic rollback or crash-consistent multi-file transaction.
-Stop the existing service before replacing its package, then activate it after
-successful installation. Installation mutations take the shared
-`~/.ww-installation.lock`; competing operations refuse instead of changing files.
-The lock remains outside `~/.ww` so software removal cannot unlink an active lock.
-The first native preflight can leave this empty lock file even when installation
-is refused. Keep the lock file in place. An interrupted native Host transaction also blocks
-legacy installation and removal until its recorded recovery completes.
+`install` refuses a different existing native artifact and directs the operator
+to `upgrade`. It refuses a different FHS package and directs the operator to
+`image update`. Re-running a newer shell installer cannot bypass these checks.
+Same-artifact repair can restore missing owned software; unknown collisions,
+symlinks, and altered owned files cause refusal. Unknown FHS files remain intact.
 
-`ww perform update` revalidates the owned installed payload and refreshes the
-managed installation. Explicit installed payloads take precedence over embedded
-installation seeds. `ww perform upgrade` fails before changing files and directs
-the operator to the current installer.
+Version-2 `installation.json` names executable and FHS ownership separately.
+It retains legacy namespace/service hashes as provenance. Complete version-1
+receipts migrate under the installation lock, with `installation-v1.json` kept
+as a backup. Incomplete version-1 receipts require the exact recorded package
+and original identity; missing legacy artifacts must be restored before migration.
+No migration rewrites namespace or service bytes.
 
-The internal [native upgrade engine](native-upgrades.md) does not yet provide a
-production command. Authenticated artifact selection and native operational
-admission remain required before enabling Host replacement.
+Fresh installation uses atomic file replacement plus an incomplete receipt.
+The complete installation is not one atomic filesystem operation. Rerun the
+same package to recover an interrupted installation. Managed startup rejects
+incomplete ownership and pending FHS updates.
 
-`scripts/uninstall.sh` requires Python 3 with `fcntl` to acquire the same lock on
-Linux and macOS. Missing Python or failed lock acquisition leaves the installation
-intact. The script retains its existing whole-directory removal behavior;
-the separate #740 command migration will change that policy.
+`image update` runs with the installed Host so production static validation uses
+that Host's engine. It retains both complete baseline generations under
+`.fhs-recovery/` and records `image-update.json` before replacing either file.
+Startup holds `~/.ww-installation.lock` through managed baseline capture. A
+running Host keeps its previously captured baseline.
+
+After interruption, repeat `ww image update`. Recovery finishes the recorded
+target when retained bytes verify, otherwise restores the retained previous
+baseline. Recovery never selects another release in the same invocation. If
+neither generation is available, startup stays closed and recovery evidence
+remains. Unknown changed files cause refusal. Namespace configuration and signed
+state are never part of FHS rollback. `image-update-retained.json` identifies the
+retained transaction after completion.
+
+The result includes `previous_fhs` and selected `fhs` kernel/status BLAKE3 hashes.
+If recovery restores the previous generation without a recorded release CID,
+`release` is null; the exact selected hashes still identify the restored bytes.
+
+The result names `~/.ww/fhs` and reports activation as false. Namespace or CLI
+overlays can shadow changed baseline paths. Existing namespace configuration,
+including legacy `etc/ns/ww` publication targets, remains unchanged. A custom
+`WW_FHS_ROOT` or service baseline remains an external packaging responsibility.
+Activate the managed baseline with a separate start or restart when intended.
+
+All software and registration mutations share `~/.ww-installation.lock`.
+Competing operations refuse. Keep the lock inode in place; the lock can remain
+after a refused preflight. Pending Host recovery blocks FHS, install, and removal
+operations; pending FHS recovery blocks native upgrade and managed startup.
+
+`uninstall` never recursively removes `~/.ww`. It verifies software ownership,
+removes owned service registration with checked lifecycle results, and deletes
+only the three software paths. Service removal retains an exact configuration
+backup. Stop/unload failure preserves registration. The shell uninstaller only
+delegates to the installed `ww uninstall`; it has no separate purge behavior.
+
+For a pending Host transaction whose installed executable cannot launch, use:
+
+```sh
+sh scripts/install.sh --recover
+sh scripts/install.sh --recover --release <RECORDED_RELEASE_CID>
+```
+
+Recovery requires an existing `host-upgrade.json`. The default locator is the
+untrusted `installed-release.json`; supply the exact recorded release explicitly
+when that locator is unavailable. The shell binds the authenticated manifest to
+the requested root and verifies the Host bytes before invoking the native
+recovery-only entry point. The native entry point
+holds the installation lock, reauthenticates the typed release, verifies its own
+executable bytes, and matches the recorded generation before calling `Engine::recover`.
+It never falls through to fresh installation or new-release selection.
+
+The shell uses the configured Kubo CLI for staging. Native reauthentication uses
+`--ipfs-url`, `IPFS_API`, or `http://localhost:5001`, in that order. Configure both
+endpoints when using a nondefault Kubo. The recorded release must contain a Host
+with this recovery entry point. Missing, incompatible, or unrelated artifacts
+cause refusal. Recovery preserves the native operational gates below.
+
+## Native upgrade integration gates
+
+`upgrade` now consumes authenticated descriptor selection and the #739 engine.
+A new `install --release` stores an untrusted release-CID locator; every upgrade
+reauthenticates that release and verifies the installed bytes. Legacy and local
+bootstrap installations without that locator cannot substitute ownership hashes
+for release authentication.
+
+Native replacement remains unavailable: `NativeService` refuses candidate
+compatibility and live restart admission. No CLI flag bypasses those checks.
+Exact authenticated no-ops and permitted recorded recovery can complete without
+replacement. Automatic channel discovery also remains unavailable until an
+independently trusted raw IPNS channel identity is provisioned; explicit
+`--release CID` does not lower a channel freshness floor.
+
+Retained signed evidence, atomic native-provenance transition, effective-deployment
+compatibility, child-side startup admission, exact running artifact/readiness,
+and measured restart deadlines remain integration gates. See
+[native Host replacement](native-upgrades.md). The installer is not an upgrade
+fallback, and CLI implementation does not authorize a production rollout.
 
 ## Build and container contract
 

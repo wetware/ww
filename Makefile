@@ -224,7 +224,7 @@ IPNS_KEY ?=
 
 # Best-effort publish: runs as part of `make all`. If Kubo isn't running,
 # the build continues without a CID (HostPathLoader fallback).
-# Default IPNS publication is host-owned and runs through `ww perform update`
+# IPNS publication is Host-owned and requires explicit namespace configuration
 # plus the daemon republisher. This build target only imports the tree.
 try-publish-std: fhs
 	@$(MAKE) publish-std 2>/dev/null \

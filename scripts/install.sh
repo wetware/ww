@@ -1,17 +1,18 @@
 #!/bin/sh
-# Wetware installer (IPFS-first)
-# Usage: curl -sSf https://raw.githubusercontent.com/wetware/ww/master/scripts/install.sh | sh
-#   or:  curl -sSf ... | sh -s -- --version <CID>
+# Wetware installer for an explicitly selected authenticated release.
+# Usage: curl -sSf https://raw.githubusercontent.com/wetware/ww/master/scripts/install.sh | sh -s -- --release <CID>
 set -eu
 export LC_ALL=C
 
-IPNS_NAME="/ipns/releases.wetware.run"
-IPNS_TIMEOUT=60
-VERSION_CID=""
+RELEASE_CID=""
+RECOVER=false
+RECOVERY_IPFS_URL=${IPFS_API:-http://localhost:5001}
 TRUSTED_RELEASE_KEYS=/etc/wetware/release-keys
 VERIFY_MANIFEST=""
 VERIFY_SIGNATURE=""
 WW_HOME="${HOME}/.ww"
+# The cleanup trap owns only directories created by this invocation.
+WW_TMPDIR=""
 
 # --- TTY detection & output helpers ---
 
@@ -116,25 +117,30 @@ trap cleanup EXIT
 # --- Parse arguments ---
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version)
+    --release)
       if [ $# -lt 2 ] || [ -z "$2" ]; then
-        echo "Error: --version requires a CID argument"; exit 1
+        echo "Error: --release requires a CID argument"; exit 1
       fi
-      VERSION_CID="$2"; shift 2 ;;
-    --trusted-release-keys|--verify-manifest|--signature)
-      [ $# -ge 2 ] && [ -n "$2" ] || die "$1 requires a file argument"
+      RELEASE_CID="$2"; shift 2 ;;
+    --recover) RECOVER=true; shift ;;
+    --trusted-release-keys|--verify-manifest|--signature|--ipfs-url)
+      [ $# -ge 2 ] && [ -n "$2" ] || die "$1 requires an argument"
       case "$1" in
         --trusted-release-keys) TRUSTED_RELEASE_KEYS=$2 ;;
         --verify-manifest) VERIFY_MANIFEST=$2 ;;
         --signature) VERIFY_SIGNATURE=$2 ;;
+        --ipfs-url) RECOVERY_IPFS_URL=$2 ;;
       esac
       shift 2 ;;
     --help)
-      echo "Usage: install.sh [--version CID] [--trusted-release-keys FILE]"
+      echo "Usage: install.sh --release CID [--trusted-release-keys FILE]"
+      echo "       install.sh --recover [--release CID] [--ipfs-url URL] [--trusted-release-keys FILE]"
       echo "       install.sh --verify-manifest FILE --signature FILE [--trusted-release-keys FILE]"
       echo "  Trust keys: independently provisioned /etc/wetware/release-keys by default"
-      echo "  --version  Install a specific release by immutable CID"
-      echo "             (default: resolve latest via IPNS)"
+      echo "  --release  Install a specific release by immutable CID"
+      echo "  Automatic channel selection requires a provisioned freshness contract."
+      echo "  --recover  Recover only the pending native Host transaction"
+      echo "  --ipfs-url Native recovery Kubo HTTP endpoint (default: IPFS_API or http://localhost:5001)"
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -220,12 +226,158 @@ verify_manifest() {
   ' "$manifest" || die "Malformed SHA-256 release manifest"
 }
 
+# The public package builder stores the <=1 MiB manifest as one raw block.
+# Bind that block to the requested root independently of Kubo before executing
+# any downloaded Host. This is a flat directory membership check, not a general
+# IPLD decoder or a substitute for native typed-descriptor verification.
+verify_release_binding() {
+  if ! ipfs block get "$RELEASE_CID" > "$WW_TMPDIR/release-root"; then
+    die "Could not fetch release root block"
+  fi
+  [ "$(wc -c < "$WW_TMPDIR/release-root")" -le 2097152 ] \
+    || die "Release root exceeds 2 MiB"
+  # Encode the fixed CIDv1 / DAG-PB / SHA-256 profile locally. Comparing the
+  # entire canonical string also rejects other codecs and nonzero base32 padding.
+  printf '\001\160\022\040' > "$WW_TMPDIR/root-cid"
+  openssl dgst -sha256 -binary "$WW_TMPDIR/release-root" >> "$WW_TMPDIR/root-cid" \
+    || die "Could not hash release root"
+  od -An -v -tu1 "$WW_TMPDIR/root-cid" > "$WW_TMPDIR/root-cid-bytes" \
+    || die "Could not read release root CID"
+  actual_cid=$(awk '
+    BEGIN { alphabet="abcdefghijklmnopqrstuvwxyz234567"; printf "b" }
+    { for (i=1; i<=NF; i++) {
+        bits+=8; value=value*256+$i
+        while (bits>=5) {
+          bits-=5; scale=2^bits
+          printf "%s", substr(alphabet, int(value/scale)+1, 1)
+          value%=scale
+        }
+      }
+    }
+    END { if (bits) printf "%s", substr(alphabet, value*2^(5-bits)+1, 1) }
+  ' "$WW_TMPDIR/root-cid-bytes") || die "Could not encode release root CID"
+  [ "$actual_cid" = "$RELEASE_CID" ] || die "Release root CID mismatch"
+  openssl dgst -sha256 -binary "$WW_TMPDIR/CHECKSUMS.txt" > "$WW_TMPDIR/manifest-digest" \
+    || die "Could not hash release manifest"
+  manifest_digest=$(od -An -v -tx1 "$WW_TMPDIR/manifest-digest" | tr -d ' \n')
+  od -An -v -tu1 "$WW_TMPDIR/release-root" > "$WW_TMPDIR/root-bytes" \
+    || die "Could not read release root"
+  # Accept only the producer profile: sorted unique ASCII names, canonical
+  # length varints, exact Hash/Name/Tsize fields, and plain-directory Data.
+  # Other links remain opaque; only CHECKSUMS.txt grants payload authority.
+  awk -v digest="$manifest_digest" -v size="$(wc -c < "$WW_TMPDIR/CHECKSUMS.txt")" '
+    function fail() { exit 1 }
+    function number(end,    value,scale,b,count) {
+      value=0; scale=1
+      for (count=1; count<=4; count++) {
+        if (pos>end) fail()
+        b=bytes[pos++]; value+=(b%128)*scale
+        if (value>2097152) fail()
+        if (b<128) { if (count>1 && b==0) fail(); return value }
+        scale*=128
+      }
+      fail()
+    }
+    function field(tag,end,    field_length) {
+      if (pos>end || bytes[pos++]!=tag) fail()
+      field_length=number(end)
+      if (field_length>end-pos+1) fail()
+      return pos+field_length-1
+    }
+    # Validate u64 Tsize without rounding large values in awk. Only a small
+    # raw manifest size is interpreted; unrelated artifact sizes stay opaque.
+    function tsize(end,    count,b,value,scale) {
+      value=0; scale=1
+      for (count=1; count<=10; count++) {
+        if (pos>end) fail()
+        b=bytes[pos++]
+        if (count==10 && b>1) fail()
+        if (count<=4) { value+=(b%128)*scale; scale*=128 }
+        if (b<128) {
+          if (count>1 && b==0) fail()
+          return count<=4 ? value : -1
+        }
+      }
+      fail()
+    }
+    { for (i=1; i<=NF; i++) bytes[++total]=$i }
+    END {
+      pos=1
+      while (pos<=total) {
+        if (bytes[pos]==10) {
+          if (data++) fail()
+          data_end=field(10,total)
+          if (data_end!=pos+1 || bytes[pos]!=8 || bytes[pos+1]!=1) fail()
+          pos+=2
+          if (links && pos<=total) fail()
+        } else {
+          if (++links>1024) fail()
+          end=field(18,total)
+          hash_end=field(10,end); hash=""
+          if (hash_end-pos+1!=36 || bytes[pos]!=1 || bytes[pos+2]!=18 || bytes[pos+3]!=32 ||
+              (bytes[pos+1]!=85 && bytes[pos+1]!=112 && bytes[pos+1]!=113)) fail()
+          while (pos<=hash_end) hash=hash sprintf("%02x",bytes[pos++])
+          name_end=field(18,end); name=""
+          while (pos<=name_end) {
+            if (bytes[pos]<32 || bytes[pos]>126) fail()
+            name=name sprintf("%c",bytes[pos++])
+          }
+          if (name=="" || name=="." || name==".." || name~/[^A-Za-z0-9._-]/ ||
+              ("x" name)<=("x" previous)) fail()
+          previous=name
+          if (pos>end || bytes[pos++]!=24) fail()
+          link_size=tsize(end)
+          if (pos!=end+1) fail()
+          if (name=="CHECKSUMS.txt") {
+            if (hash!="01551220" digest || link_size!=size) fail()
+            matched=1
+          }
+        }
+      }
+      if (data!=1 || !matched) fail()
+    }
+  ' "$WW_TMPDIR/root-bytes" || die "Invalid release root or manifest binding"
+}
+
+if "$RECOVER"; then
+  [ -z "$VERIFY_MANIFEST" ] && [ -z "$VERIFY_SIGNATURE" ] \
+    || die "cannot combine --recover with manifest verification"
+  [ -d "$WW_HOME" ] && [ ! -L "$WW_HOME" ] \
+    && [ -f "$WW_HOME/host-upgrade.json" ] && [ ! -L "$WW_HOME/host-upgrade.json" ] \
+    || die "Recovery requires a pending Host upgrade in a regular host-upgrade.json file."
+  # This locator grants no authority. The native recovery entry point checks
+  # the authenticated release against the exact pending generation under lock.
+  # Accept only the compact JSON emitted by InstalledRelease. Fail closed on
+  # alternative encodings instead of adding a second general JSON parser.
+  if [ -z "$RELEASE_CID" ]; then
+    pointer="$WW_HOME/installed-release.json"
+    [ -f "$pointer" ] && [ ! -L "$pointer" ] \
+      || die "Recovery release locator is unavailable; supply --release CID for the recorded generation."
+    pointer_size=$(wc -c < "$pointer")
+    [ "$pointer_size" -le 1024 ] \
+      || die "Recovery release locator is invalid; supply --release CID for the recorded generation."
+    pointer_value=$(cat "$pointer")
+    [ "${#pointer_value}" -eq "$pointer_size" ] \
+      || die "Recovery release locator is noncanonical; supply --release CID for the recorded generation."
+    RELEASE_CID=$(printf '%s' "$pointer_value" | sed -n 's/^{"version":1,"release":"\([A-Za-z0-9]*\)"}$/\1/p')
+    [ "$pointer_value" = "{\"version\":1,\"release\":\"$RELEASE_CID\"}" ] \
+      || die "Recovery release locator is invalid; supply --release CID for the recorded generation."
+  fi
+fi
+
 if [ -n "$VERIFY_MANIFEST" ] || [ -n "$VERIFY_SIGNATURE" ]; then
-  [ -n "$VERIFY_MANIFEST" ] && [ -n "$VERIFY_SIGNATURE" ] && [ -z "$VERSION_CID" ] || die "Verification requires manifest and signature only"
+  [ -n "$VERIFY_MANIFEST" ] && [ -n "$VERIFY_SIGNATURE" ] && [ -z "$RELEASE_CID" ] || die "Verification requires manifest and signature only"
   WW_TMPDIR=$(mktemp -d)
   verify_manifest "$VERIFY_MANIFEST" "$VERIFY_SIGNATURE"
   exit 0
 fi
+
+[ -n "$RELEASE_CID" ] \
+  || die "Automatic release selection is unavailable until trusted channel freshness is provisioned. Specify --release CID."
+printf '%s\n' "$RELEASE_CID" | awk '
+  /^bafybei[a-z2-7]{52}$/ { valid=1 }
+  END { exit !(NR == 1 && valid) }
+' || die "--release requires one canonical CIDv1 DAG-PB SHA-256 release root, without a path or query."
 
 # --- Detect platform ---
 OS="$(uname -s)"
@@ -256,63 +408,21 @@ if ! ipfs id >/dev/null 2>&1; then
 fi
 
 # --- Header ---
-if $IS_TTY; then
+if "$RECOVER"; then
+  printf 'Recovering the recorded Host transaction...\n'
+elif $IS_TTY; then
   printf '\n\342\232\227\357\270\217  Installing wetware...\n'
 else
   printf 'Installing wetware...\n'
 fi
 
-# --- Resolve release ---
-if [ -n "$VERSION_CID" ]; then
-  IPFS_BASE="/ipfs/${VERSION_CID}"
-else
-  spin "Resolving latest release..."
-
-  RESOLVED_CID=""
-  WW_RESOLVE_TMP=$(mktemp /tmp/ww-ipns-resolve.XXXXXXXX)
-  ipfs name resolve "$IPNS_NAME" > "$WW_RESOLVE_TMP" 2>/dev/null &
-  RESOLVE_PID=$!
-
-  i=0
-  while [ $i -lt $IPNS_TIMEOUT ]; do
-    if ! kill -0 "$RESOLVE_PID" 2>/dev/null; then
-      RESOLVED_CID=$(cat "$WW_RESOLVE_TMP" 2>/dev/null || true)
-      break
-    fi
-    i=$((i + 1))
-    sleep 1
-  done
-
-  kill "$RESOLVE_PID" 2>/dev/null || true
-  wait "$RESOLVE_PID" 2>/dev/null || true
-  rm -f "$WW_RESOLVE_TMP"
-
-  if [ -z "$RESOLVED_CID" ]; then
-    die "IPNS resolution failed" \
-      "Your IPFS node could not resolve releases.wetware.run." \
-      "Try again in a few minutes, or install by CID:" \
-      "  curl -sSf .../install.sh | sh -s -- --version <CID>" \
-      "Release CIDs: https://github.com/wetware/ww/releases"
-  fi
-
-  # Validate resolved CID looks like an IPFS path
-  case "$RESOLVED_CID" in
-    /ipfs/bafy*|/ipfs/Qm*) ;;
-    *) die "IPNS resolved to unexpected value" \
-         "Got: ${RESOLVED_CID}" \
-         "Expected /ipfs/bafy... or /ipfs/Qm..." ;;
-  esac
-
-  IPFS_BASE="$RESOLVED_CID"
-  spin_ok "Resolved latest release"
-fi
+# --- Select immutable release ---
+IPFS_BASE="/ipfs/${RELEASE_CID}"
 
 WW_TMPDIR=$(mktemp -d)
 
-# Stage the complete package before touching installed state. SHA-256 is the
-# release contract; missing or duplicate entries are errors.
+# Authenticate all staged bytes before executing the selected Host.
 BIN_PATH="bin/ww/${OS_NAME}/${ARCH_NAME}/ww"
-mkdir -p "${WW_TMPDIR}/fhs/boot" "${WW_TMPDIR}/fhs/bin"
 if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt" > "${WW_TMPDIR}/CHECKSUMS.txt"; then
   die "Could not fetch required CHECKSUMS.txt"
 fi
@@ -321,6 +431,7 @@ if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt.sig" > "${WW_TMPDIR}/CHECKSUMS.txt.sig
   die "Could not fetch required CHECKSUMS.txt.sig"
 fi
 verify_manifest "${WW_TMPDIR}/CHECKSUMS.txt" "${WW_TMPDIR}/CHECKSUMS.txt.sig"
+verify_release_binding
 
 fetch_verified() {
   package_path="$1"
@@ -343,19 +454,33 @@ fetch_verified() {
   [ "$actual" = "$expected" ] || die "Checksum mismatch: ${package_path}"
 }
 
-spin "Fetching verified Host and FHS payloads..."
+spin "Fetching verified Host..."
 fetch_verified "$BIN_PATH" "${WW_TMPDIR}/ww"
+chmod +x "${WW_TMPDIR}/ww"
+spin_ok "Fetched verified Host"
+
+if "$RECOVER"; then
+  "${WW_TMPDIR}/ww" upgrade --recover-only --release "$RELEASE_CID" \
+    --ipfs-url "$RECOVERY_IPFS_URL" --trusted-release-keys "$TRUSTED_RELEASE_KEYS"
+  exit 0
+fi
+
+spin "Fetching verified FHS payloads..."
+mkdir -p "${WW_TMPDIR}/fhs/boot" "${WW_TMPDIR}/fhs/bin"
 fetch_verified "fhs/boot/kernel.wasm" "${WW_TMPDIR}/fhs/boot/kernel.wasm"
 fetch_verified "fhs/bin/status.wasm" "${WW_TMPDIR}/fhs/bin/status.wasm"
-chmod +x "${WW_TMPDIR}/ww"
 spin_ok "Fetched verified package"
 
 # The candidate validates components, identity, ownership and configuration.
 # Its installer repeats preflight and uses atomic replacement for each file.
 # Multi-file installation is recoverable by rerunning this installer, not atomic.
-"${WW_TMPDIR}/ww" perform install --check \
-  --payload "${WW_TMPDIR}/fhs" --executable "${WW_HOME}/bin/ww"
-"${WW_TMPDIR}/ww" perform install \
-  --payload "${WW_TMPDIR}/fhs" --executable "${WW_HOME}/bin/ww"
+"${WW_TMPDIR}/ww" install --check --payload "${WW_TMPDIR}/fhs" \
+  --manifest "${WW_TMPDIR}/CHECKSUMS.txt" --signature "${WW_TMPDIR}/CHECKSUMS.txt.sig" \
+  --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
+  --bootstrap-release "${IPFS_BASE#/ipfs/}"
+"${WW_TMPDIR}/ww" install --payload "${WW_TMPDIR}/fhs" \
+  --manifest "${WW_TMPDIR}/CHECKSUMS.txt" --signature "${WW_TMPDIR}/CHECKSUMS.txt.sig" \
+  --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
+  --bootstrap-release "${IPFS_BASE#/ipfs/}"
 "${WW_HOME}/bin/ww" --version
-printf '\nInstalled Host and FHS. Use the service activation command printed above.\n'
+printf '\nInstalled Host, baseline FHS, and identity. Register a service separately with ww daemon install.\n'

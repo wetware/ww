@@ -29,8 +29,8 @@ The `WW_CELL_MODE` envvar identifies application plumbing:
 | absent | process input/output | process-local P3 RPC transport; PID0 receives a `Membrane` |
 
 The packaged PID0 implementation is `std/kernel`. For each epoch, the Host selects
-`/boot/kernel.wasm` from the final effective FHS. Embedded bytes seed installation
-only. PID0 uses the granted P3 transport for Cap'n Proto RPC. PID0 receives
+`/boot/kernel.wasm` from the final effective FHS. Installation consumes an
+authenticated software package; runtime never falls back to embedded bytes. PID0 uses the granted P3 transport for Cap'n Proto RPC. PID0 receives
 the broad process-local root `Membrane`. Each ordinary child receives the
 parent-selected `Membrane` supplied to its spawn or listener registration.
 
@@ -85,6 +85,19 @@ Canonical CIDv1/raw/BLAKE3 routing-key derivation is the optional pure
 Grant authoring must prefer an image-bound Executor over Runtime, scoped Signer
 over Identity, Finder without Announcer when observation is sufficient, and a
 capability protocol over bearer tokens in args/env.
+
+Software lifecycle boundaries:
+- `install`: Host, baseline FHS, and identity; no daemon or namespace publication.
+- `image update`: authenticated baseline only; no native replacement or restart.
+- `upgrade`: authenticated native selection through #739; native operational
+  compatibility and restart admission still gate actual replacement.
+- `uninstall`: owned software and service removal; preserve private user state.
+- `daemon install/uninstall`: disabled registration or checked removal with backup.
+
+`perform` has no aliases. `init`, `build`, and `push` remain project scaffolding,
+artifact compilation, and content publication. `/bin` is an artifact namespace,
+not an execution policy. `ns` edits startup overlays; it does not promote a head.
+See [installation and recovery](installation.md) for current integration gates.
 
 Quick start with Kubo running and an installed identity:
 ```

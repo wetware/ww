@@ -233,7 +233,9 @@ fn systemd_snapshot(show: &str, configuration: &[u8]) -> Result<ServiceSnapshot>
                 && sub == "dead"
                 && pid == 0
                 && property("FragmentPath")?.is_empty()
-                && property("ExecStart")?.is_empty()
+                // systemctl omits an empty ExecStart array for an absent unit,
+                // including with --all. Nonempty command evidence still fails.
+                && properties.get("ExecStart").is_none_or(|value| value.is_empty())
                 && property("DropInPaths")?.is_empty()
                 && configuration.is_empty(),
             "systemd absence conflicts with loaded service evidence"
@@ -280,7 +282,15 @@ fn systemd_snapshot(show: &str, configuration: &[u8]) -> Result<ServiceSnapshot>
         "FragmentPath",
         "DropInPaths",
     ] {
-        parts.push(property(key)?.as_bytes());
+        // systemctl omits the EnvironmentFiles array when no files are
+        // configured. Keep its empty identity slot; configured files remain
+        // part of the fingerprint.
+        let value = if key == "EnvironmentFiles" {
+            properties.get(key).copied().unwrap_or_default()
+        } else {
+            property(key)?
+        };
+        parts.push(value.as_bytes());
     }
     Ok(ServiceSnapshot {
         registered: true,
@@ -805,6 +815,43 @@ mod tests {
         assert_eq!(observed.running, RunningState::Stopped);
         assert!(systemd_snapshot("", b"").is_err());
         assert!(systemd_snapshot(&absent.replace("MainPID=0", "MainPID=7"), b"").is_err());
+    }
+
+    #[test]
+    fn systemd_absent_accepts_omitted_empty_execstart_but_rejects_command_evidence() {
+        // Actual systemd 255 output for a nonexistent unit. --all also omits
+        // the empty ExecStart and EnvironmentFiles array properties.
+        let absent = "MainPID=0\nResult=success\nEnvironment=\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nFragmentPath=\nDropInPaths=\nUnitFileState=\nNeedDaemonReload=no\n";
+        let observed = systemd_snapshot(absent, b"").unwrap();
+        assert!(!observed.registered);
+        assert_eq!(observed.running, RunningState::Stopped);
+        assert!(systemd_snapshot(&format!("{absent}ExecStart=/bin/sleep 300\n"), b"").is_err());
+        assert!(systemd_snapshot(
+            &absent.replace("ActiveState=inactive", "ActiveState=active"),
+            b""
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn systemd_omitted_empty_environment_files_preserves_configuration_identity() {
+        let omitted = SYSTEMD.replace("EnvironmentFiles=\n", "");
+        let before = systemd_snapshot(SYSTEMD, b"unit bytes").unwrap();
+        let after = systemd_snapshot(&omitted, b"unit bytes").unwrap();
+        assert_eq!(before.configuration_identity, after.configuration_identity);
+        let configured =
+            format!("{omitted}EnvironmentFiles=/home/testww/probe.env (ignore_errors=yes)\n");
+        let changed = systemd_snapshot(&configured, b"unit bytes").unwrap();
+        assert_ne!(
+            before.configuration_identity,
+            changed.configuration_identity
+        );
+        let missing_command = omitted
+            .lines()
+            .filter(|line| !line.starts_with("ExecStart="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(systemd_snapshot(&missing_command, b"unit bytes").is_err());
     }
 
     #[test]

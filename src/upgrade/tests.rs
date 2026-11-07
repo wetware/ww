@@ -486,7 +486,7 @@ fn malformed_incomplete_receipts_and_unauthenticated_old_bytes_refuse() {
         let home = fixture();
         let mut receipt = Receipt::load(&home.path().join(".ww")).unwrap();
         match invalid {
-            0 => receipt.version = 2,
+            0 => receipt.version = 3,
             1 => receipt.complete = false,
             2 => receipt.hashes[0] = "unrecognized old bytes".into(),
             _ => (),
@@ -702,6 +702,91 @@ fn pending_recovery_runs_before_new_release_selection() {
         }
     );
     assert_eq!(disk_matches_receipt(home.path()), OLD);
+}
+
+#[test]
+fn authenticated_recovery_accepts_only_exact_recorded_generations() {
+    for executable in [OLD, NEW] {
+        let home = fixture();
+        let mut service = FakeService::absent();
+        service.incompatible = Some(selected(NEW).artifact);
+        let mut engine = open(home.path());
+        assert!(engine
+            .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+            .is_err());
+        engine.require_pending_recovery().unwrap();
+        assert_eq!(
+            engine
+                .recover_authenticated(&mut service, TIMEOUT, selected(executable))
+                .unwrap(),
+            Outcome::Recovered {
+                artifact: selected(OLD).artifact,
+                action: RecoveryAction::AbortedBeforeReplacement,
+                live_ready: false,
+            }
+        );
+        assert_eq!(disk_matches_receipt(home.path()), OLD);
+        assert!(!home.path().join(".ww/host-upgrade.json").exists());
+        assert_eq!((service.restarts, service.stops), (0, 0));
+        unchanged_user_state(home.path());
+    }
+}
+
+#[test]
+fn authenticated_recovery_rejects_unrelated_artifact_or_provenance_without_changes() {
+    for mismatch in 0..5 {
+        let home = fixture();
+        let mut service = FakeService::absent();
+        service.incompatible = Some(selected(NEW).artifact);
+        let mut engine = open(home.path());
+        assert!(engine
+            .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+            .is_err());
+        let journal = std::fs::read(&engine.paths.journal).unwrap();
+        let mut executable = selected(OLD);
+        match mismatch {
+            0 => executable = selected(THIRD),
+            1 => executable.release = "another-authenticated-release".into(),
+            2 => executable.version = "another-version".into(),
+            3 => executable.revision = "another-revision".into(),
+            4 => executable.platform = "another-platform".into(),
+            _ => unreachable!(),
+        }
+        let error = engine
+            .recover_authenticated(&mut service, TIMEOUT, executable)
+            .unwrap_err();
+        assert!(error.to_string().contains("not a recorded Host generation"));
+        assert_eq!(std::fs::read(&engine.paths.journal).unwrap(), journal);
+        assert_eq!(disk_matches_receipt(home.path()), OLD);
+        assert_eq!((service.restarts, service.stops), (0, 0));
+        unchanged_user_state(home.path());
+    }
+}
+
+#[test]
+fn authenticated_recovery_requires_pending_ownership_and_preserves_service_gates() {
+    let home = fixture();
+    {
+        let mut engine = open(home.path());
+        assert!(engine.require_pending_recovery().is_err());
+        assert!(engine
+            .recover_authenticated(&mut FakeService::absent(), TIMEOUT, selected(OLD))
+            .is_err());
+        assert_eq!(disk_matches_receipt(home.path()), OLD);
+        assert!(!engine.paths.journal.exists());
+    }
+    prepare_recovery(home.path(), false);
+    let mut engine = open(home.path());
+    let mut service = FakeService::absent();
+    service.incompatible = Some(selected(OLD).artifact);
+    let error = engine
+        .recover_authenticated(&mut service, TIMEOUT, selected(OLD))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("previous Host is incompatible"));
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), NEW);
+    assert!(engine.paths.journal.exists());
+    assert_eq!((service.restarts, service.stops), (0, 0));
+    unchanged_user_state(home.path());
 }
 
 #[test]
@@ -1234,4 +1319,49 @@ fn deadline_before_stopped_upgrade_commit_preserves_pending_transaction() {
 #[test]
 fn deadline_before_stopped_recovery_commit_preserves_pending_transaction() {
     assert_stopped_deadline_boundary("recover", false);
+}
+
+#[test]
+fn scoped_v2_receipt_survives_refusal_recovery_upgrade_and_rollback() {
+    let home = fixture();
+    let root = home.path().join(".ww");
+    let mut receipt = Receipt::load(&root).unwrap();
+    receipt.version = 2;
+    storage::write_record(&root.join("installation.json"), &receipt.encode().unwrap()).unwrap();
+    let mut service = FakeService::absent();
+    service.incompatible = Some(selected(NEW).artifact);
+    assert!(open(home.path())
+        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .is_err());
+    assert!(root.join("host-upgrade.json").exists());
+    let recovery = open(home.path())
+        .operator_upgrade::<&[u8]>(&mut service, TIMEOUT, || {
+            panic!("recovery must precede release selection")
+        })
+        .unwrap();
+    assert!(matches!(
+        recovery,
+        Outcome::Recovered {
+            action: RecoveryAction::AbortedBeforeReplacement,
+            live_ready: false,
+            ..
+        }
+    ));
+    assert!(!root.join("host-upgrade.json").exists());
+    assert_eq!(
+        Receipt::load(&root).unwrap().encode().unwrap(),
+        receipt.encode().unwrap()
+    );
+    service.incompatible = None;
+    assert!(matches!(
+        install(home.path(), &mut service, OLD, NEW),
+        Outcome::Installed { live_ready: false }
+    ));
+    assert_eq!(Receipt::load(&root).unwrap().version, 2);
+    open(home.path())
+        .operator_rollback(&mut service, TIMEOUT)
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("bin/ww")).unwrap(), OLD);
+    assert_eq!(Receipt::load(&root).unwrap().version, 2);
+    unchanged_user_state(home.path());
 }

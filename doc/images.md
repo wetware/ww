@@ -148,7 +148,7 @@ distinct identities. The persistent Host PeerId does not depend on kernel bytes.
 
 ## Installed host layout
 
-`ww perform install` and `ww perform update` separate private host state from
+`ww install` and `ww image update` separate private host state from
 the local image root:
 
 ```
@@ -169,6 +169,10 @@ The generated service captures `~/.ww/fhs` as its lowest-priority baseline and
 preserves explicit image arguments as CLI overlays. The service reads
 `~/.ww/etc/ns` through a separate host-only
 configuration argument. The service does not mount `~/.ww` as an image.
+
+`image update` changes only the owned baseline and retains recovery bytes. It
+does not restart the Host, alter namespaces, or advance an authoritative head.
+Fresh installation does not create a `ww` namespace publisher.
 
 Put intentional local image content under `~/.ww/fhs`, or pass an explicit
 image path to `ww daemon install`. Do not put private host state in an image

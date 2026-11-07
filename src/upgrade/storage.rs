@@ -60,7 +60,7 @@ impl Paths {
     }
 }
 
-pub(super) fn directory(path: &Path) -> Result<()> {
+pub fn directory(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspect directory {}", path.display()))?;
     // SAFETY: geteuid has no pointer arguments.
@@ -73,7 +73,7 @@ pub(super) fn directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn exists(path: &Path) -> Result<bool> {
+pub fn exists(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -96,7 +96,7 @@ fn regular(file: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn open_read(path: &Path) -> Result<File> {
+pub fn open_read(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -126,7 +126,7 @@ fn open_write(path: &Path, executable: bool) -> Result<File> {
     Ok(file)
 }
 
-pub(super) fn read_record(path: &Path) -> Result<Option<Vec<u8>>> {
+pub fn read_record(path: &Path) -> Result<Option<Vec<u8>>> {
     if !exists(path)? {
         return Ok(None);
     }
@@ -141,7 +141,7 @@ pub(super) fn read_record(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-pub(super) fn write_record(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_record(path: &Path, bytes: &[u8]) -> Result<()> {
     ensure!(
         bytes.len() <= MAX_RECORD,
         "transaction record exceeds 64 KiB"
@@ -166,7 +166,7 @@ pub(super) fn write_record(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn rename(from: &Path, to: &Path) -> Result<()> {
+pub fn rename(from: &Path, to: &Path) -> Result<()> {
     open_read(from)?;
     if exists(to)? {
         open_read(to)?;
@@ -183,7 +183,7 @@ pub(super) fn rename(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn sync_parent(path: &Path) -> Result<()> {
+pub fn sync_parent(path: &Path) -> Result<()> {
     let parent = path.parent().context("transaction file parent")?;
     directory(parent)?;
     checkpoint("directory.sync.before")?;
@@ -194,7 +194,7 @@ pub(super) fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn remove(path: &Path) -> Result<()> {
+pub fn remove(path: &Path) -> Result<()> {
     if !exists(path)? {
         return Ok(());
     }
