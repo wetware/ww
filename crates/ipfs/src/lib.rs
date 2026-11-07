@@ -19,10 +19,11 @@ use async_trait::async_trait;
 use cache::{PathWriteNotOwned, PathWriteSourcePanic};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+pub mod car;
 pub mod cid_identity;
 mod composed;
+pub mod ipns;
 pub mod map;
-pub mod release;
 pub mod snapshot;
 
 pub use composed::{parse_kubo_dag_import_response, KuboResponseLimit};
@@ -559,7 +560,9 @@ impl HttpClient {
         Self::with_http_client(ipfs_url, http_client)
     }
 
-    fn with_http_client(ipfs_url: String, http_client: reqwest::Client) -> Self {
+    /// Use an explicitly configured transport, including a private Unix socket.
+    /// The caller controls endpoint, redirects, proxy policy, and deadlines.
+    pub fn with_http_client(ipfs_url: String, http_client: reqwest::Client) -> Self {
         Self {
             http_client,
             base_url: ipfs_url.trim_end_matches('/').to_string(),

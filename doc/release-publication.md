@@ -1,10 +1,10 @@
-# Release-publication foundation (#737)
+# Public release formats and private publication
 
-The host library in `ipfs::map` provides a bounded immutable inline IPLD Map,
-initially used for release metadata.
-`ipfs::release::Owner` journals release retention and publication transitions.
-Neither module changes the running Host, deployment cache, release scripts,
-CI publication holds, or production configuration.
+`ww-release` defines release authentication, descriptors, consumer freshness and
+offline package construction. Private `wetware/infra` owns official publication
+policy, the sole durable `Owner`, journal, recovery, Kubo announcement and signing
+workflow. Production publication remains held. This extraction authorizes no
+credential provisioning, deployment or activation.
 
 ## Map v1
 
@@ -64,184 +64,134 @@ The future work must evaluate reuse or evolution of this inline implementation
 before introducing an independent Map. This foundation selects neither a
 general value model nor a future collection API.
 
-## One release owner
+### Single-block link decoding
 
-`Owner::open(existing_directory, domain)` holds an exclusive OS file lock for
-its lifetime. All publishers for one release channel must use this same
-private directory, including across process restarts. Each async method requires
-an exclusive mutable borrow. A second owner for the same directory fails
-immediately, rather than running competing retention/publication operations.
+`ipfs::map::inline_v1::links(bytes)` returns links from one bounded inline-profile
+value or version-1 Map envelope. The helper preserves both accepted forms,
+including standalone lists that are not Map envelopes. It does not verify a
+block's CID, walk a DAG, establish closure or decide retention.
 
-The operator must provision a durable private directory on a local filesystem
-with advisory locks, atomic rename, file sync, and directory sync. The operator
-must not replace the directory, delete its lock, restore an older snapshot,
-or edit journal files while the owner operates. NFS, hostile directory writers,
-and malicious filesystem rollback are outside this contract.
+Package DAG-CBOR decoding still requires a Map envelope. The public package
+implementation does not substitute the broader inline-profile decoder.
 
-`domain` binds the journal to one operator-provisioned Kubo repository and
-publication channel. Adapter domain mismatches fail before backend calls.
-A domain string is not backend authentication or an exclusive Kubo pin claim.
-Provisioning must route all channel publication through this owner and prevent
-other clients from deleting its pins. Changing Kubo repositories requires
-explicit migration; reusing the same label for an empty repository is invalid.
-No second registry is added to the deployment cache.
+## Crate and executable boundary
 
-## State and ordering
-
-```mermaid
-stateDiagram-v2
-    [*] --> Candidate: begin(expected current)
-    Candidate --> Candidate: journal stage intent / import / journal acknowledgement
-    Candidate --> Retained: final root acknowledged, no pending stage
-    Retained --> Retained: durable publication intent / uncertain adapter result
-    Retained --> Published: conditional authenticated adapter acknowledges
-    Candidate --> Retired: abandon, retaining any pins
-    Retained --> Retired: abandon before publication or fenced rejection
-    Published --> Retired: newer publication commits
-```
-
-A generation identifies one journal record. `begin` rejects a stale expected
-publication or a competing active candidate. An exact retry returns the active
-generation. Generations are never reused. Publication generations order local
-attempts; they do not prove source revision ancestry or consumer freshness.
-
-`retain_stage` validates all supplied CID hashes and reachable links before
-recording intent or calling Kubo. A stage must contain every reachable block,
-except subgraphs rooted at this owner's previously acknowledged stage roots.
-Merely finding a CID in Kubo does not authorize reuse. Retired acknowledged
-stage roots remain eligible because retirement never removes their pins.
-Duplicate supplied CIDs are charged against input bounds and deduplicated for
-traversal. Unreachable supplied blocks are rejected.
-
-Release blocks support raw, strict DAG-PB, and bounded DAG-CBOR profile values,
-with SHA-256 CIDs. DAG-PB accepts both legal positions of the Data field and
-rejects noncanonical link/CID fields. DAG-CBOR supports Map envelopes or
-standalone bounded profile values. Unknown Map versions are rejected by
-`Map::decode`; graph traversal does not interpret a standalone list as a
-release descriptor. Descriptor/schema validation remains #738 work.
-
-The graph validator delegates DAG-CBOR link extraction to `crate::map::links`.
-This defines the currently supported format/codec boundary. It does not require
-future persistent collections under #698 to use the current Map envelope or
-`Value` representation. Any new format needs explicit traversal and retention
-contracts; this foundation does not select those formats.
-
-| Owner/import limit | Value |
-| --- | ---: |
-| Conservative encoded CAR charge per stage | 64 MiB |
-| Supplied block | 2 MiB |
-| Supplied block records per stage, including duplicates | 16,384 |
-| Traversed links per stage | 65,536 |
-| Recorded stages, including pending stages, across owner | 4,096 |
-| Release records, including retired records | 256 |
-| State file | 1 MiB |
-
-These limits reject excess work; they do not silently prune history. At the
-owner limits, coordinated migration or a separately reviewed compaction policy
-is required. The caller supplies one bounded stage at a time. This owner does
-not fetch remote descendants or accumulate a complete release in memory.
-Existing `CaptureBatch` and snapshot APIs remain the artifact-acquisition
-machinery for the future producer. #738 must connect acquisition to these
-bounded stages without trusting arbitrary preexisting backend blocks.
-
-`KuboRetention` reuses `HttpClient::import_composed`, with a positive configured
-operation timeout. Kubo's CAR importer holds its GC lock through block import,
-offline recursive pinning, and pin flush. The HTTP client consumes the entire
-bounded response and rejects `PinErrorMsg`, malformed acknowledgements, and
-streaming errors, including errors carried by HTTP 200 responses.
-Each recorded stage root remains recursively pinned. Larger releases build
-and acknowledge child stages before importing a parent that links those roots.
-
-`finish_retention` requires an acknowledged stage for the exact final release
-root. Only then can `publish` persist publication intent and invoke a publisher.
-A successful publication moves the prior current record to Retired in the
-same durable state replacement that selects the new Published record.
-
-## Durable writes and recovery
-
-The journal uses `owner.lock`, `state.json`, and at most one `state.next` file.
-It follows the existing private-state write pattern in `rpc::keys`:
-write temporary file, sync file, rename, sync directory. It adds exclusive
-process locking, bounded state validation, and a persistent initialization
-marker. A missing initialized journal is an error. Temporary files are never
-recovery authority. Recovery rejects unknown versions, malformed/noncanonical
-state, inconsistent transitions, missing retention evidence, and exceeded bounds.
-
-A journal write failure poisons the owner handle, including failure after
-rename. Further operations fail until the caller reopens and reconciles.
-Durable writes contain no async cancellation points. They can briefly block
-the calling thread; this is an offline publication library, not a guest I/O path.
-
-| Interruption | Recovery |
+| Component | Owner and interface |
 | --- | --- |
-| Before stage intent | Candidate remains; resupply stage. |
-| During acquisition/import | Pending root remains; publication is forbidden. |
-| Pin succeeded but acknowledgement was lost | `reconcile_retention` imports an empty CAR for the recorded root, recursively verifies/pins it, then journals acknowledgement. |
-| Pending graph was incomplete | Reconciliation fails; resupply the exact immutable stage. |
-| After acknowledgement, before Retained | Retry `finish_retention`. |
-| After publication intent, before/after remote effect | Retry `publish` with the same generation and adapter. New candidates and retirement remain blocked. |
-| Adapter gives terminal fenced rejection | Record becomes Retired; current publication does not advance. |
-| After remote acknowledgement, before local commit | Same-intent retry reconciles the remote effect before recording Published. |
-| During any snapshot replacement | Reopen the complete old or new snapshot; reject invalid state. |
+| `ww-release` default features | `auth`, `descriptor`, authenticated selection and consumer freshness |
+| `ww-release` feature `package` | `Metadata`, `prepare`, `finalize`, `Package`, CAR/tree transfer functions and offline `ww-release-package` |
+| `ipfs` | Map, CID identity, pure `ipns` records, bounded CARv1 framing and Kubo/IPLD transport |
+| `cell::packaging` | Production FHS component validation and staging |
+| `ww` | Host deployment `Publisher`, `RecordStore`, `Republisher`; compatibility reexports |
+| Private `ww-release-publisher` | Official metadata/sequence policy, stage planning, single durable Owner and announcement |
 
-The backend contract includes content integrity and durable recursive retention.
-Storage corruption, backend data loss, external unpinning, and operator rollback
-invalidate that contract; the journal is not a storage audit or repair service.
-The implementation validates supplied content and closure, and Kubo checks
-complete offline reachability during each recursive retention attempt.
+`ww::release::{auth,descriptor}`, `ww::packaging`, and the pure items under
+`ww::ipns` reexport the same types and functions. The extraction removes
+`ipfs::release`, including its 11 public Owner/policy declarations. This is an
+intentional pre-1.0 API removal. No public journal or publication-policy adapter
+replaces that module.
 
-## Publication and authentication boundary
+Private infra depends on `ww-release` and `ipfs` at one exact public Git revision.
+It does not depend on root `ww` or its embedded-guest build prerequisites.
+The package feature still uses Cell/Wasmtime for production FHS validation.
+Public crates have no private dependency.
 
-`Publisher` has no production implementation. A CID, domain string, generation,
-or successful retention is never accepted as authentication.
+`Package` exposes `open`, `root`, `authenticate`, `fetch`, `read_block`, and `links`.
+Construction and acquisition check graph closure, CID integrity, supported codecs,
+canonical block formats, depth, block count and byte limits. The graph pass
+bounds distinct blocks and examined edges and checks cached subtree height.
+Private stage partitioning and its traversal budget remain private policy.
+Acquisition does not authenticate a release; callers must supply independent
+trust to `authenticate`.
 
-#738 must provide an adapter that:
+Four free functions support offline transfer without adding publication policy:
+`pack_tree`, `unpack_tree`, `read_car`, and `write_car`. Unsigned input trees use
+the same UnixFS builder as release packages. Signed CAR export preserves the
+existing release root and every reachable block. CAR import checks bounded
+framing, CID integrity and exact graph closure before returning a package.
+Unsigned tree materialization also bounds expanded bytes, file/directory counts,
+path depth and total traversal work; shared blocks do not bypass those bounds.
 
-1. Authenticates the exact selected descriptor/root and its artifact bindings.
-2. Enforces revision ancestry, compatibility, and authorized rollback policy.
-3. Binds the complete `PublicationIntent` to one stable channel and operation.
-4. Conditionally applies the transition against `previous` and reconciles exact
-   retries without regressing a newer authoritative value.
-5. Treats cancellation/errors as uncertain results. If it returns `Rejected`,
-   it must durably fence retries and delayed effects for that intent.
-
-A plain IPNS PUT does not meet this contract. Existing signed-IPNS sequence and
-record persistence machinery must be evaluated by #738; this owner does not
-create another IPNS watermark or signing-key store. Consumer freshness and
-legacy-reader migration also remain #738 responsibilities.
-
-## Retirement and ownership
-
-Kubo pins have CID identity, not independent reference counts. Shared descendants
-and duplicate roots therefore do not authorize cleanup. `retire` changes only
-journal metadata. `prune` always returns an ownership error. Neither the backend
-trait nor the owner exposes unpin; destruction only releases the file lock.
-Unknown import outcomes can leave extra retained or unpinned blocks. The owner
-reports pending roots and retains evidence instead of guessing at cleanup.
-
-## Validation and limits of evidence
-
-Pure tests cover canonical bytes/CIDs, strict malformed inputs, all Map bounds,
-immutable operations, and explicit in-memory storage. Owner fixtures cover
-state ordering, loss of both acknowledgements, cancellation, stale/competing
-candidates, domain mismatch, shared roots, journal bounds/corruption, write
-failure poisoning, and refusal to prune.
-
-The crash suite exits a subprocess without destructors at four filesystem
-checkpoints for each of seven transition commits: Candidate, stage intent,
-stage acknowledgement, Retained, publication intent, Published, and Retired.
-The writes exercise actual file and directory sync. These are process-crash
-tests, not simulated power cuts or proof of storage-controller persistence.
-
-The opt-in Kubo 0.33.0 suite uses disposable offline repositories:
+The transfer profile uses one CARv1 root and deterministic encoded-CID block
+ordering. It rejects duplicate, missing and unreachable blocks. CAR framing
+has a separate bounded allowance above the existing 8 GiB payload budget.
+`ipfs::car::{Reader,Writer,Limits}` supplies shared streaming framing. Kubo import
+continues to use bounded CAR stages and its existing acknowledgement contract.
+Neither CAR import nor a staging Kubo pin supplies publication retention authority.
 
 ```sh
-WW_TEST_REQUIRE_KUBO=1 cargo test -p ipfs --test release_kubo -- --nocapture
+cargo test --locked -p ww-release
+cargo test --locked -p ww-release --features package
+cargo test --locked -p ipfs
+cargo build --release --locked -p ww-release --features package --bin ww-release-package
 ```
 
-It checks GC blocked during a partially streamed CAR, a 72 MiB graph retained
-through bounded stages, shared descendants, missing/corrupt supplied blocks,
-HTTP-200 pin errors, cancellation after real retention, and lost acknowledgement
-followed by abrupt Kubo restart and owner reconciliation. Publication remains
-a fixture. Running without `WW_TEST_REQUIRE_KUBO` skips real Kubo execution.
-No production Kubo, production IPNS identity, signing key, or publisher is used.
+## Authentication and release graph
+
+`ww_release::descriptor::Descriptor` uses canonical versioned IPLD Map bytes.
+The descriptor contains real links to the FHS and native artifacts, platform
+and ABI identity, file sizes and SHA-256 digests, actual source/build provenance,
+and the Host/PID0 compatibility profile. Runtime file digests differ from UnixFS
+storage-root identities. Reused Host artifacts retain their actual build revision.
+
+The graph remains acyclic: artifact roots → descriptor → `RELEASE-DESCRIPTOR`
+binding → manifest → detached signature → final UnixFS transport root. The final
+root directly links the descriptor as `release-descriptor` and preserves legacy
+installer paths. The binding is exactly canonical descriptor CID text plus LF;
+its ordinary SHA-256 entry is signed by the existing #412 Ed25519 authority.
+The descriptor never includes the signature, manifest hash, or enclosing root.
+
+Consumers authenticate the manifest and binding before descriptor interpretation.
+Artifact selection requires a supported platform, matching compatibility profile,
+and verified artifact bytes. The consumer watermark stores the raw signed IPNS
+record and authenticated release proof in one locked durable state file. It
+rejects lower IPNS sequences, equal-IPNS-sequence value changes, lower signed
+release sequences, and equal-release-sequence descriptor changes. Expiry does not
+erase either floor. Explicit historical selection authenticates and checks
+compatibility without updating channel freshness state.
+
+The existing shell installer continues to authenticate its manifest and payloads.
+It does not interpret descriptors or persist freshness watermarks. Legacy readers
+therefore retain their existing replay limitation during migration. #739 owns
+Host replacement; #740 owns CLI migration. Neither is changed here.
+
+## Discovery and local authority
+
+Official ordering belongs to infra's single durable Owner. IPNS remains eventual
+discovery. The Host's deployment-IPNS publisher has a separate lifecycle.
+
+Three events have different meanings:
+
+| Event | Meaning |
+| --- | --- |
+| Local commitment | The owner selects a completely retained, authenticated release and persists its immutable announcement request in the same journal transaction. |
+| Delivery acknowledgement | Kubo accepted one request for the committed root. The journal can record that acknowledgement. |
+| Eventual discoverability | A consumer finds the signed IPNS record and fetches its release graph. No local transaction or acknowledgement proves this event globally. |
+
+A delayed older request can finish after a newer request and temporarily expose
+an older release. Consumers with an accepted signed release watermark reject
+that release. A fresh consumer has no floor and cannot prove it found the latest
+signed release through IPNS alone. The tracked
+[`tests/publication-negative-control`](../tests/publication-negative-control/README.md)
+reproduces the delayed-write counterexample with unmodified Boxo v0.27.2 and
+LevelDB. The counterexample is regression evidence, not a production incident.
+
+## Qualification and holds
+
+Public tests preserve canonical bytes/CIDs, signatures, provenance, strict package
+closure and consumer freshness. Real FHS tests use the production Cell validator.
+The public Boxo delayed-write control remains independently reproducible.
+
+Private infra owns the 28 crash checkpoints, lock probes, journal recovery,
+retention ordering, direct Kubo tests and private executable qualification.
+Process-crash tests do not prove power-loss durability. Local Kubo tests do not
+qualify production storage, worker isolation, credentials or public discovery.
+
+The public `publish` workflow job remains unconditionally disabled and refuses
+publication. `make publish` refuses before builds or external calls. The private
+signing/publication workflow also remains inactive. Existing publication fences
+and the production hold remain in force.
+
+See [the public package handoff](release-publisher-infra-contract.md),
+[authentication](release-authentication.md), and
+[infra's operator contract](https://github.com/wetware/infra/blob/master/ops/vps/publisher-contract.md).

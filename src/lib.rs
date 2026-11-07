@@ -41,7 +41,7 @@ pub mod ns;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod packaging;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod release_auth;
+pub mod release;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod telemetry;
 #[cfg(not(target_arch = "wasm32"))]

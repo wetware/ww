@@ -59,7 +59,7 @@ is not a release downloader. Its caller must trust the executed Host and local
 payload. Container registry distribution and deployment-head authority are
 separate from this IPFS release contract.
 
-`ww::release_auth::TrustedKeys` accepts separately supplied keyring bytes.
+`ww::release::auth::TrustedKeys` accepts separately supplied keyring bytes.
 `authenticate` returns an `AuthenticatedManifest` only after strict Ed25519
 verification and manifest parsing. `verify_artifact` explicitly uses SHA-256.
 #739 must obtain trust independently and use this verification before consuming
@@ -70,16 +70,16 @@ and package validation. A staging tree is not an authorized release.
 `scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS` signs the
 exact staged manifest and verifies the result against independent trusted keys.
 It rejects an existing signature destination and a private key inside the release
-tree. The local publisher signs before `ipfs add`. The remote publisher verifies
-against its independently provisioned keyring before its first remote operation.
-The remote verifier comes from the reviewed checkout, never the release tree.
+tree. `ww-release-package prepare` constructs the binding before signing.
+`finalize` authenticates the signed tree before producing the transport root.
+The worker verifies against its independently provisioned keyring before local
+commitment; the verifier comes from the installed executable, never the release tree.
 
-The workflow references the proposed `release-signing` protected environment.
-Only the signing step receives `WW_RELEASE_SIGNING_KEY`. Repository, master ref,
-event type, and successful prerequisite jobs gate that step. Only master pushes
-and master workflow dispatches qualify. The signer also rejects PRs, forks, tags,
-and other branches. These checks complement environment protections; they do
-not establish that production protections have been configured.
+Official signing admission now belongs to private `wetware/infra`. Its inactive
+protected signing job validates the reviewed public artifact handoff before key
+access. Public CI receives no release-signing secret. The reusable signing script
+checks explicit files and independent trust; it does not allocate CI authority.
+Environment protections and signing custody require separate approval.
 
 Private key material exists only in an owner-accessible temporary directory
 outside the artifact tree. The step disables tracing, uses `umask 077`, clears
@@ -114,7 +114,7 @@ use ephemeral runners and restrict access to runner storage.
    `/etc/wetware/release-keys`, owned by an administrator and not writable by
    untrusted users. For a user-managed installation, provision a protected local
    path and pass `--trusted-release-keys` explicitly. Releases cannot rotate keys.
-5. After separate CI approval, configure environment secret
+5. After separate CI approval in `wetware/infra`, configure environment secret
    `WW_RELEASE_SIGNING_KEY` with the private PEM and environment variable
    `WW_RELEASE_TRUSTED_KEYS` with the public keyring. A final LF is optional in
    the CI variable; the workflow adds one if absent. Restrict `release-signing`
@@ -130,10 +130,11 @@ use ephemeral runners and restrict access to runner storage.
    #737/#738's publication owner when that integration is ready. Do not activate
    a competing owner or journal from this work.
 
-For authorized local publication, set `WW_RELEASE_SIGNING_KEY_FILE` to the
-private PEM outside the release directory. `WW_RELEASE_TRUSTED_KEYS` selects the
-independent public keyring, defaulting to `/etc/wetware/release-keys`.
-These settings do not authorize publication by themselves.
+For offline qualification, run `ww-release-package prepare`, then
+`scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS`, followed
+by `ww-release-package finalize`. Keep the private PEM outside the release
+directory and use independently supplied public trust. These commands do not
+announce a release or authorize production publication.
 
 ## Rotation, compromise, and unsigned releases
 
@@ -160,36 +161,50 @@ bytes if recovery requires them. Do not add a temporary skip-verification flag.
 Until the first signed release and trust distribution are ready, distributing
 this new installer as the default would strand users. That cutover is NO-GO.
 
-## #738 integration contract
+## #738 descriptor binding
 
-#412 signs manifest bytes; #738 owns descriptor schema, retention, discovery,
-and freshness. There must be one release trust root and one publication owner.
-The compatible binding order is:
+The descriptor uses the existing #412 signer. It adds no signing authority.
+The frozen binding order is:
 
-1. Finalize and retain the descriptor and its artifact graph through #737/#798.
-2. Write `RELEASE-DESCRIPTOR` containing the exact canonical descriptor CID and
-   one LF. Add its SHA-256 record to `CHECKSUMS.txt` before signing. Alternatively,
-   add a SHA-256 record for exact descriptor bytes. #738 must choose and freeze
-   its representation, supported CID profile, and parser.
-3. Sign the final manifest through #412. Keep the manifest and signature outside
-   the descriptor's hashed content. The descriptor must not contain their hashes
-   or the enclosing release-root CID. This dependency direction has no hash cycle.
-4. The consumer authenticates the manifest, verifies the binding file's exact
-   bytes, validates the CID/schema, and fetches/verifies the descriptor. A CID
-   alone never authorizes selection. #738 must retain real traversable IPLD links;
-   a CID string in this binding file does not retain the artifact graph.
+1. Construct immutable artifact graphs and the canonical version-1 descriptor.
+   The descriptor contains actual IPLD links and excludes its enclosing root,
+   manifest, and signature.
+2. Write `RELEASE-DESCRIPTOR` as canonical descriptor CID text plus exactly one
+   LF. Add the binding's ordinary SHA-256 entry to `CHECKSUMS.txt`.
+3. Sign the exact manifest bytes with the existing Ed25519 procedure.
+4. Finalize the legacy-compatible UnixFS transport root. It reaches all payloads,
+   manifest, signature, binding, and a direct `release-descriptor` IPLD link.
+5. Begin the owner candidate for that final root. Retain complete bounded child
+   stages and then the final root. Authenticate before authoritative local
+   commitment. Announce through IPNS after that commitment.
 
-This is an available format seam, not implemented descriptor publication.
-The generic authenticated manifest verifier can verify this binding file today.
-The installer does not interpret descriptors. #738 must test tampered binding
-bytes, mismatched descriptor/platform data, and missing binding records.
+`AuthenticatedRelease` verifies the signature, binding bytes, descriptor CID,
+schema, and manifest artifact bindings. Selection checks platform and Host/PID0
+compatibility. Artifact verification checks exact reconstructed bytes before use.
+The shell installer keeps its existing signed-manifest path during migration;
+it does not interpret descriptors or persist consumer freshness state.
+
+The Rust consumer records raw signed IPNS evidence and the signed release proof
+in one locked durable watermark. IPNS sequence and release sequence are separate
+monotonic floors. Historical immutable selection never rewinds that watermark.
+The watermark includes the public keyring used at acceptance. Reopening uses
+that historical keyring only to verify the persisted floor. Each new discovery
+must authenticate with the current independently provisioned keyring. A consumer
+offline during key overlap can therefore preserve its floor after the old key
+is removed, then accept a higher release signed by the new key. Historical keys
+never authorize a new discovery. This relies on the documented private-state
+integrity boundary; hostile filesystem writes and rollback are excluded.
+A fresh consumer cannot prove latest release discovery through IPNS alone.
+See [release-publication.md](release-publication.md) for local commitment,
+uncertain delivery, recovery, and the approved divergence from #737's CAS claim.
 
 ## Limits and assumptions
 
-Authentication does not establish freshness, channel identity, source provenance,
-or reproducibility. A malicious publisher can replay a previously signed release
-or deny service. #738 owns consumer freshness and intentional rollback policy;
-reuse existing signed-IPNS watermark machinery where applicable. `VERSION`,
+Manifest authentication alone does not establish freshness or reproducibility.
+The authenticated descriptor additionally binds channel identity and asserted
+source provenance. Producer provenance is an authorized assertion, not a
+reproducible-build proof. A malicious publisher can replay a previously signed release
+or deny service. Rust descriptor consumers enforce the freshness policy above. `VERSION`,
 `REVISION`, examples, and installer files are not implicitly authenticated by
 payload-only checksum entries. Do not derive authority from those files.
 

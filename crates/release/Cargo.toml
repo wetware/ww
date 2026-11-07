@@ -1,0 +1,36 @@
+[package]
+name = "ww-release"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+package = ["dep:cell", "dep:clap"]
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = "0.22.1"
+bytes = { workspace = true }
+chrono = { version = "0.4.42", features = ["serde"] }
+cid = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+ipfs = { path = "../ipfs" }
+ipld-dagpb = "=0.2.2"
+libp2p-identity = { workspace = true, features = ["peerid"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+cell = { path = "../cell", optional = true }
+clap = { version = "4.5.51", features = ["derive"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }
+libp2p-identity = { workspace = true, features = ["ed25519", "rand"] }
+rust-ipns = { git = "https://github.com/wetware/rust-ipfs", rev = "c6770c290e4aa03f5cf6e550f44ac518308b7094", default-features = false, features = ["ed25519", "rsa"] }
+
+[[bin]]
+name = "ww-release-package"
+path = "src/bin/ww-release-package.rs"
+required-features = ["package"]

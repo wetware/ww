@@ -51,6 +51,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cleanup certification. Post-publication descriptor work observes cancellation.
 
 ### Removed
+- Public `ipfs::release` publication-policy and journal APIs. Official publication
+  moves to private `wetware/infra`; public `ww-release` retains formats,
+  authentication, offline packages and consumer freshness. Existing protocol,
+  FHS and IPNS paths remain available through reexports. Production remains held.
 - Obsolete kernel-selector migration handling and tests for retired CLI flags
   and routing identifiers. `--kernel` now receives Clap's ordinary unknown-argument
   error; `WW_KERNEL` has no effect. PID0 selection still uses `/boot/kernel.wasm`
@@ -60,12 +64,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Authenticated release descriptors and package library (#738).** Public
+  `ww-release` binds canonical descriptors to Ed25519 manifests, preserves actual
+  producer provenance, verifies Host/FHS bytes and compatibility, and maintains
+  consumer freshness floors. Its `package` feature supplies `ww-release-package`
+  for offline construction, bounded CAR transfer, and verification. CAR transfer
+  preserves release CIDs and shares the existing UnixFS builder and graph checks.
+  Existing `ww::release` paths reexport
+  the same protocol types. Official publication, the sole durable Owner/journal
+  and protected signing move to private `wetware/infra`. Public CI builds and
+  validates artifacts. `make publish` refuses; production publication remains held.
 - **Durable release foundation (#737).** A bounded immutable host IPLD Map
   uses canonical DAG-CBOR and explicit blockstore persistence. A separate
-  release owner journals staged retention and conditional publication intent,
+  release owner journals staged retention and publication intent,
   serializes attempts, reconciles uncertain acknowledgements, and refuses
-  destructive pin cleanup. Authentication and production publication remain
-  gated on #738; no production publisher is enabled.
+  destructive pin cleanup. #738 defines local commitment and authenticated
+  integration; no production publisher is enabled.
 - **Executor worker liveness (#390).** The Host metrics endpoint reports each
   worker's lifecycle, confirmed progress age, and five-second stall threshold.
   A 250 ms LocalSet heartbeat distinguishes blocked workers from Cells awaiting

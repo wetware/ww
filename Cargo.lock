@@ -1390,6 +1390,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "walkdir",
  "wasmparser 0.254.0",
  "wasmtime",
  "wasmtime-wasi",
@@ -3610,12 +3611,16 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "chrono",
  "cid",
  "futures",
+ "hex",
  "http",
  "http-body-util",
  "ipld-dagpb",
+ "libp2p-identity",
  "reqwest",
+ "rust-ipns",
  "serde",
  "serde_ipld_dagcbor",
  "serde_json",
@@ -8372,7 +8377,6 @@ dependencies = [
  "auth",
  "axum",
  "base58",
- "base64",
  "blake3",
  "bytes",
  "capnp",
@@ -8415,6 +8419,7 @@ dependencies = [
  "wit-component 0.244.0",
  "wit-parser 0.244.0",
  "ww-cache",
+ "ww-release",
 ]
 
 [[package]]
@@ -8431,6 +8436,30 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "ww-release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "cell",
+ "chrono",
+ "cid",
+ "clap",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "ipfs",
+ "ipld-dagpb",
+ "libp2p-identity",
+ "rust-ipns",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

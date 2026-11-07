@@ -43,12 +43,9 @@ if grep -Eq '\b(kubectl|ssh|scp|rsync|rollout|patch|scale)\b|set[[:space:]]+imag
   fail "image-release job must not contain a deployment transport or mutation command"
 fi
 
-# The IPFS publisher is the only workflow job that retains VPS transport for
-# this POC. Keeping SSH/kubectl out of every other job prevents a new deploy
-# job, namespaced mutation, or wrapper from silently restoring CI ownership of
-# ww-master.
+# Public jobs must not acquire infrastructure transport authority.
 if grep -Eq '\b(kubectl|ssh|scp|rsync)\b' <<<"$non_publish_workflow"; then
-  fail "only the IPFS publisher may use remote or Kubernetes transport"
+  fail "public workflow must not use remote or Kubernetes transport"
 fi
 
 grep -Fq "github.event_name == 'workflow_dispatch'" <<<"$release_job" \
@@ -66,31 +63,21 @@ grep -Fq 'needs: [changes, test, validate-release, release_image]' "$WORKFLOW" \
   || fail "IPFS publication must wait for the image build, not a deployment"
 grep -Fq 'name: Publish to IPFS' "$WORKFLOW" \
   || fail "workflow must retain IPFS publication"
-grep -Fq 'get pod -l app=ipfs-daemon --field-selector=status.phase=Running -o json | jq -r' "$WORKFLOW" \
-  || fail "IPFS publisher must consider only Running daemon pods"
-grep -Fq 'select(.metadata.deletionTimestamp | not)' "$WORKFLOW" \
-  || fail "IPFS publisher must exclude terminating daemon pods"
-grep -Fq 'any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\")' "$WORKFLOW" \
-  || fail "IPFS publisher must select a Ready daemon pod"
-retry_loop="$({
-  awk '
-    /for attempt in 1 2 3; do/ { in_loop = 1 }
-    in_loop { print }
-    in_loop && /^        done$/ { exit }
-  ' "$WORKFLOW"
-})"
-pod_selection="POD=\"\$(select_ready_ipfs_pod)\""
-grep -Fq "$pod_selection" <<<"$retry_loop" \
-  || fail "IPFS publisher must reselect a Ready daemon pod for each retry"
-publish_retry_selection="$({
-  awk '
-    /Re-select immediately before publish/ { capture = 1 }
-    capture { print }
-    capture && /else/ { exit }
-  ' "$WORKFLOW"
-})"
-grep -Fq "$pod_selection" <<<"$publish_retry_selection" \
-  || fail "IPFS publisher must reselect a Ready daemon pod before each publish retry"
+grep -Fq 'Refuse unintegrated infrastructure publication' "$WORKFLOW" \
+  || fail 'IPFS publisher must refuse until infra integration is reviewed'
+handoff_step="$(awk '
+  /^    - name: Refuse unintegrated infrastructure publication$/ { capture = 1; next }
+  capture && /^    - / { exit }
+  capture { print }
+' "$WORKFLOW")"
+grep -Eq '^        exit 1$' <<<"$handoff_step" \
+  || fail 'unintegrated publication must fail closed'
+if grep -Eq '\b(ssh|scp|rsync|kubectl)\b|WW_RELEASE_SSH_' "$WORKFLOW"; then
+  fail 'unintegrated infrastructure transport remains in the workflow'
+fi
+if grep -Eq '\b(kubectl|rsync)\b' "$WORKFLOW"; then
+  fail "legacy cluster publication transport remains"
+fi
 if grep -Fq 'fetch_previous_binaries' "$WORKFLOW"; then
   fail "std-only releases must consume the current run's Host binaries"
 fi
@@ -114,46 +101,85 @@ grep -Fq 'bash tests/test_container_boot.sh ww-validated:release' "$WORKFLOW" ||
 grep -Fq 'bash tests/test_container_boot.sh ww-validated:source' "$WORKFLOW" || fail 'source boot gate missing'
 grep -Fq 'docker load -i tested-image.tar' <<<"$release_job" || fail 'GHCR must publish the tested image'
 grep -Fq "            - 'scripts/**'" "$WORKFLOW" || fail 'installer-only changes must trigger release validation'
-grep -Fq 'linux/musl-x86_64' "$WORKFLOW" || fail 'IPFS must include fifth Host target'
+grep -Fq 'test_release_descriptor_package.sh' "$WORKFLOW" || fail 'descriptor package validation missing'
 
-# Release secrets belong only to the guarded signing step. These assertions
-# inspect source boundaries; environment protection settings require operator
-# verification before activation.
-signing_step="$(awk '
-  /^    - name: Sign exact release checksum manifest$/ { capture = 1; print; next }
-  capture && /^    - / { exit }
-  capture { print }
-' "$WORKFLOW")"
-[[ -n "$signing_step" ]] || fail 'release manifest signing step missing'
-for condition in "github.repository == 'wetware/ww'" "github.ref == 'refs/heads/master'" \
-  "github.event_name == 'push'" "github.event_name == 'workflow_dispatch'" \
-  "needs.test.result == 'success'" "needs.validate-release.result == 'success'" \
-  "needs.release_image.result == 'success'"; do
-  grep -Fq "$condition" <<<"$signing_step" || fail "signing admission lost: $condition"
-done
-# shellcheck disable=SC2016
-grep -Fq 'WW_RELEASE_SIGNING_KEY: ${{ secrets.WW_RELEASE_SIGNING_KEY }}' <<<"$signing_step" \
-  || fail 'signing key must be a step-scoped secret'
-[[ "$(grep -Fc 'secrets.WW_RELEASE_SIGNING_KEY' "$WORKFLOW")" == 1 ]] \
-  || fail 'signing key must not be exposed to other steps'
-! grep -Fq 'secrets.WW_RELEASE_SIGNING_KEY' <<<"$non_publish_workflow" \
-  || fail 'build or PR jobs received a release signing key'
-grep -Fq '    environment: release-signing' "$WORKFLOW" \
-  || fail 'signing requires a protected environment boundary'
-grep -Fq 'set +x' <<<"$signing_step" || fail 'signing must disable tracing'
-grep -Fq 'umask 077' <<<"$signing_step" || fail 'private key file permissions missing'
-grep -Fq 'unset WW_RELEASE_SIGNING_KEY WW_RELEASE_TRUSTED_KEYS' <<<"$signing_step" \
-  || fail 'signing subprocesses must not inherit the key secret'
-# shellcheck disable=SC2016
-grep -Fq 'mktemp -d "$RUNNER_TEMP/ww-signing.XXXXXXXX"' <<<"$signing_step" \
-  || fail 'private key must remain outside build and release artifacts'
-transport_step="$(awk '
-  /^    - name: Publish to IPFS via VPS$/ { capture = 1; next }
-  capture && /^    - / { exit }
-  capture { print }
-' "$WORKFLOW")"
-grep -Fq "if: steps.release-signature.outcome == 'success'" <<<"$transport_step" \
-  || fail 'publisher transport must require successful manifest authentication'
+# Official signing and publication policy belong to private wetware/infra.
+# Public CI builds artifacts and verifies them with disposable fixture keys.
+if grep -Eq 'secrets\.WW_RELEASE_SIGNING_KEY|environment: release-signing|wetware/infra|request-release\.py|ww-release-publisher' "$WORKFLOW"; then
+  fail 'public workflow retains private signing, source, or publisher access'
+fi
+grep -Fq 'cargo build --locked -p ww-release --features package --bin ww-release-package' "$WORKFLOW" \
+  || fail 'public offline package tool build missing'
+grep -Fq 'name: Validate public release package library' "$WORKFLOW" \
+  || fail 'public package feature tests missing'
+
+# The private handoff receives one raw CAR; the tested image uses a separate raw artifact.
+python3 - "$WORKFLOW" <<'PYGUARD'
+from pathlib import Path
+import re
+import sys
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+def validate_car_boundary(text):
+    validation = text.split('  validate-release:\n', 1)[1].split('  release_image:\n', 1)[0]
+    image = text.split('  release_image:\n', 1)[1].split('  publish:\n', 1)[0]
+    steps = re.split(r'^    - ', validation, flags=re.M)[1:]
+    staging = [step for step in steps if step.startswith('name: Archive validated release inputs as CAR\n')]
+    require(len(staging) == 1, 'release input CAR construction missing')
+    staging = staging[0]
+    require('for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 linux-musl-x86_64; do' in staging,
+            'release input must retain exactly five original receipt directories')
+    require('for receipt in REVISION SHA256SUMS PROVENANCE.json; do' in staging,
+            'release input receipt set changed')
+    copies = [line.strip() for line in staging.splitlines() if line.strip().startswith('cp ')]
+    require(copies == ['cp -R release-tree release-input/release-tree',
+                      'cp "artifacts/ww-$platform/$receipt" "release-input/artifacts/ww-$platform/$receipt"'],
+            'release input must contain only the release tree and original receipts')
+    require('./ww-release-package pack-tree --tree release-input --spool release-input-spool' in staging
+            and './ww-release-package export-car --spool release-input-spool --car release-input.car' in staging,
+            'release input must use the public content encoder')
+    uploads = [step for step in steps if 'uses: actions/upload-artifact@' in step]
+    require(len(uploads) == 2, 'release inputs and image must use separate artifacts')
+    for path in ('release-input.car', 'tested-image.tar'):
+        upload = [step for step in uploads if re.search(r'^        path: '+re.escape(path)+r'$', step, re.M)]
+        require(len(upload) == 1, 'missing single-file artifact: '+path)
+        require('actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9' in upload[0]
+                and '        archive: false\n' in upload[0] and '        if-no-files-found: error\n' in upload[0],
+                'release handoff must use pinned raw upload: '+path)
+    require('validated-release' not in validation+image, 'obsolete mixed release artifact remains')
+    require('uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333' in image
+            and '        name: tested-image.tar\n' in image
+            and '        skip-decompress: true\n' in image
+            and '        digest-mismatch: error\n' in image,
+            'image consumer must receive the exact tested raw image')
+
+text = Path(sys.argv[1]).read_text()
+validate_car_boundary(text)
+mutations = [
+    ('archive: false', 'archive: true'),
+    ('actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9', 'actions/upload-artifact@v7'),
+    ('name: tested-image.tar', 'name: release-input.car'),
+    ('skip-decompress: true', 'skip-decompress: false'),
+    ('digest-mismatch: error', 'digest-mismatch: warn'),
+    ('for receipt in REVISION SHA256SUMS PROVENANCE.json; do', 'for receipt in REVISION SHA256SUMS; do'),
+    ('cp -R release-tree release-input/release-tree', 'cp -R release-tree release-input/release-tree\n        cp ww-release-package release-input/tool'),
+    ('./ww-release-package export-car', './ww-release-package verify'),
+    ('./ww-release-package pack-tree', './ww-release-package verify'),
+    ('path: release-input.car', 'path: release-input-spool/'),
+    ('cp "artifacts/ww-$platform/$receipt"', 'cp "replacement/$receipt"'),
+]
+for old, new in mutations:
+    require(old in text, 'mutation target missing: '+old)
+    try:
+        validate_car_boundary(text.replace(old, new))
+    except AssertionError:
+        continue
+    raise AssertionError('raw CAR boundary accepted mutation: '+old)
+print(f'PASS: raw CAR source contract and {len(mutations)} mutation controls')
+PYGUARD
 
 # Freeze the existing job-level admission controls during the maintenance hold.
 # This covers ordinary Rust/metrics CI, release validation, GHCR and Pages.
