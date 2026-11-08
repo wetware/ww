@@ -107,6 +107,59 @@ class Inputs(unittest.TestCase):
 
 
 class Commands(unittest.TestCase):
+    def test_timeout_cleans_descendants_after_the_command_leader_exits(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            held = root / "descendant.lock"
+            ready = root / "descendant.json"
+            program = (
+                "import fcntl,json,os,pathlib,sys,time\n"
+                "child=os.fork()\n"
+                "if child: os._exit(0)\n"
+                "lock=open(sys.argv[1],'w')\n"
+                "fcntl.flock(lock,fcntl.LOCK_EX)\n"
+                "pathlib.Path(sys.argv[2]).write_text(json.dumps({'group':os.getpgrp()}))\n"
+                "time.sleep(60)\n"
+            )
+            runner = MODULE.Runner(root, root, 1)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "command deadline"):
+                    runner.run("orphan-output", [sys.executable, "-c", program, held, ready],
+                               deadline=time.monotonic() + 0.5)
+                self.assertTrue(ready.exists(), "descendant probe did not execute")
+                with held.open() as lock:
+                    until = time.monotonic() + 2
+                    while True:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            self.assertLess(time.monotonic(), until, "descendant survived cleanup")
+                            time.sleep(0.01)
+            finally:
+                if ready.exists():
+                    with held.open() as lock:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            # The held lock proves this probe's original group
+                            # still exists; do not signal a released/reused ID.
+                            os.killpg(json.loads(ready.read_text())["group"], signal.SIGKILL)
+
+    def test_readiness_manager_command_obeys_the_readiness_deadline(self):
+        class SlowManager(MODULE.Runner):
+            def run(self, name, argv, **kwargs):
+                return super().run(name, [sys.executable, "-c", "import time; time.sleep(1)"], **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = SlowManager(root, root, 0.1)
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "readiness deadline"):
+                MODULE.readiness(runner, {}, "slow-manager")
+            self.assertLess(time.monotonic() - started, 0.75)
+
     def test_cancellation_reaps_child_after_output_descriptors_close(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

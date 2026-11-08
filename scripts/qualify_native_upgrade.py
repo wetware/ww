@@ -195,18 +195,20 @@ class Runner:
                 require(cancelled is None or not cancelled(), f"command cancelled: {name}")
                 time.sleep(min(0.05, max(0, deadline - time.monotonic())))
         except BaseException:
-            if process.poll() is None:
+            # Do not reap the leader before signaling its owned group. A leader
+            # can exit while descendants retain the output pipes. During output
+            # drain, the unreaped leader also prevents its group ID being reused.
+            # In the later wait loop, cancellation is checked only while poll()
+            # reports that the leader is still live.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as error:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except PermissionError as error:
-                    # A process can finish between poll and the group signal.
-                    # Preserve a real refusal while reaping an already exited child.
-                    try:
-                        process.wait(timeout=0.1)
-                    except subprocess.TimeoutExpired:
-                        raise error
+                    process.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    raise error
             process.wait(timeout=5)
             raise
         finally:
@@ -428,7 +430,7 @@ def readiness(runner, state, name):
     last_error = "no running process"
     while time.monotonic() < deadline:
         try:
-            pid, invocation = manager_process(runner, name + "-process")
+            pid, invocation = manager_process(runner, name + "-process", deadline=deadline)
             with pinned_pid(pid):
                 token = process_token(pid)
                 expected = state["native"]["artifact"]["digest"]
@@ -451,7 +453,7 @@ def readiness(runner, state, name):
                     require(response["contract"] == state["disposition"]["contract"], "readiness contract differs from committed state")
                     require(process_token(pid) == token and sha256(Path(f"/proc/{pid}/exe")) == expected,
                             "process changed across readiness observation")
-                    require(manager_process(runner, name + "-process-after") == (pid, invocation),
+                    require(manager_process(runner, name + "-process-after", deadline=deadline) == (pid, invocation),
                             "manager invocation changed across readiness observation")
                     require(response["serving_ready"] and response["effective_root"]
                             and response["kernel_source"] and response["kernel_runtime"], "Host is not serving ready")
