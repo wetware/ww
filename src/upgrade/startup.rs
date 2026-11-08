@@ -518,12 +518,10 @@ impl Lease {
                 }) | libc::LOCK_NB,
             )
         };
-        ensure!(
-            status == 0,
-            "startup lease is busy: {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
+        if status != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("acquire startup lease {}", path.display()));
+        }
         let lease = Self {
             file,
             home: home.to_owned(),
@@ -949,6 +947,22 @@ mod tests {
         }
         .next_generation()
         .is_err());
+    }
+
+    #[test]
+    fn contended_startup_lease_preserves_the_would_block_error() {
+        let home = tempfile::tempdir().unwrap();
+        let mutation = MutationLock::acquire(home.path()).unwrap();
+        drop(StartupLease::exclusive_create(&mutation).unwrap());
+        let _reader = StartupLease::shared(home.path()).unwrap();
+        let error = StartupLease::exclusive(home.path()).err().unwrap();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::WouldBlock),
+            "contention must remain distinguishable from custody and other IO failures"
+        );
     }
 
     #[test]

@@ -70,6 +70,7 @@ enum NativePhase {
     Installed,
     Starting,
     Verified,
+    Containing,
     Committed,
     Restoring,
     Restored,
@@ -172,6 +173,15 @@ impl NativeJournal {
                 );
             }
             _ => bail!("quiescence target requires both contract and permit"),
+        }
+        if self.phase == NativePhase::Containing {
+            ensure!(
+                self.admission.is_some()
+                    && self.disposition.stop_intent
+                    && self.disposition.quiescence_contract.is_some()
+                    && self.disposition.quiescence_permit.is_some(),
+                "containment requires an exact admitted quiescence target and stop intent"
+            );
         }
         match &self.admission {
             Some(admission) => {
@@ -402,6 +412,24 @@ fn existing_inputs(
     ensure!(inputs.startup_identity()?==contract.startup && inputs.config.home==home && !inputs.config.insecure_ephemeral,
         "effective startup inputs changed; stop and explicitly admit the new inputs before native replacement");
     Ok(())
+}
+
+fn exclusive_startup_until(home: &Path, deadline: Instant) -> Result<StartupLease> {
+    loop {
+        check_deadline(deadline)?;
+        match StartupLease::exclusive(home) {
+            Ok(lease) => return Ok(lease),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|cause| cause.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                let remaining = deadline.saturating_duration_since(monotonic_now());
+                std::thread::sleep(Duration::from_millis(5).min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 impl Engine {
@@ -964,24 +992,48 @@ impl Engine {
     ) -> Result<Outcome> {
         let Err(error) = result else { return result };
         let containment = (|| -> Result<bool> {
-            let Some((journal, _)) = read_native(&self.paths)? else {
+            let Some((mut journal, rollback)) = read_native(&self.paths)? else {
                 return Ok(false);
             };
             if !matches!(
                 journal.phase,
-                NativePhase::Starting | NativePhase::Verified | NativePhase::Restoring
+                NativePhase::Starting
+                    | NativePhase::Verified
+                    | NativePhase::Restoring
+                    | NativePhase::Containing
             ) {
                 return Ok(false);
             }
-            let Some(admission) = &journal.admission else {
+            let Some(admission) = journal.admission.clone() else {
                 return Ok(false);
             };
             // Failure cleanup has one separately bounded, recorded budget. An
             // exhausted upgrade/recovery deadline cannot skip containment.
             let deadline = deadline(Duration::from_millis(journal.cleanup_timeout_millis))?;
             check_deadline(deadline)?;
+            // A valid child can retain the shared startup lease while capturing
+            // inputs. Revoke its runnable journal authority before waiting for
+            // that lease, and preserve the exact execution recovery must stop.
+            let target = match journal.phase {
+                NativePhase::Starting | NativePhase::Verified => Some(PermitTarget::Candidate),
+                NativePhase::Restoring => Some(PermitTarget::RestoredBefore),
+                NativePhase::Containing => None,
+                _ => unreachable!("containment phases checked above"),
+            };
+            if let Some(role) = target {
+                let tuple = if role == PermitTarget::Candidate {
+                    &journal.after
+                } else {
+                    &journal.before
+                };
+                journal.disposition.quiescence_contract = Some(tuple.contract.clone());
+                journal.disposition.quiescence_permit = Some(journal.make_payload(role)?);
+            }
+            journal.disposition.quiesced = None;
+            journal.disposition.stop_intent = true;
+            journal.phase(&self.paths, rollback, NativePhase::Containing)?;
             {
-                let lease = StartupLease::exclusive(self._lock.home())?;
+                let lease = exclusive_startup_until(self._lock.home(), deadline)?;
                 validate_owned_mixed(&self.paths, &lease, &journal)?;
                 lease.write_state(&journal.blocked())?;
             }
@@ -1321,6 +1373,9 @@ impl Engine {
             let role = match j.phase {
                 NativePhase::Starting | NativePhase::Verified => Some(PermitTarget::Candidate),
                 NativePhase::Restoring => Some(PermitTarget::RestoredBefore),
+                // Containing already records the exact failing execution. Its
+                // target can be either candidate or restored-before.
+                NativePhase::Containing => None,
                 _ => None,
             };
             if let Some(role) = role {

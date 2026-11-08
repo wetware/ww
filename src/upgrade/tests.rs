@@ -41,6 +41,12 @@ struct FakeService {
     service_deadlines: Vec<(&'static str, Instant)>,
     #[serde(skip)]
     expire_after_guarded_restart: bool,
+    #[serde(skip)]
+    capturing_child: Option<std::process::Child>,
+    #[serde(skip)]
+    capture_fixture: Option<(PathBuf, PathBuf)>,
+    #[serde(skip)]
+    expected_quiescence_permit: Option<startup::StartupPermitPayload>,
 }
 
 impl FakeService {
@@ -81,6 +87,9 @@ impl FakeService {
             restart_deadline: None,
             service_deadlines: Vec::new(),
             expire_after_guarded_restart: false,
+            capturing_child: None,
+            capture_fixture: None,
+            expected_quiescence_permit: None,
         }
     }
 
@@ -165,6 +174,12 @@ impl ServiceControl for FakeService {
         _: Instant,
     ) -> Result<service::ServiceDisposition> {
         intent.validate()?;
+        if let Some(expected) = &self.expected_quiescence_permit {
+            ensure!(
+                intent.quiescence_permit.as_ref() == Some(expected),
+                "recovery changed the recorded containment target"
+            );
+        }
         ensure!(intent.stop_intent, "missing stop intent");
         ensure!(!self.stop_failure, "service stop failed");
         if matches!(self.snapshot.running, RunningState::Running { .. }) {
@@ -199,6 +214,31 @@ impl ServiceControl for FakeService {
         self.running_artifact = Some(executable.artifact().clone());
         self.effects += 1;
         self.save_state()?;
+        if let Some((home, executable)) = &self.capture_fixture {
+            self.capturing_child = Some(
+                Command::new(executable)
+                    .args([
+                        "--exact",
+                        "upgrade::tests::native_v2_capturing_child_worker",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("WW_NATIVE_CAPTURE_HOME", home)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::fs::File::create(home.join("capture-stderr"))?)
+                    .spawn()?,
+            );
+            while !home.join("capture-ready").exists() {
+                check_deadline(deadline)?;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Exhaust the actual operation deadline while the independently
+            // validated child retains its real shared startup lease.
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+            );
+            check_deadline(deadline)?;
+        }
         if self.expire_after_guarded_restart {
             storage::faults::advance_clock_at(1);
             checkpoint("fixture.restart.exhausted-deadline")?;
@@ -3138,4 +3178,266 @@ fn native_v2_recovery_refuses_missing_zero_or_unbounded_cleanup_budgets_before_e
             state_before
         );
     }
+}
+
+#[test]
+#[ignore = "subprocess worker; invoked by native containment contention regression"]
+fn native_v2_capturing_child_worker() {
+    let home = PathBuf::from(std::env::var_os("WW_NATIVE_CAPTURE_HOME").unwrap());
+    let _instance = startup::InstanceLease::shared(&home).unwrap();
+    let lease = startup::StartupLease::shared(&home).unwrap();
+    let invocation = lease.read_contract().unwrap().unwrap().invocation;
+    let permit = validate_transaction_start(&lease, &invocation, Instant::now() + TIMEOUT).unwrap();
+    std::fs::write(
+        home.join("capture-ready"),
+        permit.payload().digest().unwrap(),
+    )
+    .unwrap();
+    let until = Instant::now() + Duration::from_secs(15);
+    let denied = loop {
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join(".ww/host-upgrade.json")).unwrap())
+                .unwrap();
+        if journal["phase"] == "containing" {
+            assert!(
+                validate_transaction_start(&lease, &invocation, Instant::now() + TIMEOUT).is_err()
+            );
+            // Keep the lock contended after denial becomes durable, so success
+            // requires retrying exclusive acquisition instead of one attempt.
+            std::thread::sleep(Duration::from_millis(80));
+            break true;
+        }
+        if Instant::now() >= until {
+            assert!(
+                validate_transaction_start(&lease, &invocation, Instant::now() + TIMEOUT).is_ok()
+            );
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    std::fs::write(
+        home.join("capture-result"),
+        if denied { "denied" } else { "still-runnable" },
+    )
+    .unwrap();
+}
+
+#[test]
+fn native_v2_containment_revokes_capture_permit_before_retrying_shared_lease_contention() {
+    let worker_directory = tempfile::tempdir().unwrap();
+    let worker = worker_directory.path().join("capturing-worker");
+    std::fs::copy(std::env::current_exe().unwrap(), &worker).unwrap();
+    for restored in [false, true] {
+        storage::faults::configure(None);
+        let (home, mut engine, original, inputs, mut service) = native_fixture(true);
+        if restored {
+            service.not_ready = true;
+            assert!(engine
+                .operator_upgrade(&mut service, TIMEOUT, || {
+                    Ok(native_request(
+                        signed_generation(OLD, 1),
+                        inputs.clone(),
+                        NEW,
+                        2,
+                    ))
+                })
+                .is_err());
+            service.not_ready = false;
+        }
+        service.capture_fixture = Some((home.path().to_owned(), worker.clone()));
+        let operation_deadline = Instant::now() + Duration::from_secs(10);
+        let error = if restored {
+            engine.recover_prepared_until(&mut service, operation_deadline, &inputs)
+        } else {
+            engine.operator_upgrade_until(&mut service, operation_deadline, || {
+                Ok(native_request(original, inputs.clone(), NEW, 2))
+            })
+        }
+        .unwrap_err();
+        assert!(
+            service
+                .capturing_child
+                .as_mut()
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success(),
+            "{}",
+            std::fs::read_to_string(home.path().join("capture-stderr")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("capture-result")).unwrap(),
+            "denied",
+            "restored={restored}: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("owned service is stopped"),
+            "{error:#}"
+        );
+        assert_eq!(service.snapshot.running, RunningState::Stopped);
+        assert_containment_deadline(&engine, &service, operation_deadline);
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&engine.paths.journal).unwrap()).unwrap();
+        assert_eq!(journal["phase"], "containing");
+        let recorded: startup::StartupPermitPayload =
+            serde_json::from_value(journal["disposition"]["quiescence_permit"].clone()).unwrap();
+        assert_eq!(
+            recorded.role,
+            if restored {
+                startup::PermitTarget::RestoredBefore
+            } else {
+                startup::PermitTarget::Candidate
+            }
+        );
+        service.capture_fixture = None;
+        service.expected_quiescence_permit = Some(recorded);
+        engine
+            .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+            .unwrap();
+        assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+    }
+}
+
+fn prepare_containment_crash(restored: bool) -> tempfile::TempDir {
+    storage::faults::configure(None);
+    let (home, engine, _, _, mut service) = native_fixture(true);
+    service.persistent_state = Some(home.path().join("simulated-native-v2.json"));
+    service.not_ready = true;
+    service.save_state().unwrap();
+    drop(engine);
+    if restored {
+        assert!(run_native_fixture_operation(home.path(), "upgrade").is_err());
+    }
+    home
+}
+
+#[test]
+fn native_v2_process_exit_after_containment_intent_preserves_exact_recovery_target() {
+    let worker_directory = tempfile::tempdir().unwrap();
+    let worker = worker_directory.path().join("containment-worker");
+    std::fs::copy(std::env::current_exe().unwrap(), &worker).unwrap();
+    for restored in [false, true] {
+        let action = if restored { "recover" } else { "upgrade" };
+        let baseline = prepare_containment_crash(restored);
+        storage::faults::configure(None);
+        assert!(run_native_fixture_operation(baseline.path(), action).is_err());
+        let point = storage::faults::trace()
+            .iter()
+            .position(|s| s == "native.phase.Containing")
+            .expect("failure must durably revoke the runnable phase before startup exclusion")
+            + 1;
+        let home = prepare_containment_crash(restored);
+        let status = Command::new(&worker)
+            .args([
+                "--exact",
+                "upgrade::tests::native_v2_crash_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("WW_NATIVE_V2_HOME", home.path())
+            .env("WW_NATIVE_V2_POINT", point.to_string())
+            .env("WW_NATIVE_V2_ACTION", action)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86));
+        storage::faults::configure(None);
+        let mut engine = open(home.path());
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&engine.paths.journal).unwrap()).unwrap();
+        assert_eq!(journal["phase"], "containing");
+        let target: startup::StartupPermitPayload =
+            serde_json::from_value(journal["disposition"]["quiescence_permit"].clone()).unwrap();
+        assert_eq!(
+            target.role,
+            if restored {
+                startup::PermitTarget::RestoredBefore
+            } else {
+                startup::PermitTarget::Candidate
+            }
+        );
+        let lease = startup::StartupLease::shared(home.path()).unwrap();
+        assert!(
+            matches!(
+                lease.read_state().unwrap().unwrap().disposition,
+                startup::StartupDisposition::Transaction { .. }
+            ),
+            "owner must exit before Blocked publication"
+        );
+        assert!(
+            validate_transaction_start(&lease, &target.invocation, Instant::now() + TIMEOUT)
+                .is_err()
+        );
+        drop(lease);
+        let mut service: FakeService = serde_json::from_slice(
+            &std::fs::read(home.path().join("simulated-native-v2.json")).unwrap(),
+        )
+        .unwrap();
+        service.not_ready = false;
+        service.expected_quiescence_permit = Some(target);
+        engine
+            .recover_prepared_until(
+                &mut service,
+                Instant::now() + TIMEOUT,
+                &admission_inputs(home.path()),
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+        assert_eq!(
+            service.running_artifact.as_ref(),
+            Some(signed_generation(OLD, 1).artifact())
+        );
+        assert!(!engine.paths.journal.exists());
+    }
+}
+
+#[test]
+fn native_v2_containment_exhaustion_leaves_a_durably_non_runnable_journal() {
+    storage::faults::configure(None);
+    let (home, mut engine, original, inputs, mut service) = native_fixture(true);
+    service.interrupt_guarded_restart = true;
+    let interruption = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(native_request(original, inputs.clone(), NEW, 2))
+        })
+    }));
+    assert!(interruption.is_err());
+    service.interrupt_guarded_restart = false;
+    let _instance = startup::InstanceLease::shared(home.path()).unwrap();
+    let lease = startup::StartupLease::shared(home.path()).unwrap();
+    let invocation = lease.read_contract().unwrap().unwrap().invocation;
+    let permit = validate_transaction_start(&lease, &invocation, Instant::now() + TIMEOUT).unwrap();
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&engine.paths.journal).unwrap()).unwrap();
+    journal["cleanup_timeout_millis"] = 30.into();
+    storage::write_record(
+        &engine.paths.journal,
+        &serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let error = engine
+        .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "contention exceeded the recorded cleanup bound"
+    );
+    assert!(format!("{error:#}").contains("containment is unconfirmed"));
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&engine.paths.journal).unwrap()).unwrap();
+    assert_eq!(after["phase"], "containing");
+    assert!(validate_transaction_start(&lease, &invocation, Instant::now() + TIMEOUT).is_err());
+    assert_eq!(
+        serde_json::from_value::<startup::StartupPermitPayload>(
+            after["disposition"]["quiescence_permit"].clone()
+        )
+        .unwrap(),
+        *permit.payload()
+    );
+    assert!(matches!(
+        lease.read_state().unwrap().unwrap().disposition,
+        startup::StartupDisposition::Transaction { .. }
+    ));
 }

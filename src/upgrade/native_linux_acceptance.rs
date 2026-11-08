@@ -98,6 +98,28 @@ fn bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[test]
+#[ignore = "explicit disposable source-built Host protocol fixture only"]
+fn source_fixture_protocol_accepts_long_operation_budget() -> Result<()> {
+    ensure!(
+        std::env::var("WW739_DISPOSABLE_SYSTEMD").as_deref() == Ok("1")
+            && Path::new("/.dockerenv").is_file()
+            && unsafe { libc::geteuid() } == 1001
+            && std::env::var("HOME").as_deref() == Ok("/home/testww"),
+        "protocol fixture requires the isolated ww739 fixture account"
+    );
+    let path = Path::new("/home/testww/ww739-bootstrap");
+    let bytes = bounded(path, 1024 * 1024 * 1024)?;
+    let artifact = upgrade::ArtifactIdentity {
+        algorithm: upgrade::DigestAlgorithm::Sha256,
+        digest: hex::encode(Sha256::digest(&bytes)),
+        size: bytes.len() as u64,
+    };
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let executable = VerifiedExecutable::open(path, &artifact, deadline)?;
+    super::verify_guard_capability(&executable, deadline)
+}
+
 /// Run one explicitly selected component operation against production Engine
 /// state. All permits originate from Engine journal validation.
 #[test]
@@ -116,7 +138,18 @@ fn source_fixture_component_operation() -> Result<()> {
     inputs.validate()?;
     let mut service = ComponentService { home: home.clone() };
     let mut engine = Engine::open(&home)?;
-    let deadline = Instant::now() + Duration::from_secs(300);
+    let timeout = match std::env::var("WW739_COMPONENT_TIMEOUT_SECS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .context("component timeout must be integer seconds")?,
+        Err(std::env::VarError::NotPresent) => 300,
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        (1..=600).contains(&timeout),
+        "component timeout must be within 1..=600 seconds"
+    );
+    let deadline = Instant::now() + Duration::from_secs(timeout);
     match std::env::var("WW739_COMPONENT_OPERATION").as_deref() {
         Ok("admit") => {
             let observed = super::observe(&home, deadline)?;
@@ -176,7 +209,13 @@ fn source_fixture_component_operation() -> Result<()> {
                 engine.operator_rollback_prepared_until(&mut service, deadline, &inputs)?
             );
         }
-        _ => anyhow::bail!("select admit, upgrade or rollback component operation"),
+        Ok("recover") => {
+            eprintln!(
+                "component recovery outcome: {:?}",
+                engine.recover_prepared_until(&mut service, deadline, &inputs)?
+            );
+        }
+        _ => anyhow::bail!("select admit, upgrade, rollback or recover component operation"),
     }
     Ok(())
 }

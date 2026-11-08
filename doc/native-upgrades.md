@@ -144,9 +144,12 @@ ww upgrade --release CID --check
 Changed upgrades, rollback, and recovery require a positive explicit timeout.
 Exact-artifact no-ops and read-only checks do not need a restart budget.
 The journal records a separate containment budget of at most 30 seconds. After
-operation failure, one cleanup deadline bounds the owned-service stop and
-reobservation. Unconfirmed containment retains blocked recovery evidence. This
-budget is not a restart default. Filesystem syscalls have no hard real-time bound.
+operation failure, the engine records `Containing` before waiting for the
+startup lease. That phase rejects pending launch permits and retains the exact
+process target for recovery. One cleanup deadline bounds lease contention,
+publication of `Blocked`, the owned-service stop, and reobservation. Unconfirmed
+containment retains the non-runnable journal and recovery evidence. This budget
+is not a restart default. Filesystem syscalls have no hard real-time bound.
 Rollback preflight (`--rollback --check`) remains unavailable. Automatic channel
 selection still requires independent trusted-channel provisioning; explicit CID
 selection does not activate that separate feature.

@@ -1723,7 +1723,8 @@ fn launch_preflight(
             timeout_millis: u64::try_from(
                 deadline
                     .saturating_duration_since(Instant::now())
-                    .as_millis(),
+                    .as_millis()
+                    .min(300_000),
             )?,
         };
         ensure!(
