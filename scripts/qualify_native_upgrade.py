@@ -23,6 +23,7 @@ import socket
 import stat
 import struct
 import subprocess
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -112,6 +113,8 @@ def validate_arguments(args):
     require(uid >= 1000 and account.pw_name.startswith("ww739-")
             and home == Path(account.pw_dir) and home == home.resolve(strict=True),
             "qualification requires a dedicated ww739-* account and its exact HOME")
+    require(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+            "qualification requires Linux pidfd observation and signaling")
     custody(home, uid, directory=True)
     marker_directory = Path("/run/ww739-qualification")
     custody(marker_directory, 0, directory=True)
@@ -160,10 +163,13 @@ class Runner:
         self.env["HOME"] = str(home)
         self.env["XDG_RUNTIME_DIR"] = f"/run/user/{os.geteuid()}"
 
-    def run(self, name, argv, expected=0):
+    def run(self, name, argv, expected=0, deadline=None, cancelled=None):
         argv = [str(item) for item in argv]
         started = time.monotonic()
         command_budget = self.timeout + MAX_CONTAINMENT_SECONDS + 10
+        deadline = min(deadline, started + command_budget) if deadline is not None else started + command_budget
+        require(time.monotonic() < deadline, f"command deadline: {name}")
+        require(cancelled is None or not cancelled(), f"command cancelled: {name}")
         record_name = f"{len(self.commands):04d}-{name}"
         process = subprocess.Popen(argv, cwd=self.home, env=self.env, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -175,7 +181,8 @@ class Runner:
                     os.set_blocking(stream.fileno(), False)
                     selector.register(stream, selectors.EVENT_READ, label)
                 while selector.get_map():
-                    require(time.monotonic() - started < command_budget, f"command deadline: {name}")
+                    require(time.monotonic() < deadline, f"command deadline: {name}")
+                    require(cancelled is None or not cancelled(), f"command cancelled: {name}")
                     for key, _ in selector.select(0.05):
                         data = os.read(key.fileobj.fileno(), 65536)
                         if not data:
@@ -183,7 +190,10 @@ class Runner:
                         else:
                             chunks[key.data].extend(data)
                             require(len(chunks[key.data]) <= MAX_COMMAND_OUTPUT, f"command output exceeds bound: {name}")
-            process.wait(timeout=max(0.01, command_budget - (time.monotonic() - started)))
+            while process.poll() is None:
+                require(time.monotonic() < deadline, f"command deadline: {name}")
+                require(cancelled is None or not cancelled(), f"command cancelled: {name}")
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
         except BaseException:
             if process.poll() is None:
                 try:
@@ -256,9 +266,10 @@ def acknowledge_live_reply(stream):
         raise RuntimeError("readiness peer closed or sent extra data before acknowledgement")
 
 
-def manager_process(runner, name):
+def manager_process(runner, name, deadline=None, cancelled=None):
     output = runner.run(name, ["/usr/bin/systemctl", "--user", "show", "ww.service",
-                               "--property=MainPID", "--property=InvocationID"])
+                               "--property=MainPID", "--property=InvocationID"],
+                        deadline=deadline, cancelled=cancelled)
     values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     require(set(values) == {"MainPID", "InvocationID"}
             and re.fullmatch(r"[0-9a-f]{32}", values["InvocationID"]),
@@ -269,16 +280,147 @@ def manager_process(runner, name):
 
 
 @contextmanager
-def pinned_pid(pid):
+def pinned_pid(pid, require_live_after=True):
     descriptor = os.pidfd_open(pid, 0)
     poller = select.poll()
     poller.register(descriptor, select.POLLIN)
     try:
         require(not poller.poll(0), "manager process already exited")
-        yield
-        require(not poller.poll(0), "manager process exited during observation")
+        yield descriptor
+        if require_live_after:
+            require(not poller.poll(0), "manager process exited during observation")
     finally:
         os.close(descriptor)
+
+
+def readiness_socket_path(home, pid, token):
+    encoded = json.dumps(token, separators=(",", ":")).encode()
+    domain = b"wetware.readiness-address.v1"
+    digest = hashlib.sha256(len(domain).to_bytes(8, "big") + domain
+                            + len(encoded).to_bytes(8, "big") + encoded).hexdigest()[:32]
+    return home / f".ww/bin/.ww-host-upgrade/r-{pid}-{digest}.sock"
+
+
+def pause_verified_process(pid, expected_digest, check_context, deadline):
+    """Signal only a live, same-owner process pinned before executable checks."""
+    require(time.monotonic() < deadline, "candidate fault deadline expired")
+    with pinned_pid(pid, require_live_after=False) as descriptor:
+        require(Path(f"/proc/{pid}").stat().st_uid == os.geteuid(), "candidate process has another owner")
+        token = process_token(pid)
+        require(sha256(Path(f"/proc/{pid}/exe")) == expected_digest, "candidate executable differs")
+        check_context(pid, token)
+        require(process_token(pid) == token
+                and sha256(Path(f"/proc/{pid}/exe")) == expected_digest,
+                "candidate process changed before fault injection")
+        check_context(pid, token)
+        require(time.monotonic() < deadline, "candidate fault deadline expired")
+        signal.pidfd_send_signal(descriptor, signal.SIGSTOP)
+        return {"pid": pid, "process_start": token, "sha256": expected_digest,
+                "signal": "SIGSTOP", "injected_monotonic": time.monotonic()}
+
+
+class CandidatePauseWatcher:
+    """Observe the owned candidate; never edit transaction state or signal by PID."""
+
+    def __init__(self, runner, candidate_sha256, original_manager):
+        output = runner.output / "readiness-timeout-watcher"
+        output.mkdir(mode=0o700)
+        self.runner = Runner(runner.home, output, runner.timeout)
+        self.runner.env = runner.env.copy()
+        self.candidate_sha256, self.original_manager = candidate_sha256, original_manager
+        self.deadline = time.monotonic() + runner.timeout
+        self.cancelled = threading.Event()
+        self.result = {"injected": False}
+        self.thread = threading.Thread(target=self._watch, name="ww739-candidate-fault", daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.cancelled.set()
+        # Every watcher command checks cancellation and reaps its child.
+        self.thread.join(timeout=6)
+        require(not self.thread.is_alive(), "candidate watcher did not stop within cleanup bound")
+
+    def require_injected(self):
+        require(self.result["injected"], "candidate watcher did not inject: " + self.result.get("error", "unknown"))
+        return self.result
+
+    def _journal(self):
+        path = self.runner.home / ".ww/host-upgrade.json"
+        try:
+            journal = record(path, os.geteuid())
+        except FileNotFoundError:
+            return None
+        require(journal["version"] == 2 and journal["operation"] == "upgrade",
+                "candidate watcher found another transaction kind")
+        require(journal["after"]["generation"]["artifact"]["digest"] == self.candidate_sha256,
+                "candidate watcher found another target artifact")
+        return journal
+
+    def _check_context(self, pid, token, invocation, transaction_id):
+        require(not self.cancelled.is_set(), "candidate watcher cancelled before injection")
+        path = readiness_socket_path(self.runner.home, pid, token)
+        info = path.lstat()
+        require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.geteuid()
+                and stat.S_IMODE(info.st_mode) == 0o600,
+                "candidate readiness socket is not an owned private socket")
+        require(manager_process(self.runner, "verify-manager", self.deadline, self.cancelled.is_set)
+                == (pid, invocation), "candidate manager invocation changed")
+        journal = self._journal()
+        require(journal is not None and journal["transaction_id"] == transaction_id
+                and journal["phase"] in ("starting", "verified"),
+                "candidate transaction changed before injection")
+        return journal["phase"]
+
+    def _watch(self):
+        try:
+            for _ in range(16_384):
+                require(time.monotonic() < self.deadline, "candidate watcher deadline expired")
+                require(not self.cancelled.is_set(), "candidate watcher cancelled")
+                journal = self._journal()
+                if journal is not None and journal["phase"] in ("starting", "verified"):
+                    try:
+                        observed = manager_process(self.runner, "watch-manager", self.deadline, self.cancelled.is_set)
+                    except (RuntimeError, OSError):
+                        observed = None
+                    if (observed is not None and observed[0] != self.original_manager[0]
+                            and observed[1] != self.original_manager[1]):
+                        pid, invocation = observed
+                        token = process_token(pid)
+                        if readiness_socket_path(self.runner.home, pid, token).exists():
+                            phases = []
+
+                            def verify(current_pid, current_token):
+                                phases.append(self._check_context(current_pid, current_token,
+                                                                  invocation, journal["transaction_id"]))
+
+                            receipt = pause_verified_process(pid, self.candidate_sha256, verify, self.deadline)
+                            self.result = {"injected": True, **receipt, "invocation": invocation,
+                                           "transaction_id": journal["transaction_id"], "phase": phases[-1]}
+                            return
+                self.cancelled.wait(0.25)
+            raise RuntimeError("candidate watcher exceeded observation bound")
+        except BaseException as error:
+            self.result["error"] = str(error)
+        finally:
+            self.runner.save("result.json", self.result)
+
+
+def require_enablement(runner, name, expected, unit, owned_unit):
+    state = runner.run(name, ["/usr/bin/systemctl", "--user", "show", "ww.service",
+                             "--property=UnitFileState", "--value"]).strip()
+    require(state == expected, f"service enablement changed: expected {expected}, got {state}")
+    require(unit.read_bytes() == owned_unit, "custom service definition changed")
+
+
+def require_fault_stop_policy(runner):
+    output = runner.run("fault-stop-policy", ["/usr/bin/systemctl", "--user", "show", "ww.service",
+                        "--property=TimeoutStopUSec", "--property=KillMode", "--property=SendSIGKILL"])
+    values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    require(values == {"TimeoutStopUSec": "5s", "KillMode": "control-group", "SendSIGKILL": "yes"},
+            "fault injection requires effective five-second stop and control-group SIGKILL policy")
 
 
 def readiness(runner, state, name):
@@ -291,10 +433,7 @@ def readiness(runner, state, name):
                 token = process_token(pid)
                 expected = state["native"]["artifact"]["digest"]
                 require(sha256(Path(f"/proc/{pid}/exe")) == expected, "wrong running native executable")
-                encoded = json.dumps(token, separators=(",", ":")).encode()
-                domain = b"wetware.readiness-address.v1"
-                digest = hashlib.sha256(len(domain).to_bytes(8, "big") + domain + len(encoded).to_bytes(8, "big") + encoded).hexdigest()[:32]
-                path = runner.home / f".ww/bin/.ww-host-upgrade/r-{pid}-{digest}.sock"
+                path = readiness_socket_path(runner.home, pid, token)
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
                     stream.settimeout(max(0.001, deadline - time.monotonic()))
                     stream.connect(str(path))
@@ -346,8 +485,12 @@ def main():
     report = {"version": 1, "platform": args.platform, "status": "RUNNING", "checks": [],
               "producer_receipts": {key: marker[key] for key in ("a", "b")},
               "trust_sha256": sha256(trust), "production_activation": False,
-              "remaining": ["native crash boundaries", "failed start and readiness recovery",
-                            "compatibility refusal", "enabled and absent service cases", "login/boot persistence"]}
+              "remaining": ["initialization, admission, replacement, rollback and terminal crash boundaries",
+                            "failed start recovery", "wrong executable, PID reuse and same-PID exec refusal",
+                            "stale socket and nonce replay refusal", "changed inputs, service definition and trust refusal",
+                            "missing or substituted proof recovery", "moving-head and missing-route readiness cases",
+                            "compatibility and legacy-protocol refusal", "concurrent manual process exclusion",
+                            "absent service case", "login/boot persistence"]}
     runner.save("report.json", report)
     unit = home / ".config/systemd/user/ww.service"
     owned_unit = None
@@ -369,33 +512,69 @@ def main():
         owned_unit = unit.read_bytes()
         original_unit = owned_unit.decode("utf-8")
         require(original_unit.count("[Service]\n") == 1, "unexpected generated service definition")
-        owned_unit = original_unit.replace("[Service]\n", "[Service]\nEnvironment=WW_COMPILE_WORKERS=2\nWorkingDirectory=" + str(home) + "\n").encode()
+        require("TimeoutStopSec=" not in original_unit, "generated service already specifies a stop budget")
+        owned_unit = original_unit.replace("[Service]\n", "[Service]\nTimeoutStopSec=5\nEnvironment=WW_COMPILE_WORKERS=2\nWorkingDirectory=" + str(home) + "\n").encode()
         unit.write_bytes(owned_unit)
         runner.run("daemon-reload", ["/usr/bin/systemctl", "--user", "daemon-reload"])
+        require_fault_stop_policy(runner)
+        runner.run("enable-before-admission", ["/usr/bin/systemctl", "--user", "enable", "ww.service"])
+        require_enablement(runner, "enabled-before-admission", "enabled", unit, owned_unit)
         runner.run("admit-a", [binary, "startup", "admit", "--timeout-secs", args.timeout_secs, "--json", "service"])
         state = native_tuple(home, args.release_a, marker["a"])
         runner.run("start-a", ["/usr/bin/systemctl", "--user", "start", "ww.service"])
         readiness(runner, state, "a")
+        require_enablement(runner, "enabled-a", "enabled", unit, owned_unit)
         report["checks"].append("actual systemd A starts with HTTP admin disabled")
         runner.run("upgrade-a-b", [binary, "upgrade", "--release", args.release_b, *common, "--timeout-secs", args.timeout_secs, "--json"])
         state = native_tuple(home, args.release_b, marker["b"])
         readiness(runner, state, "b")
+        require_enablement(runner, "enabled-b", "enabled", unit, owned_unit)
         report["checks"].append("actual changed A to B commits matching provenance and readiness")
         runner.run("rollback-b-a", [binary, "upgrade", "--rollback", "--timeout-secs", args.timeout_secs, "--json"])
         state = native_tuple(home, args.release_a, marker["a"])
         readiness(runner, state, "restored-a")
+        require_enablement(runner, "enabled-restored-a", "enabled", unit, owned_unit)
         report["checks"].append("actual retained rollback restores A with measured readiness")
+        report["checks"].append("enabled A to B to A preserves enablement and custom unit bytes")
         before_noop = json.dumps(state, sort_keys=True)
         noop = json.loads(runner.run("exact-noop", [binary, "upgrade", "--release", args.release_a, *common, "--json"]))
         require(noop["outcome"]["kind"] == "already-installed" and noop["changed_paths"] == [] and noop["activation"] is False, "exact no-op changed software or activated service")
         require(json.dumps(native_tuple(home, args.release_a, marker["a"]), sort_keys=True) == before_noop, "exact no-op changed startup state")
+        original_manager = manager_process(runner, "timeout-original-manager")
+        with CandidatePauseWatcher(runner, marker["b"]["sha256"], original_manager) as watcher:
+            runner.run("readiness-timeout", [binary, "upgrade", "--release", args.release_b, *common,
+                       "--timeout-secs", args.timeout_secs, "--json"], expected=1)
+        injection = watcher.require_injected()
+        pending = record(home / ".ww/host-upgrade.json", os.geteuid())
+        blocked = record(home / ".ww/bin/.ww-host-upgrade/startup-state.json", os.geteuid())
+        require(pending["version"] == 2 and pending["operation"] == "upgrade"
+                and pending["phase"] == "containing" and pending["transaction_id"] == injection["transaction_id"]
+                and pending["disposition"]["stop_intent"] is True
+                and blocked["disposition"]["kind"] == "blocked",
+                "readiness failure did not retain a nonrunnable blocked transaction")
+        require(runner.run("timeout-contained-pid", ["/usr/bin/systemctl", "--user", "show", "ww.service",
+                           "--property=MainPID", "--value"]).strip() == "0",
+                "readiness failure did not contain the owned candidate")
+        require_enablement(runner, "enabled-after-timeout", "enabled", unit, owned_unit)
+        runner.save("readiness-timeout-state.json", {"journal": pending, "state": blocked})
+        recovered = json.loads(runner.run("readiness-timeout-recover", [binary, "upgrade", "--recover-only",
+                               "--release", args.release_b, *common, "--timeout-secs", args.timeout_secs, "--json"]))
+        require(recovered["outcome"]["kind"] == "recovered", "readiness timeout retry did not perform recovery")
+        state = native_tuple(home, args.release_a, marker["a"])
+        readiness(runner, state, "timeout-restored-a")
+        require_enablement(runner, "enabled-after-timeout-recovery", "enabled", unit, owned_unit)
+        report["checks"].append("pidfd-injected readiness timeout stops candidate, retains blocked intent, and installed CLI recovery restores ready A")
         runner.run("stop-before-stopped-upgrade", ["/usr/bin/systemctl", "--user", "stop", "ww.service"])
+        runner.run("disable-before-stopped-admission", ["/usr/bin/systemctl", "--user", "disable", "ww.service"])
+        require_enablement(runner, "disabled-before-stopped-admission", "disabled", unit, owned_unit)
+        runner.run("admit-stopped-disabled-a", [binary, "startup", "admit", "--timeout-secs", args.timeout_secs, "--json", "service"])
         result = json.loads(runner.run("stopped-upgrade", [binary, "upgrade", "--release", args.release_b, *common, "--timeout-secs", args.timeout_secs, "--json"]))
         native_tuple(home, args.release_b, marker["b"])
         require(result["activation"] is False, "stopped upgrade activated service")
         require(runner.run("stopped-pid", ["/usr/bin/systemctl", "--user", "show", "ww.service", "--property=MainPID", "--value"]).strip() == "0", "stopped service started during upgrade")
+        require_enablement(runner, "disabled-after-stopped-upgrade", "disabled", unit, owned_unit)
         require(unit.read_bytes() == owned_unit and all(sha256(Path(path)) == value for path, value in hashes.items()), "native operation changed preserved configuration, identity, FHS or private state")
-        report["checks"].extend(["exact-artifact no-op preserves provenance", "stopped service remains stopped", "custom configuration, identity, FHS and private bytes preserved"])
+        report["checks"].extend(["exact-artifact no-op preserves provenance", "disabled stopped service remains disabled and stopped", "custom configuration, identity, FHS and private bytes preserved"])
         # Core-path success cannot claim the remaining failure/platform matrix.
         report["status"] = "PARTIAL"
     except BaseException as error:

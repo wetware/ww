@@ -4,7 +4,12 @@
 import importlib.util
 import json
 import os
+import signal
 import socket
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -102,6 +107,80 @@ class Inputs(unittest.TestCase):
 
 
 class Commands(unittest.TestCase):
+    def test_cancellation_reaps_child_after_output_descriptors_close(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = MODULE.Runner(root, root, 60)
+            cancelled = threading.Event()
+            timer = threading.Timer(0.1, cancelled.set)
+            timer.start()
+            try:
+                started = time.monotonic()
+                with self.assertRaisesRegex(RuntimeError, "command cancelled"):
+                    runner.run("cancelled", [sys.executable, "-c",
+                               "import os,time; os.close(1); os.close(2); time.sleep(60)"],
+                               cancelled=cancelled.is_set)
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertEqual(runner.commands[-1]["exit"], -signal.SIGKILL)
+            finally:
+                timer.cancel()
+                timer.join()
+
+    def test_command_deadline_kills_and_reaps_owned_child(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = MODULE.Runner(root, root, 60)
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "command deadline"):
+                runner.run("deadline", [sys.executable, "-c", "import time; time.sleep(60)"],
+                           deadline=started + 0.1)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(runner.commands[-1]["exit"], -signal.SIGKILL)
+
+    def test_candidate_watcher_timeout_does_not_claim_injection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = MODULE.Runner(root, root, 0.1)
+            with MODULE.CandidatePauseWatcher(runner, "a" * 64, (123, "b" * 32)) as watcher:
+                watcher.thread.join(timeout=2)
+            with self.assertRaisesRegex(RuntimeError, "did not inject"):
+                watcher.require_injected()
+            self.assertFalse(json.loads((root / "readiness-timeout-watcher/result.json").read_text())["injected"])
+
+    @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pidfd signal support required")
+    def test_pidfd_fault_refuses_wrong_bytes_changed_context_and_exited_child(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        descriptor = os.pidfd_open(child.pid)
+        try:
+            deadline = time.monotonic() + 5
+            expected = MODULE.sha256(Path(f"/proc/{child.pid}/exe"))
+            with self.assertRaisesRegex(RuntimeError, "candidate executable"):
+                MODULE.pause_verified_process(child.pid, "0" * 64, lambda *_: None, deadline)
+            with self.assertRaisesRegex(RuntimeError, "manager changed"):
+                MODULE.pause_verified_process(child.pid, expected,
+                    lambda *_: MODULE.require(False, "manager changed"), deadline)
+            self.assertNotIn(Path(f"/proc/{child.pid}/stat").read_text().rsplit(")", 1)[1].split()[0], ("T", "t"))
+            observed = []
+            result = MODULE.pause_verified_process(child.pid, expected,
+                                                   lambda pid, token: observed.append((pid, token)), deadline)
+            self.assertEqual(result["pid"], child.pid)
+            self.assertEqual(result["sha256"], expected)
+            self.assertTrue(observed)
+            stop_deadline = time.monotonic() + 1
+            while Path(f"/proc/{child.pid}/stat").read_text().rsplit(")", 1)[1].split()[0] not in ("T", "t"):
+                self.assertLess(time.monotonic(), stop_deadline)
+                time.sleep(0.01)
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            child.wait(timeout=2)
+            with self.assertRaises((OSError, RuntimeError)):
+                MODULE.pause_verified_process(child.pid, expected, lambda *_: None, deadline)
+        finally:
+            if child.poll() is None:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            child.wait(timeout=2)
+            os.close(descriptor)
+
     def test_reply_acknowledgement_requires_live_peer_without_extra_bytes(self):
         for state in ("live", "closed", "extra"):
             with self.subTest(state=state):
