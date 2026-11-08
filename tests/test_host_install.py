@@ -26,11 +26,38 @@ class HostInstall(unittest.TestCase):
                         IPFS_ROUTING_API="http://127.0.0.1:1",
                         WW_CWASM_DIR=str(Path(self.tmp.name) / "cwasm"))
 
-    def install(self, *flags, binary=None):
+    def install(self, *flags, binary=None, umask=-1):
         selected = binary or self.binary
         bootstrap = bootstrap_arguments(Path(self.tmp.name) / 'bootstrap', selected, self.payload)
         return subprocess.run([str(selected), "install", *bootstrap, *flags], env=self.env,
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=120, umask=umask)
+
+    def test_fresh_install_creates_private_directories_with_group_writable_umask(self):
+        result = self.install(umask=0o002)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_installed()
+        for path in (self.home / '.ww').rglob('*'):
+            if path.is_dir():
+                self.assertEqual(path.stat().st_mode & 0o022, 0, str(path))
+        self.assertEqual((self.home / '.ww').stat().st_mode & 0o022, 0)
+        identity = (self.home / '.ww/identity').read_bytes()
+        result = self.install(umask=0o002)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / '.ww/identity').read_bytes(), identity)
+
+    def test_existing_group_writable_directory_is_preserved_and_refused(self):
+        root = self.home / '.ww'
+        root.mkdir()
+        root.chmod(0o775)
+        marker = root / 'private-state'
+        marker.write_bytes(b'operator-owned state')
+        result = self.install(umask=0o002)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('without symlinks or other-user writes', result.stderr)
+        self.assertEqual(root.stat().st_mode & 0o777, 0o775)
+        self.assertEqual(marker.read_bytes(), b'operator-owned state')
+        self.assertFalse((root / 'identity').exists())
+        self.assertFalse(self.destination.exists())
 
     def snapshot(self):
         return {str(path.relative_to(self.home)): path.read_bytes()

@@ -115,6 +115,60 @@ fn fresh_registration_is_disabled_before_plist_publication() {
 }
 
 #[test]
+fn registration_creates_private_directories_under_group_writable_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    const CHILD: &str = "WW_TEST_REGISTRATION_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "daemon_cmd::tests::registration_creates_private_directories_under_group_writable_umask",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        // SAFETY: umask is async-signal-safe. Only the forked test process changes
+        // its mask; other tests in this process keep their original policy.
+        unsafe {
+            child.pre_exec(|| {
+                libc::umask(0o002);
+                Ok(())
+            });
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    for platform in [Platform::Linux, Platform::Macos] {
+        let home = tempfile::tempdir().unwrap();
+        let lock = MutationLock::acquire(home.path()).unwrap();
+        let mut manager = FakeManager::new(platform, home.path());
+        let bytes = definition(platform, home.path());
+        assert!(install_locked(&lock, platform, &bytes, false, &mut manager).unwrap());
+        for entry in walkdir::WalkDir::new(home.path()).min_depth(1) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_dir() {
+                assert_eq!(
+                    entry.metadata().unwrap().permissions().mode() & 0o022,
+                    0,
+                    "{} permits other-user writes",
+                    entry.path().display()
+                );
+            }
+        }
+        assert!(!install_locked(&lock, platform, &bytes, false, &mut manager).unwrap());
+    }
+}
+
+#[test]
 fn failed_disablement_does_not_publish_launchd_plist() {
     let home = tempfile::tempdir().unwrap();
     let lock = MutationLock::acquire(home.path()).unwrap();

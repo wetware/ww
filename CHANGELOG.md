@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Disposable genuine release rehearsal (#742).** Verify original five-platform
+  producer receipts, reconstruct signed releases, exercise bounded CAR transfer
+  and rejection controls, and retain command-level evidence. A separate consumer
+  rehearsal checks authenticated installation and FHS update behavior with
+  isolated Kubo and installation state. Native service upgrade and production
+  publication retain their acceptance gates.
 - **Separate software and daemon CLI lifecycles (#740).** Use `ww install`,
   `ww image update`, `ww upgrade`, and `ww uninstall`; `perform` has no aliases.
   Installation creates Host/FHS/identity without a daemon or publication.
@@ -26,6 +32,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pending authenticated selection, compatibility, and native restart admission.
 
 ### Fixed
+- Create private installation and daemon directories under group-writable umasks.
+  Existing directories retain their permissions and remain subject to custody
+  checks.
 - **Bind shell bootstrap and recovery to the requested release (#805).** Verify
   the raw release root CID and its direct signed-manifest link before executing
   any downloaded Host. A different validly signed release cannot satisfy this

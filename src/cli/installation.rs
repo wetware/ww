@@ -2,6 +2,7 @@
 use anyhow::{ensure, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use ww::installation_state::{MutationLock, Receipt};
 use ww::upgrade::storage as durable;
@@ -164,7 +165,10 @@ pub(super) fn persist_identity(path: &Path, key: &ed25519_dalek::SigningKey) -> 
     };
     let path = absolute.as_path();
     let parent = path.parent().context("identity parent")?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(ww::keys::encode(key).as_bytes())?;
     temp.as_file().sync_all()?;
@@ -196,7 +200,10 @@ fn atomic_write(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let parent = path.parent().context("installation file parent")?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
     durable::directory(parent)?;
     if durable::exists(path)? {
         durable::open_read(path)?;
@@ -531,7 +538,10 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         release = Some(startup.native.transport_root);
     }
     if !args.check {
-        std::fs::create_dir_all(&root)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)?;
         let mut next = state.clone().unwrap_or(Receipt {
             version: 2,
             hashes: std::array::from_fn(|_| digest(b"")),
@@ -554,7 +564,10 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         next.complete = false;
         if guarded {
             for path in SOFTWARE {
-                std::fs::create_dir_all(root.join(path).parent().context("software parent")?)?;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(root.join(path).parent().context("software parent")?)?;
             }
             let selected = selected.as_ref().context("guarded release proof missing")?;
             let mut engine = ww::upgrade::Engine::from_lock(lock)?;
@@ -773,7 +786,10 @@ pub(super) async fn image_update(args: UpdateArgs) -> Result<()> {
         let _ = migrate(&root, &before)?;
         let store = root.join(".fhs-recovery");
         parents(&home, &store.join("artifact"))?;
-        std::fs::create_dir_all(&store)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&store)?;
         durable::directory(&store)?;
         for index in 1..3 {
             atomic_write(
