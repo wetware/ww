@@ -1,0 +1,273 @@
+{
+  "unit": {
+    "Id": {
+      "type": "s",
+      "data": "ww.service"
+    },
+    "LoadState": {
+      "type": "s",
+      "data": "loaded"
+    },
+    "ActiveState": {
+      "type": "s",
+      "data": "inactive"
+    },
+    "SubState": {
+      "type": "s",
+      "data": "dead"
+    },
+    "FragmentPath": {
+      "type": "s",
+      "data": "/home/testww/.config/systemd/user/ww.service"
+    },
+    "DropInPaths": {
+      "type": "as",
+      "data": []
+    },
+    "UnitFileState": {
+      "type": "s",
+      "data": "disabled"
+    },
+    "NeedDaemonReload": {
+      "type": "b",
+      "data": false
+    },
+    "InvocationID": {
+      "type": "ay",
+      "data": []
+    },
+    "Job": {
+      "type": "(uo)",
+      "data": [
+        0,
+        "/"
+      ]
+    },
+    "Transient": {
+      "type": "b",
+      "data": false
+    },
+    "JoinsNamespaceOf": {
+      "type": "as",
+      "data": []
+    },
+    "TriggeredBy": {
+      "type": "as",
+      "data": []
+    }
+  },
+  "service": {
+    "Type": {
+      "type": "s",
+      "data": "simple"
+    },
+    "MainPID": {
+      "type": "u",
+      "data": 0
+    },
+    "ControlPID": {
+      "type": "u",
+      "data": 0
+    },
+    "Result": {
+      "type": "s",
+      "data": "success"
+    },
+    "ExecStartEx": {
+      "type": "a(sasasttttuii)",
+      "data": [
+        [
+          "/home/testww/.ww/bin/ww",
+          [
+            "/home/testww/.ww/bin/ww",
+            "run"
+          ],
+          [],
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "ExecCondition": {
+      "type": "a(sasbttttuii)",
+      "data": []
+    },
+    "ExecStartPre": {
+      "type": "a(sasbttttuii)",
+      "data": []
+    },
+    "ExecStartPost": {
+      "type": "a(sasbttttuii)",
+      "data": []
+    },
+    "ExecStop": {
+      "type": "a(sasbttttuii)",
+      "data": []
+    },
+    "ExecStopPost": {
+      "type": "a(sasbttttuii)",
+      "data": []
+    },
+    "Environment": {
+      "type": "as",
+      "data": [
+        "WW_LOG_LEVEL=info"
+      ]
+    },
+    "EnvironmentFiles": {
+      "type": "a(sb)",
+      "data": []
+    },
+    "PassEnvironment": {
+      "type": "as",
+      "data": []
+    },
+    "UnsetEnvironment": {
+      "type": "as",
+      "data": []
+    },
+    "WorkingDirectory": {
+      "type": "s",
+      "data": "/home/testww"
+    },
+    "RootDirectory": {
+      "type": "s",
+      "data": ""
+    },
+    "RootImage": {
+      "type": "s",
+      "data": ""
+    },
+    "User": {
+      "type": "s",
+      "data": ""
+    },
+    "Group": {
+      "type": "s",
+      "data": ""
+    },
+    "DynamicUser": {
+      "type": "b",
+      "data": false
+    },
+    "PAMName": {
+      "type": "s",
+      "data": ""
+    },
+    "SetLoginEnvironment": {
+      "type": "b",
+      "data": false
+    },
+    "StandardInput": {
+      "type": "s",
+      "data": "null"
+    },
+    "PrivateTmp": {
+      "type": "b",
+      "data": false
+    },
+    "PrivateNetwork": {
+      "type": "b",
+      "data": false
+    },
+    "PrivateUsers": {
+      "type": "b",
+      "data": false
+    },
+    "PrivateMounts": {
+      "type": "b",
+      "data": false
+    },
+    "NetworkNamespacePath": {
+      "type": "s",
+      "data": ""
+    },
+    "BindPaths": {
+      "type": "a(ssbt)",
+      "data": []
+    },
+    "BindReadOnlyPaths": {
+      "type": "a(ssbt)",
+      "data": []
+    },
+    "TemporaryFileSystem": {
+      "type": "a(ss)",
+      "data": []
+    },
+    "RuntimeDirectory": {
+      "type": "as",
+      "data": []
+    },
+    "StateDirectory": {
+      "type": "as",
+      "data": []
+    },
+    "CacheDirectory": {
+      "type": "as",
+      "data": []
+    },
+    "LogsDirectory": {
+      "type": "as",
+      "data": []
+    },
+    "ConfigurationDirectory": {
+      "type": "as",
+      "data": []
+    },
+    "SetCredential": {
+      "type": "a(say)",
+      "data": []
+    },
+    "SetCredentialEncrypted": {
+      "type": "a(say)",
+      "data": []
+    },
+    "LoadCredential": {
+      "type": "a(ss)",
+      "data": []
+    },
+    "LoadCredentialEncrypted": {
+      "type": "a(ss)",
+      "data": []
+    },
+    "ImportCredential": {
+      "type": "as",
+      "data": []
+    },
+    "LogNamespace": {
+      "type": "s",
+      "data": ""
+    },
+    "PIDFile": {
+      "type": "s",
+      "data": ""
+    },
+    "StandardOutput": {
+      "type": "s",
+      "data": "journal"
+    },
+    "StandardError": {
+      "type": "s",
+      "data": "inherit"
+    },
+    "FileDescriptorStoreMax": {
+      "type": "u",
+      "data": 0
+    }
+  },
+  "manager_environment": [
+    "HOME=/home/testww",
+    "LANG=C.UTF-8",
+    "LOGNAME=testww",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin",
+    "SHELL=/bin/sh",
+    "USER=testww",
+    "XDG_RUNTIME_DIR=/run/user/1001",
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus"
+  ]
+}

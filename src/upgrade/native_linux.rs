@@ -889,7 +889,7 @@ fn directory_custody(path: &Path, uid: u32) -> Result<()> {
             std::fs::symlink_metadata(&prefix).context("inspect systemd input directory")?;
         ensure!(metadata.is_dir() && (metadata.uid()==0 || metadata.uid()==uid)
             && (metadata.mode() & 0o022 == 0 || (metadata.uid()==0 && metadata.mode() & libc::S_ISVTX as u32 != 0)),
-            "systemd input directories must be owned without symlinks or unprotected other-user writes");
+            "systemd input directory {} must be owned without symlinks or unprotected other-user writes", prefix.display());
     }
     Ok(())
 }
@@ -1038,6 +1038,7 @@ fn process_instance(live: &LiveEvidence) -> super::service::ProcessInstance {
         pid: live.process.pid(),
         start: live.process.start_token().clone(),
         launch_nonce: live.response.launch_nonce,
+        manager_invocation_id: hex::encode(live.invocation_id),
     }
 }
 
@@ -1120,6 +1121,17 @@ pub(crate) fn quiesce(
         intent.stop_intent,
         "quiescence requires durable stop intent"
     );
+    if intent.identity.is_none() {
+        let current = snapshot(home, deadline)?;
+        ensure!(
+            current == intent.original && current.running == RunningState::Stopped,
+            "standalone service disposition changed before quiescence"
+        );
+        let mut completed = intent.clone();
+        completed.quiesced = Some(current);
+        completed.validate()?;
+        return Ok(completed);
+    }
     let identity = intent
         .identity
         .as_ref()
@@ -1131,31 +1143,16 @@ pub(crate) fn quiesce(
         "service configuration or automatic-start disposition changed before quiescence"
     );
     if let RunningState::Running { pid } = observed.snapshot.running {
-        let original = intent
-            .original_process
-            .as_ref()
-            .context("quiescence lacks original process identity")?;
-        let contract = intent
-            .original_contract
-            .as_ref()
-            .context("quiescence lacks original startup contract")?;
+        let live = identify_quiescence_target(home, intent, pid, deadline)?;
+        let confirmed = identify_quiescence_target(home, intent, pid, deadline)?;
         ensure!(
-            pid == original.pid,
-            "service runs a different process before quiescence"
+            process_instance(&live) == process_instance(&confirmed)
+                && live.response.contract == confirmed.response.contract
+                && live.response.transaction_id == confirmed.response.transaction_id
+                && live.response.permit_digest == confirmed.response.permit_digest,
+            "owned execution changed immediately before quiescence"
         );
-        let process =
-            super::attestation::PinnedProcess::capture(pid, &contract.artifact, deadline)?;
-        let live = observe_ready(
-            home,
-            contract,
-            process.executable(),
-            Some(original.launch_nonce),
-            deadline,
-        )?;
-        ensure!(
-            process_instance(&live) == *original,
-            "original process changed before quiescence"
-        );
+        live.process.revalidate(deadline)?;
         manager_action(home, identity, "StopUnit", deadline)?;
     }
     let stopped = await_stopped(home, identity, deadline)?;
@@ -1163,6 +1160,62 @@ pub(crate) fn quiesce(
     completed.quiesced = Some(stopped);
     completed.validate()?;
     Ok(completed)
+}
+
+fn identify_quiescence_target(
+    home: &Path,
+    intent: &super::service::ServiceDisposition,
+    pid: u32,
+    deadline: Instant,
+) -> Result<LiveEvidence> {
+    if let (Some(contract), Some(permit)) = (&intent.quiescence_contract, &intent.quiescence_permit)
+    {
+        let candidate = (|| -> Result<LiveEvidence> {
+            permit.validate()?;
+            ensure!(
+                permit.contract == contract.identity && permit.invocation == contract.invocation,
+                "quiescence permit differs from the journal-selected contract"
+            );
+            let process =
+                super::attestation::PinnedProcess::capture(pid, &contract.artifact, deadline)?;
+            let live = observe_execution(home, contract, process.executable(), None, deadline)?;
+            ensure!(
+                live.response.transaction_id == Some(permit.transaction_id)
+                    && live.response.permit_digest == Some(permit.digest()?),
+                "quiescence execution identifies another transaction permit"
+            );
+            Ok(live)
+        })();
+        if let Ok(live) = candidate {
+            return Ok(live);
+        }
+        check_deadline(deadline)?;
+    }
+    let original = intent
+        .original_process
+        .as_ref()
+        .context("quiescence lacks original process identity")?;
+    let contract = intent
+        .original_contract
+        .as_ref()
+        .context("quiescence lacks original startup contract")?;
+    ensure!(
+        pid == original.pid,
+        "service runs an unrelated process before quiescence"
+    );
+    let process = super::attestation::PinnedProcess::capture(pid, &contract.artifact, deadline)?;
+    let live = observe_execution(
+        home,
+        contract,
+        process.executable(),
+        Some(original.launch_nonce),
+        deadline,
+    )?;
+    ensure!(
+        process_instance(&live) == *original,
+        "original process changed before quiescence"
+    );
+    Ok(live)
 }
 
 pub(crate) fn stop(home: &Path, expected: &ServiceIdentity, deadline: Instant) -> Result<()> {
@@ -1311,6 +1364,24 @@ pub fn observe_ready(
     launch_nonce: Option<[u8; 32]>,
     deadline: Instant,
 ) -> Result<LiveEvidence> {
+    let live = observe_execution(home, contract, executable, launch_nonce, deadline)?;
+    ensure!(
+        live.response.serving_ready
+            && !live.response.effective_root.is_empty()
+            && !live.response.kernel_source.is_empty()
+            && !live.response.kernel_runtime.is_empty(),
+        "managed Host has not established coherent serving readiness"
+    );
+    Ok(live)
+}
+
+pub fn observe_execution(
+    home: &Path,
+    contract: &super::startup::StartupContractV1,
+    executable: &VerifiedExecutable,
+    launch_nonce: Option<[u8; 32]>,
+    deadline: Instant,
+) -> Result<LiveEvidence> {
     use super::inputs::{
         evidence_socket_path, ReadinessChallenge, ReadinessResponse, MAX_NATIVE_RESPONSE_BYTES,
         NATIVE_PROTOCOL_VERSION,
@@ -1357,7 +1428,17 @@ pub fn observe_ready(
         version: NATIVE_PROTOCOL_VERSION,
         nonce: fresh_nonce(),
         launch_nonce,
+        timeout_millis: u64::try_from(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )?
+        .min(300_000),
     };
+    ensure!(
+        challenge.timeout_millis > 0,
+        "readiness operation deadline expired"
+    );
     let bytes = serde_json::to_vec(&challenge)?;
     write_stream(&stream, &(bytes.len() as u32).to_be_bytes(), deadline)?;
     write_stream(&stream, &bytes, deadline)?;
@@ -1382,12 +1463,6 @@ pub fn observe_ready(
             && response.startup == contract.startup,
         "managed readiness evidence binding mismatch"
     );
-    ensure!(
-        !response.effective_root.is_empty()
-            && !response.kernel_source.is_empty()
-            && !response.kernel_runtime.is_empty(),
-        "managed Host returned incomplete ready state"
-    );
     process.verify_peer(&stream, deadline)?;
     executable.revalidate(deadline)?;
     let after = observe(home, deadline)?;
@@ -1404,6 +1479,33 @@ pub fn observe_ready(
         service: after.invocation.identity,
         invocation_id: after.invocation_id,
     })
+}
+
+pub(crate) fn revalidate_running(
+    home: &Path,
+    evidence: &super::service::RunningEvidence,
+    permit: &super::StartupPermit,
+    executable: &VerifiedExecutable,
+    deadline: Instant,
+) -> Result<()> {
+    let live = observe_ready(
+        home,
+        permit.contract(),
+        executable,
+        Some(evidence.process.launch_nonce),
+        deadline,
+    )?;
+    ensure!(
+        process_instance(&live) == evidence.process
+            && live.service == evidence.service
+            && live.response.contract == evidence.contract
+            && live.response.artifact == evidence.artifact
+            && live.response.startup == evidence.startup
+            && live.response.transaction_id == Some(permit.payload().transaction_id)
+            && live.response.permit_digest == Some(permit.payload().digest()?),
+        "running process, startup contract or transaction changed before commit"
+    );
+    Ok(())
 }
 
 fn fresh_nonce() -> [u8; 32] {
@@ -1683,7 +1785,16 @@ mod tests {
                 .unwrap();
         let fragment = home.join(".config/systemd/user/ww.service");
         std::fs::create_dir_all(fragment.parent().unwrap()).unwrap();
+        for directory in [
+            home.clone(),
+            home.join(".config"),
+            home.join(".config/systemd"),
+            home.join(".config/systemd/user"),
+        ] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         std::fs::write(&fragment, "[Service]\nExecStart=fixture\n").unwrap();
+        std::fs::set_permissions(&fragment, std::fs::Permissions::from_mode(0o600)).unwrap();
         capture.unit.get_mut("FragmentPath").unwrap().data = serde_json::json!(fragment);
         capture.service.get_mut("WorkingDirectory").unwrap().data = serde_json::json!(home);
         let executable = home.join(".ww/bin/ww");

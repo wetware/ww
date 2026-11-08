@@ -114,6 +114,7 @@ impl ServiceIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)] // Persist one exact owned service identity without a separate allocation.
 pub enum InvocationBinding {
     Standalone,
     Managed { service: ServiceIdentity },

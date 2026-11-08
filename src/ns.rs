@@ -193,7 +193,7 @@ fn scan_namespace_captures(
                 };
                 let content =
                     std::str::from_utf8(&bytes).context("namespace config is not UTF-8")?;
-                let config = NamespaceConfig::parse(name, &content);
+                let config = NamespaceConfig::parse(name, content);
                 config.validate()?;
                 configs.insert(
                     name.to_string(),

@@ -57,6 +57,7 @@ pub struct ReadinessChallenge {
     pub version: u32,
     pub nonce: [u8; 32],
     pub launch_nonce: Option<[u8; 32]>,
+    pub timeout_millis: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

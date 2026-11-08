@@ -65,7 +65,7 @@ pub struct CapturedMounts {
 #[derive(Debug)]
 enum CapturedOperation {
     Local { target: GuestTarget },
-    Immutable { root: Cid, mount: FrozenMount },
+    Immutable { root: Cid, mount: Box<FrozenMount> },
 }
 
 impl fmt::Debug for CapturedMounts {
@@ -170,7 +170,7 @@ impl CapturedMounts {
                             retained_roots.push(mount.source().cid());
                             uncertain_publication = false;
                         }
-                        frozen.push(mount);
+                        frozen.push(*mount);
                     }
                 }
             }
@@ -341,7 +341,7 @@ pub async fn capture_frozen_mounts_with_cancel(
                     identity.update(selected.dag_size().to_be_bytes());
                     CapturedOperation::Immutable {
                         root,
-                        mount: FrozenMount::new(selected, mount.target.clone())?,
+                        mount: Box::new(FrozenMount::new(selected, mount.target.clone())?),
                     }
                 }
             };

@@ -144,6 +144,30 @@ impl NativeJournal {
             "native after retention differs from target tuple"
         );
         self.disposition.validate()?;
+        match (
+            &self.disposition.quiescence_contract,
+            &self.disposition.quiescence_permit,
+        ) {
+            (None, None) => (),
+            (Some(contract), Some(permit)) => {
+                ensure!(
+                    self.admission.is_some(),
+                    "stopped transaction cannot own a launched quiescence target"
+                );
+                let role = if contract == &self.after.contract {
+                    PermitTarget::Candidate
+                } else if contract == &self.before.contract {
+                    PermitTarget::RestoredBefore
+                } else {
+                    bail!("quiescence contract is not an exact transaction target")
+                };
+                ensure!(
+                    permit == &self.make_payload(role)?,
+                    "quiescence permit differs from exact target"
+                );
+            }
+            _ => bail!("quiescence target requires both contract and permit"),
+        }
         match &self.admission {
             Some(admission) => {
                 admission.validate(&self.disposition.original)?;
@@ -475,13 +499,152 @@ impl Engine {
         }
     }
     pub fn validate_recovery_executable(&self, generation: &AuthenticatedGeneration) -> Result<()> {
-        let (j, _) = read_native(&self.paths)?.context("no pending native recovery")?;
-        ensure!(
-            same_generation_identity(generation.record(), &j.before.generation)
-                || same_generation_identity(generation.record(), &j.after.generation),
-            "authenticated recovery executable is not an exact recorded generation"
-        );
+        let bytes = storage::read_private_record(&self.paths.journal)?
+            .context("no pending native recovery")?;
+        let header: serde_json::Value =
+            serde_json::from_slice(&bytes).context("invalid Host transaction journal")?;
+        if header.get("version").and_then(|v| v.as_u64()) == Some(1) {
+            let journal = self.pending_recovery()?.context("legacy journal missing")?;
+            ensure!(
+                legacy_generation_matches(generation.record(), &journal.previous)
+                    || legacy_generation_matches(generation.record(), &journal.candidate),
+                "authenticated recovery executable is not an exact recorded legacy generation"
+            );
+        } else {
+            let (journal, _) = read_native(&self.paths)?.context("no pending native recovery")?;
+            ensure!(
+                same_generation_identity(generation.record(), &journal.before.generation)
+                    || same_generation_identity(generation.record(), &journal.after.generation),
+                "authenticated recovery executable is not an exact recorded generation"
+            );
+        }
         Ok(())
+    }
+
+    /// Legacy recovery never invents a transport-root/proof association or
+    /// grants guarded startup authority. Explicit signed evidence authorizes
+    /// only the exact recorded physical generation selected for recovery.
+    pub fn recover_authenticated_without_preparation_until(
+        &mut self,
+        service: &mut impl ServiceControl,
+        deadline: Instant,
+        generation: &AuthenticatedGeneration,
+    ) -> Result<Option<Outcome>> {
+        check_deadline(deadline)?;
+        self._lock.reject_pending_image()?;
+        self.validate_recovery_executable(generation)?;
+        let bytes =
+            storage::read_private_record(&self.paths.journal)?.context("journal missing")?;
+        let header: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if header.get("version").and_then(|v| v.as_u64()) != Some(1) {
+            return self.recover_without_preparation_until(service, deadline);
+        }
+        ensure!(
+            !startup::metadata_present(self._lock.home())?,
+            "legacy recovery cannot alter an initialized guarded installation"
+        );
+        let mut journal = self.pending_recovery()?.context("legacy journal missing")?;
+        if matches!(journal.phase, Phase::Staging | Phase::Ready) {
+            return self.recover_without_preparation_until(service, deadline);
+        }
+        let current = service.snapshot(deadline)?;
+        validate_snapshot(&current, &self.paths.executable)?;
+        same_configuration(&journal.before, &current)?;
+        ensure!(
+            current.running == RunningState::Stopped,
+            "explicitly stop the legacy managed service before authenticated recovery"
+        );
+        if journal.phase == Phase::Committed {
+            ensure!(
+                legacy_generation_matches(generation.record(), &journal.candidate),
+                "committed legacy cleanup requires the exact independently authenticated candidate"
+            );
+            storage::verify(&self.paths.executable, generation.artifact())?;
+            ensure!(
+                storage::read_record(&self.paths.receipt)?.as_ref()
+                    == journal.receipt_after.as_ref(),
+                "committed legacy receipt changed"
+            );
+            let expected = Retained {
+                version: 1,
+                current: journal.candidate.clone(),
+                previous: journal.previous.clone(),
+            };
+            ensure!(
+                storage::read_record(&self.paths.retained)?
+                    .as_deref()
+                    .map(Retained::decode)
+                    .transpose()?
+                    .as_ref()
+                    == Some(&expected),
+                "committed legacy retention changed"
+            );
+            self.remove_working_files()?;
+            storage::remove(&self.paths.journal)?;
+            return Ok(Some(Outcome::Recovered {
+                artifact: journal.candidate.artifact,
+                action: RecoveryAction::CompletedCommit,
+                live_ready: false,
+            }));
+        }
+        ensure!(legacy_generation_matches(generation.record(),&journal.previous),"legacy restoration requires independently authenticated exact previous generation; select its explicit release root");
+        if journal.phase == Phase::Restored {
+            storage::verify(&self.paths.executable, generation.artifact())?;
+            ensure!(
+                storage::read_record(&self.paths.receipt)?.as_ref()
+                    == Some(&journal.receipt_before)
+                    && storage::read_record(&self.paths.retained)? == journal.retained_before,
+                "restored legacy tuple changed"
+            );
+            self.finish_aborted(&journal)?;
+            return Ok(Some(Outcome::Recovered {
+                artifact: journal.previous.artifact,
+                action: RecoveryAction::RestoredPrevious,
+                live_ready: false,
+            }));
+        }
+        let retained_now = storage::read_record(&self.paths.retained)?;
+        let after_retained = serde_json::to_vec(&Retained {
+            version: 1,
+            current: journal.candidate.clone(),
+            previous: journal.previous.clone(),
+        })?;
+        ensure!(
+            retained_now == journal.retained_before
+                || retained_now.as_ref() == Some(&after_retained),
+            "legacy retention changed outside transaction"
+        );
+        ensure!(
+            storage::verify(&self.paths.executable, &journal.previous.artifact).is_ok()
+                || storage::verify(&self.paths.executable, &journal.candidate.artifact).is_ok(),
+            "legacy executable matches neither recorded generation"
+        );
+        storage::verify(
+            &self.paths.artifact(&journal.previous.artifact),
+            generation.artifact(),
+        )?;
+        check_deadline(deadline)?;
+        journal.phase = Phase::Restoring;
+        storage::write_record(&self.paths.journal, &serde_json::to_vec(&journal)?)?;
+        self.install_cached(generation.artifact(), deadline)?;
+        storage::write_record(&self.paths.receipt, &journal.receipt_before)?;
+        match &journal.retained_before {
+            Some(bytes) => storage::write_record(&self.paths.retained, bytes)?,
+            None => storage::remove(&self.paths.retained)?,
+        }
+        ensure!(
+            service.snapshot(deadline)? == current,
+            "legacy managed service changed during restoration"
+        );
+        storage::verify(&self.paths.executable, generation.artifact())?;
+        journal.phase = Phase::Restored;
+        storage::write_record(&self.paths.journal, &serde_json::to_vec(&journal)?)?;
+        self.finish_aborted(&journal)?;
+        Ok(Some(Outcome::Recovered {
+            artifact: journal.previous.artifact,
+            action: RecoveryAction::RestoredPrevious,
+            live_ready: false,
+        }))
     }
 
     fn start_native<R: Read>(
@@ -596,6 +759,8 @@ impl Engine {
                 identity,
                 original_process: admission.as_ref().map(|a| a.original_process.clone()),
                 original_contract: admission.as_ref().map(|_| contract),
+                quiescence_contract: None,
+                quiescence_permit: None,
                 stop_intent: false,
                 quiesced: None,
             },
@@ -657,6 +822,8 @@ impl Engine {
                 && quiesced.identity == j.disposition.identity
                 && quiesced.original_process == j.disposition.original_process
                 && quiesced.original_contract == j.disposition.original_contract
+                && quiesced.quiescence_contract == j.disposition.quiescence_contract
+                && quiesced.quiescence_permit == j.disposition.quiescence_permit
                 && quiesced.stop_intent
                 && quiesced.quiesced.is_some(),
             "quiescence changed original transaction disposition"
@@ -675,18 +842,18 @@ impl Engine {
         self.install_cached(&j.after.generation.artifact, deadline)?;
         j.phase(&self.paths, rollback, NativePhase::Installed)?;
         let live = j.admission.is_some();
-        if live {
+        let live_evidence = if live {
             j.phase(&self.paths, rollback, NativePhase::Starting)?;
             lease.write_state(&j.runnable(PermitTarget::Candidate)?)?;
             drop(lease);
             drop(instance);
-            self.restart_native(
+            Some(self.restart_native(
                 service,
                 &j,
                 PermitTarget::Candidate,
                 &request.inputs,
                 deadline,
-            )?;
+            )?)
         } else {
             ensure!(
                 service.snapshot(deadline)?.running == RunningState::Stopped,
@@ -694,7 +861,8 @@ impl Engine {
             );
             drop(lease);
             drop(instance);
-        }
+            None
+        };
         j.phase(&self.paths, rollback, NativePhase::Verified)?;
         let _instance = if live {
             None
@@ -711,7 +879,25 @@ impl Engine {
             )?;
         }
         check_deadline(deadline)?;
+        if let Some(evidence) = &live_evidence {
+            self.revalidate_native_evidence(
+                service,
+                &j,
+                PermitTarget::Candidate,
+                evidence,
+                deadline,
+            )?;
+        }
         write_tuple(&self.paths, &lease, &j.after, &j.retained_after)?;
+        if let Some(evidence) = &live_evidence {
+            self.revalidate_native_evidence(
+                service,
+                &j,
+                PermitTarget::Candidate,
+                evidence,
+                deadline,
+            )?;
+        }
         j.phase(&self.paths, rollback, NativePhase::Committed)?;
         lease.write_state(&j.steady(&j.after))?;
         self.finish_native(&j, true)?;
@@ -725,7 +911,7 @@ impl Engine {
         role: PermitTarget,
         inputs: &PreflightInputs,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<service::RunningEvidence> {
         let admission = j.admission.as_ref().context("restart not admitted")?;
         let tuple = if role == PermitTarget::Candidate {
             &j.after
@@ -752,8 +938,38 @@ impl Engine {
             "manager process differs from independently attested ready process"
         );
         verify_preflight(service, &executable, inputs, deadline)?;
-        check_deadline(deadline)
+        service.revalidate_running(&evidence, &permit, &executable, deadline)?;
+        check_deadline(deadline)?;
+        Ok(evidence)
     }
+    fn revalidate_native_evidence(
+        &self,
+        service: &mut impl ServiceControl,
+        j: &NativeJournal,
+        role: PermitTarget,
+        evidence: &service::RunningEvidence,
+        deadline: Instant,
+    ) -> Result<()> {
+        let tuple = if role == PermitTarget::Candidate {
+            &j.after
+        } else {
+            &j.before
+        };
+        let executable =
+            VerifiedExecutable::open(&self.paths.executable, &tuple.generation.artifact, deadline)?;
+        let permit = StartupPermit {
+            payload: j.make_payload(role)?,
+            contract: tuple.contract.clone(),
+        };
+        evidence.verify(
+            j.admission.as_ref().context("missing restart admission")?,
+            &permit,
+            &executable,
+        )?;
+        service.revalidate_running(evidence, &permit, &executable, deadline)?;
+        executable.revalidate(deadline)
+    }
+
     fn finish_native(&self, j: &NativeJournal, committed: bool) -> Result<()> {
         let retained = RetainedV2::decode(if committed {
             &j.retained_after
@@ -768,6 +984,20 @@ impl Engine {
             .into_iter()
             .chain(old.previous.as_ref())
         {
+            // A crash can leave a partial envelope before its final rename.
+            // This filename is derived only from a journal-owned proof reference.
+            let proof = self.paths.proof(&record.proof)?;
+            let pending = proof.with_file_name(format!(
+                ".{}.pending",
+                proof
+                    .file_name()
+                    .context("proof filename")?
+                    .to_string_lossy()
+            ));
+            if storage::exists(&pending)? {
+                storage::read_proof(&pending)?;
+                storage::remove(&pending)?;
+            }
             if !referenced(record) {
                 let proof = self.paths.proof(&record.proof)?;
                 if storage::exists(&proof)? {
@@ -1005,6 +1235,25 @@ impl Engine {
             validate_owned_mixed(&self.paths, &lease, &j)?;
             lease.write_state(&j.blocked())?;
         }
+        if j.admission.is_some() {
+            let role = match j.phase {
+                NativePhase::Starting | NativePhase::Verified => Some(PermitTarget::Candidate),
+                NativePhase::Restoring => Some(PermitTarget::RestoredBefore),
+                _ => None,
+            };
+            if let Some(role) = role {
+                let tuple = if role == PermitTarget::Candidate {
+                    &j.after
+                } else {
+                    &j.before
+                };
+                j.disposition.quiescence_contract = Some(tuple.contract.clone());
+                j.disposition.quiescence_permit = Some(j.make_payload(role)?);
+                j.disposition.quiesced = None;
+                j.disposition.stop_intent = true;
+                j.save(&self.paths, rollback)?;
+            }
+        }
         // Record stop intent before a recovery manager command as well. A prior
         // timeout does not prove that the original job is still registered.
         if !j.disposition.stop_intent {
@@ -1017,6 +1266,8 @@ impl Engine {
                 && quiesced.identity == j.disposition.identity
                 && quiesced.original_process == j.disposition.original_process
                 && quiesced.original_contract == j.disposition.original_contract
+                && quiesced.quiescence_contract == j.disposition.quiescence_contract
+                && quiesced.quiescence_permit == j.disposition.quiescence_permit
                 && quiesced.stop_intent
                 && quiesced.quiesced.is_some(),
             "recovery quiescence changed original ownership"
@@ -1046,11 +1297,17 @@ impl Engine {
         self.install_cached(&j.before.generation.artifact, deadline)?;
         write_tuple(&self.paths, &lease, &j.before, &j.retained_before)?;
         let live = j.admission.is_some();
-        if live {
+        let live_evidence = if live {
             lease.write_state(&j.runnable(PermitTarget::RestoredBefore)?)?;
             drop(lease);
             drop(instance);
-            self.restart_native(service, &j, PermitTarget::RestoredBefore, inputs, deadline)?;
+            Some(self.restart_native(
+                service,
+                &j,
+                PermitTarget::RestoredBefore,
+                inputs,
+                deadline,
+            )?)
         } else {
             ensure!(
                 service.snapshot(deadline)?.running == RunningState::Stopped,
@@ -1058,7 +1315,8 @@ impl Engine {
             );
             drop(lease);
             drop(instance);
-        }
+            None
+        };
         let _instance = if live {
             None
         } else {
@@ -1068,6 +1326,15 @@ impl Engine {
         validate_owned_mixed(&self.paths, &lease, &j)?;
         verify_tuple(&self.paths, &j.before)?;
         check_deadline(deadline)?;
+        if let Some(evidence) = &live_evidence {
+            self.revalidate_native_evidence(
+                service,
+                &j,
+                PermitTarget::RestoredBefore,
+                evidence,
+                deadline,
+            )?;
+        }
         j.phase(&self.paths, rollback, NativePhase::Restored)?;
         lease.write_state(&j.steady(&j.before))?;
         self.finish_native(&j, false)?;
@@ -1077,4 +1344,12 @@ impl Engine {
             live_ready: live,
         })
     }
+}
+
+fn legacy_generation_matches(generation: &GenerationRecord, record: &ArtifactRecord) -> bool {
+    generation.artifact == record.artifact
+        && generation.descriptor == record.release
+        && generation.target == record.platform
+        && generation.release_version == record.version
+        && generation.revision == record.revision
 }

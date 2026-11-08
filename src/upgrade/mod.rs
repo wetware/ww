@@ -70,9 +70,11 @@ impl ArtifactIdentity {
 #[derive(Clone, Debug)]
 pub struct PreverifiedCandidate {
     artifact: ArtifactIdentity,
+    #[cfg(test)]
     release: String,
     version: String,
     revision: String,
+    #[cfg(test)]
     platform: String,
 }
 
@@ -98,9 +100,11 @@ impl PreverifiedCandidate {
                 digest: hex::encode(host.artifact.sha256),
                 size: host.artifact.size,
             },
+            #[cfg(test)]
             release: release.descriptor_cid().to_string(),
             version: release.descriptor().version.clone(),
             revision: host.provenance.revision.clone(),
+            #[cfg(test)]
             platform: host.target.clone(),
         };
         candidate.artifact.validate()?;
@@ -109,7 +113,8 @@ impl PreverifiedCandidate {
 }
 
 /// Both selections are authenticated. The legacy receipt authenticates neither.
-pub struct LegacyUpgradeRequest<R: Read> {
+#[cfg(test)]
+struct LegacyUpgradeRequest<R: Read> {
     pub installed: PreverifiedCandidate,
     pub candidate: PreverifiedCandidate,
     pub bytes: R,
@@ -155,6 +160,7 @@ struct ArtifactRecord {
     platform: String,
 }
 
+#[cfg(test)]
 impl From<PreverifiedCandidate> for ArtifactRecord {
     fn from(selected: PreverifiedCandidate) -> Self {
         Self {
@@ -272,6 +278,7 @@ impl Engine {
     /// I/O: this synchronous owner cannot cancel an arbitrary blocking `Read` or
     /// in-flight filesystem operation. Once a commit is admitted, required
     /// durability work and terminal cleanup complete even if the budget expires.
+    #[cfg(test)]
     pub(crate) fn legacy_operator_upgrade<R: Read>(
         &mut self,
         service: &mut impl ServiceControl,
@@ -281,6 +288,7 @@ impl Engine {
         self.legacy_operator_upgrade_until(service, deadline(timeout)?, select)
     }
 
+    #[cfg(test)]
     pub(crate) fn legacy_operator_upgrade_until<R: Read>(
         &mut self,
         service: &mut impl ServiceControl,
@@ -306,6 +314,7 @@ impl Engine {
 
     /// Select only the previous authenticated artifact retained by this owner.
     /// No release discovery, freshness watermark, or deployment head is changed.
+    #[cfg(test)]
     pub(crate) fn legacy_operator_rollback(
         &mut self,
         service: &mut impl ServiceControl,
@@ -314,6 +323,7 @@ impl Engine {
         self.legacy_operator_rollback_until(service, deadline(timeout)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn legacy_operator_rollback_until(
         &mut self,
         service: &mut impl ServiceControl,
@@ -344,6 +354,7 @@ impl Engine {
     }
 
     /// Recover the recorded operation without selecting another release.
+    #[cfg(test)]
     pub(crate) fn legacy_recover(
         &mut self,
         service: &mut impl ServiceControl,
@@ -352,6 +363,7 @@ impl Engine {
         self.legacy_recover_before(service, deadline(timeout)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn legacy_recover_before(
         &mut self,
         service: &mut impl ServiceControl,
@@ -367,11 +379,14 @@ impl Engine {
     pub fn require_pending_recovery(&self) -> Result<()> {
         let bytes = storage::read_private_record(&self.paths.journal)?
             .context("no pending Host transaction; recovery-only cannot select a new release")?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).context("invalid Host transaction journal")?;
         if value.get("version").and_then(|v| v.as_u64()) == Some(1) {
             self.pending_recovery()?.context("legacy journal missing")?;
         } else {
-            match serde_json::from_slice::<JournalV2>(&bytes)? {
+            match serde_json::from_slice::<JournalV2>(&bytes)
+                .context("invalid Host transaction journal")?
+            {
                 JournalV2::Upgrade(j) | JournalV2::Rollback(j) => j.validate()?,
                 JournalV2::Admit(_) => {
                     anyhow::bail!("pending startup admission must recover through startup admit")
@@ -384,6 +399,7 @@ impl Engine {
     /// Recover only through an independently authenticated recorded generation.
     /// The caller must verify that its running recovery executable has the exact
     /// selected bytes. A local journal supplies scope, never release authority.
+    #[cfg(test)]
     pub(crate) fn legacy_recover_authenticated(
         &mut self,
         service: &mut impl ServiceControl,
@@ -393,6 +409,7 @@ impl Engine {
         self.legacy_recover_authenticated_until(service, deadline(timeout)?, executable)
     }
 
+    #[cfg(test)]
     pub(crate) fn legacy_recover_authenticated_until(
         &mut self,
         service: &mut impl ServiceControl,
@@ -425,6 +442,7 @@ impl Engine {
         Ok(Some(journal))
     }
 
+    #[cfg(test)]
     fn start(
         &mut self,
         service: &mut impl ServiceControl,
@@ -549,6 +567,7 @@ impl Engine {
         Ok(Outcome::Installed { live_ready })
     }
 
+    #[cfg(test)]
     fn readmit(&self, service: &mut impl ServiceControl, journal: &Journal) -> Result<()> {
         if let Some(expected) = &journal.admission {
             service.legacy_revalidate_restart(expected).context(
@@ -557,6 +576,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn restart(
         &self,
         service: &mut impl ServiceControl,
@@ -603,6 +623,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn stop_and_confirm(&self, service: &mut impl ServiceControl, deadline: Instant) -> Result<()> {
         checkpoint("service.stop.before")?;
         service.legacy_stop(deadline)?;
@@ -627,6 +648,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn legacy_recover_until(
         &mut self,
         service: &mut impl ServiceControl,
@@ -818,6 +840,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn with_recovery_context(&self, result: Result<Outcome>) -> Result<Outcome> {
         result.map_err(|error| {
             if storage::exists(&self.paths.journal).unwrap_or(true) {
@@ -835,6 +858,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn set_phase(&self, journal: &mut Journal, phase: Phase) -> Result<()> {
         checkpoint(&format!("phase.{phase:?}.before"))?;
         journal.phase = phase;
@@ -843,10 +867,12 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn save(&self, journal: &Journal) -> Result<()> {
         storage::write_record(&self.paths.journal, &serde_json::to_vec(journal)?)
     }
 
+    #[cfg(test)]
     fn finish_committed(&self, journal: &Journal) -> Result<()> {
         storage::verify(
             &self.paths.artifact(&journal.previous.artifact),
@@ -1609,6 +1635,7 @@ impl Engine {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)] // Owned bounded contract is the public checked result.
 pub enum AdmissionOutcome {
     Checked {
         contract: startup::StartupContractV1,

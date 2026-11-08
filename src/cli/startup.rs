@@ -801,8 +801,8 @@ impl ReadinessService {
             stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
             "readiness peer has another owner"
         );
-        let challenge: ReadinessChallenge =
-            read_frame(&mut stream, MAX_NATIVE_RESPONSE_BYTES).await?;
+        let challenge: ReadinessChallenge = tokio::time::timeout(Duration::from_secs(30), read_frame(&mut stream, MAX_NATIVE_RESPONSE_BYTES))
+            .await.context("readiness challenge frame deadline expired")??;
         ensure!(
             challenge.version == NATIVE_PROTOCOL_VERSION && challenge.nonce != [0; 32],
             "invalid readiness challenge"
@@ -813,9 +813,11 @@ impl ReadinessService {
                 .is_none_or(|nonce| nonce == self.startup.launch_nonce),
             "readiness launch nonce changed"
         );
+        ensure!(challenge.timeout_millis > 0, "readiness request budget must be positive");
+        let deadline = Instant::now() + Duration::from_millis(challenge.timeout_millis.min(300_000));
         self.startup
             .process
-            .revalidate(Instant::now() + Duration::from_secs(2))?;
+            .revalidate(deadline)?;
         let current = self.identity.ready_snapshot(&self.ready, self.routes.as_ref());
         let response = ReadinessResponse {
             version: NATIVE_PROTOCOL_VERSION,
@@ -842,7 +844,8 @@ impl ReadinessService {
             kernel_runtime: current.as_ref().map(|identity| identity.content.cid.clone()).unwrap_or_default(),
             kernel_source_cid: current.and_then(|identity| identity.content.source_cid),
         };
-        write_frame(&mut stream, &response, MAX_NATIVE_RESPONSE_BYTES).await
+        tokio::time::timeout_at(deadline.into(), write_frame(&mut stream, &response, MAX_NATIVE_RESPONSE_BYTES)).await
+            .context("readiness reply deadline expired")?
     }
 }
 
@@ -860,7 +863,10 @@ impl ww::services::Service for ReadinessService {
                         let (stream, _) = accepted?;
                         // A malformed request or a not-ready generation closes
                         // only that connection. Neither condition stops Host.
-                        let _ = tokio::time::timeout(Duration::from_secs(2), self.respond(stream)).await;
+                        tokio::select! {
+                            _ = shutdown.changed() => return Ok(()),
+                            _ = self.respond(stream) => {},
+                        }
                     }
                 }
             }
@@ -1299,6 +1305,32 @@ async fn prepare_preflight(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the explicit disposable systemd fixture; retains shared Kubo pins"]
+    async fn export_disposable_native_preflight_inputs() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        assert_eq!(std::env::var("WW739_DISPOSABLE_SYSTEMD").as_deref(), Ok("1"));
+        assert!(Path::new("/.dockerenv").is_file());
+        // SAFETY: geteuid has no pointer arguments.
+        assert_eq!(unsafe { libc::geteuid() }, 1001);
+        let home = Path::new("/home/testww");
+        assert_eq!(std::env::var_os("HOME"), Some(home.as_os_str().to_owned()));
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let (run, _) = super::super::startup_cmd::service_run(home, deadline).unwrap();
+        let inputs = capture_for_admission(run, deadline).await.unwrap();
+        inputs.validate().unwrap();
+        let bytes = serde_json::to_vec(&inputs).unwrap();
+        assert!(bytes.len() <= ww::upgrade::inputs::MAX_PREFLIGHT_REQUEST_BYTES);
+        let mut output = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(home.join("ww739-inputs.json")).unwrap();
+        output.write_all(&bytes).unwrap();
+        output.sync_all().unwrap();
+        eprintln!("captured native inputs: {}", hex::encode(inputs.capture_digest().unwrap()));
+    }
+
     #[tokio::test]
     async fn private_protocol_rejects_oversize_and_unknown_fields() {
         use tokio::io::AsyncWriteExt;
@@ -1311,7 +1343,7 @@ mod tests {
             .to_string()
             .contains("bound"));
         let (mut writer, mut reader) = tokio::net::UnixStream::pair().unwrap();
-        let value = serde_json::json!({ "version":1, "nonce":vec![1;32], "launch_nonce":null, "unexpected":true });
+        let value = serde_json::json!({ "version":1, "nonce":vec![1;32], "launch_nonce":null, "timeout_millis":1000, "unexpected":true });
         write_frame(&mut writer, &value, 1024).await.unwrap();
         assert!(read_frame::<ReadinessChallenge>(&mut reader, 1024)
             .await
@@ -1321,6 +1353,7 @@ mod tests {
             version: 1,
             nonce: [7; 32],
             launch_nonce: Some([9; 32]),
+            timeout_millis: 1000,
         };
         write_frame(&mut writer, &challenge, 1024).await.unwrap();
         let decoded: ReadinessChallenge = read_frame(&mut reader, 1024).await.unwrap();

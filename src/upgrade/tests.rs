@@ -206,6 +206,26 @@ impl ServiceControl for FakeService {
             kernel_runtime: "fixture-runtime".into(),
         })
     }
+    fn revalidate_running(
+        &mut self,
+        evidence: &service::RunningEvidence,
+        permit: &StartupPermit,
+        executable: &attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<()> {
+        executable.revalidate(deadline)?;
+        ensure!(
+            self.snapshot.running
+                == RunningState::Running {
+                    pid: evidence.process().pid
+                }
+                && self.running_artifact.as_ref() == Some(executable.artifact())
+                && self.startup == permit.contract().startup
+                && !self.not_ready,
+            "live evidence changed"
+        );
+        Ok(())
+    }
     fn stop(&mut self, _: &startup::ServiceIdentity, _: Instant) -> Result<()> {
         ensure!(!self.stop_failure, "stop failed");
         self.stops += 1;
@@ -1517,6 +1537,14 @@ fn scoped_v2_receipt_survives_refusal_recovery_upgrade_and_rollback() {
 // Genuine signatures over disposable protocol fixtures. These are not producer
 // artifacts and never qualify native restart or the public release pipeline.
 fn signed_generation(bytes: &[u8], sequence: u64) -> provenance::AuthenticatedGeneration {
+    signed_generation_with_key(bytes, sequence, [7; 32])
+}
+
+fn signed_generation_with_key(
+    bytes: &[u8],
+    sequence: u64,
+    seed: [u8; 32],
+) -> provenance::AuthenticatedGeneration {
     use crate::release::auth::TrustedKeys;
     use crate::release::descriptor::{
         Artifact, AuthenticatedRelease, DeploymentArtifact, Descriptor, HostArtifact, Provenance,
@@ -1537,7 +1565,7 @@ fn signed_generation(bytes: &[u8], sequence: u64) -> provenance::AuthenticatedGe
             size: bytes.len() as u64,
         }
     }
-    let key = SigningKey::from_bytes(&[7; 32]);
+    let key = SigningKey::from_bytes(&seed);
     let mut der = vec![
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
     ];
@@ -2047,6 +2075,7 @@ fn admission_process_exit_at_every_durable_boundary_restores_or_commits_exact_co
 fn fixture_process(pid: u32) -> service::ProcessInstance {
     service::ProcessInstance {
         pid,
+        manager_invocation_id: format!("{pid:032x}"),
         start: attestation::ProcessStartToken::Linux {
             boot_id: "00000000-0000-0000-0000-000000000001".into(),
             start_ticks: u64::from(pid),
@@ -2208,4 +2237,337 @@ fn native_v2_running_upgrade_consumes_exact_permit_and_recovers_failed_restart()
         Some(signed_generation(OLD, 1).artifact())
     );
     assert!(!engine.paths.journal.exists());
+}
+
+fn run_native_fixture_operation(home: &Path, action: &str) -> Result<Outcome> {
+    let mut engine = Engine::open(home)?;
+    let mut service: FakeService =
+        serde_json::from_slice(&std::fs::read(home.join("simulated-native-v2.json"))?)?;
+    let inputs = admission_inputs(home);
+    match action {
+        "upgrade" => {
+            let current = engine.current_generation()?;
+            engine.operator_upgrade(&mut service, TIMEOUT, || {
+                Ok(native_request(current, inputs, NEW, 2))
+            })
+        }
+        "second" => {
+            let current = engine.current_generation()?;
+            engine.operator_upgrade(&mut service, TIMEOUT, || {
+                Ok(native_request(current, inputs, THIRD, 3))
+            })
+        }
+        "rollback" => {
+            engine.operator_rollback_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        }
+        "recover" => engine.recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs),
+        _ => bail!("unknown native crash action"),
+    }
+}
+
+#[test]
+#[ignore = "subprocess worker; invoked by native v2 crash matrix"]
+fn native_v2_crash_worker() {
+    let home = PathBuf::from(std::env::var_os("WW_NATIVE_V2_HOME").unwrap());
+    let point: usize = std::env::var("WW_NATIVE_V2_POINT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let action = std::env::var("WW_NATIVE_V2_ACTION").unwrap();
+    storage::faults::exit_at(point);
+    run_native_fixture_operation(&home, &action).unwrap();
+    panic!("requested native v2 crash point did not execute");
+}
+
+fn prepare_native_crash(running: bool, action: &str) -> tempfile::TempDir {
+    storage::faults::configure(None);
+    let (home, engine, _, _, mut service) = native_fixture(running);
+    service.persistent_state = Some(home.path().join("simulated-native-v2.json"));
+    service.save_state().unwrap();
+    drop(engine);
+    if matches!(action, "rollback" | "second") {
+        run_native_fixture_operation(home.path(), "upgrade").unwrap();
+    }
+    if action == "recover" {
+        let baseline = prepare_native_crash(running, "upgrade");
+        storage::faults::configure(None);
+        run_native_fixture_operation(baseline.path(), "upgrade").unwrap();
+        let trace = storage::faults::trace();
+        let point = trace
+            .iter()
+            .position(|s| s == "native.phase.Installed")
+            .unwrap()
+            + 1;
+        storage::faults::configure(Some(point));
+        assert!(run_native_fixture_operation(home.path(), "upgrade").is_err());
+        storage::faults::configure(None);
+    }
+    home
+}
+
+#[test]
+fn native_v2_process_exit_at_every_upgrade_rollback_and_recovery_boundary() {
+    for running in [false, true] {
+        for action in ["upgrade", "second", "rollback", "recover"] {
+            let baseline = prepare_native_crash(running, action);
+            storage::faults::configure(None);
+            run_native_fixture_operation(baseline.path(), action).unwrap();
+            let trace = storage::faults::trace();
+            assert!(
+                trace.len() > 20,
+                "native crash trace did not execute transaction boundaries"
+            );
+            for (index, label) in trace.iter().enumerate() {
+                let home = prepare_native_crash(running, action);
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "upgrade::tests::native_v2_crash_worker",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("WW_NATIVE_V2_HOME", home.path())
+                    .env("WW_NATIVE_V2_POINT", (index + 1).to_string())
+                    .env("WW_NATIVE_V2_ACTION", action)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    status.code(),
+                    Some(86),
+                    "running={running} {action} {} {label}",
+                    index + 1
+                );
+                storage::faults::configure(None);
+                run_native_fixture_operation(home.path(), "recover").unwrap_or_else(|e| {
+                    panic!("running={running} {action} {} {label}: {e:#}", index + 1)
+                });
+                let engine = open(home.path());
+                let contract = engine.startup_contract().unwrap().unwrap();
+                let lease = startup::StartupLease::shared(home.path()).unwrap();
+                validate_steady_start(&lease, &engine.startup_state().unwrap(), &contract).unwrap();
+                let state = engine.startup_state().unwrap();
+                let retained = read_retained_v2(&engine.paths).unwrap();
+                assert_eq!(state.native, retained.current);
+                assert!(!engine.paths.journal.exists());
+                let service: FakeService = serde_json::from_slice(
+                    &std::fs::read(home.path().join("simulated-native-v2.json")).unwrap(),
+                )
+                .unwrap();
+                if running {
+                    assert_eq!(
+                        service.running_artifact.as_ref(),
+                        Some(&state.native.artifact)
+                    );
+                } else {
+                    assert_eq!(service.snapshot.running, RunningState::Stopped);
+                    assert_eq!(service.restarts, 0);
+                }
+                assert!(
+                    std::fs::read_dir(&engine.paths.proofs).unwrap().count() <= 2,
+                    "proof leak after {action} {label}"
+                );
+            }
+            eprintln!(
+                "native v2 running={running} action={action}: {} real process-exit checkpoints",
+                trace.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn native_v2_pending_child_rereads_current_trust_but_restored_before_uses_exact_history() {
+    storage::faults::configure(None);
+    let (home, mut engine, current, inputs, mut service) = native_fixture(true);
+    let original = engine.startup_contract().unwrap().unwrap();
+    service.restart_failure = true;
+    assert!(engine
+        .operator_upgrade(&mut service, TIMEOUT, || Ok(native_request(
+            current,
+            inputs.clone(),
+            NEW,
+            2
+        )))
+        .is_err());
+    {
+        let lease = startup::StartupLease::shared(home.path()).unwrap();
+        assert!(
+            validate_transaction_start(&lease, &original.invocation, Instant::now() + TIMEOUT)
+                .is_ok()
+        );
+        let unrelated = signed_generation_with_key(NEW, 2, [8; 32]);
+        std::fs::write(
+            &original.trusted_release_keys,
+            &unrelated.record().verification_keys,
+        )
+        .unwrap();
+        assert!(
+            validate_transaction_start(&lease, &original.invocation, Instant::now() + TIMEOUT)
+                .is_err()
+        );
+    }
+    service.restart_failure = false;
+    engine
+        .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        .unwrap();
+    assert_eq!(
+        engine.current_generation().unwrap().record(),
+        signed_generation(OLD, 1).record()
+    );
+    assert_eq!(engine.startup_contract().unwrap(), Some(original));
+}
+
+#[test]
+fn native_v2_signed_proof_substitution_and_loss_refuse_without_changing_accepted_tuple() {
+    storage::faults::configure(None);
+    let (_home, mut engine, current, inputs, mut service) = native_fixture(false);
+    engine
+        .operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(native_request(current, inputs, NEW, 2))
+        })
+        .unwrap();
+    let retained = read_retained_v2(&engine.paths).unwrap();
+    let proof = engine.paths.proof(&retained.current.proof).unwrap();
+    let exact = storage::read_proof(&proof).unwrap();
+    let unrelated = signed_generation(NEW, 77);
+    std::fs::write(&proof, unrelated.proof_bytes()).unwrap();
+    assert!(engine.current_generation().is_err());
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), NEW);
+    std::fs::write(&proof, &exact).unwrap();
+    assert_eq!(
+        engine.current_generation().unwrap().record(),
+        &retained.current
+    );
+    std::fs::remove_file(&proof).unwrap();
+    assert!(engine.current_generation().is_err());
+    assert!(!engine.paths.journal.exists());
+}
+
+#[test]
+fn native_v2_same_artifact_other_signed_root_preserves_contract_locator_and_history() {
+    storage::faults::configure(None);
+    let (_home, mut engine, current, inputs, mut service) = native_fixture(false);
+    let contract = engine.startup_contract().unwrap();
+    let locator = std::fs::read(&engine.paths.locator).unwrap();
+    let retained = std::fs::read(&engine.paths.retained).unwrap();
+    assert_eq!(
+        engine
+            .operator_upgrade(&mut service, TIMEOUT, || Ok(native_request(
+                current, inputs, OLD, 2
+            )))
+            .unwrap(),
+        Outcome::AlreadyInstalled
+    );
+    assert_eq!(engine.startup_contract().unwrap(), contract);
+    assert_eq!(std::fs::read(&engine.paths.locator).unwrap(), locator);
+    assert_eq!(std::fs::read(&engine.paths.retained).unwrap(), retained);
+    assert!(!engine.paths.journal.exists());
+}
+
+fn run_initialization_fixture(home: &Path) -> Result<()> {
+    let generation = signed_generation(OLD, 1);
+    let trust = provenance::IndependentTrustSource::from_path(&home.join("release-keys"))?;
+    let mut receipt = Receipt {
+        version: 2,
+        hashes: [
+            blake3::hash(OLD).to_hex().to_string(),
+            blake3::hash(b"kernel fixture").to_hex().to_string(),
+            blake3::hash(b"status fixture").to_hex().to_string(),
+            String::new(),
+            String::new(),
+        ],
+        previous: None,
+        complete: false,
+    };
+    let mut engine = Engine::open(home)?;
+    if let Some(bytes) =
+        storage::read_private_record(&engine.paths.store.join("startup-state.json"))?
+    {
+        if startup::StartupStateV1::decode(&bytes)?
+            .initializing_receipt
+            .is_none()
+        {
+            receipt.complete = true;
+            ensure!(
+                engine.verify_complete_installation(&generation, &receipt)?,
+                "completed initialization mismatch"
+            );
+            return Ok(());
+        }
+    }
+    let guard = engine.prepare_initialization(&generation, &receipt, &trust)?;
+    write_initialization_software(home);
+    if guard.may_create_identity()? {
+        std::fs::write(home.join(".ww/identity"), b"unchanged initializer identity")?;
+        std::fs::set_permissions(
+            home.join(".ww/identity"),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+    }
+    receipt.complete = true;
+    guard.finish(&receipt)
+}
+
+#[test]
+#[ignore = "subprocess worker; invoked by initialization crash matrix"]
+fn initialization_owner_crash_worker() {
+    let home = PathBuf::from(std::env::var_os("WW_INIT_OWNER_HOME").unwrap());
+    let point: usize = std::env::var("WW_INIT_OWNER_POINT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    storage::faults::exit_at(point);
+    run_initialization_fixture(&home).unwrap();
+    panic!("requested initialization owner crash point did not execute");
+}
+
+#[test]
+fn initialization_process_exit_at_every_owner_boundary_resumes_exact_unbound_generation() {
+    storage::faults::configure(None);
+    let (baseline, _, _, _) = initialization_fixture();
+    run_initialization_fixture(baseline.path()).unwrap();
+    let trace = storage::faults::trace();
+    assert!(trace.iter().any(|s| s == "proof.write.after"));
+    for (index, label) in trace.iter().enumerate() {
+        storage::faults::configure(None);
+        let (home, generation, _, _) = initialization_fixture();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "upgrade::tests::initialization_owner_crash_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("WW_INIT_OWNER_HOME", home.path())
+            .env("WW_INIT_OWNER_POINT", (index + 1).to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "{} {label}", index + 1);
+        storage::faults::configure(None);
+        run_initialization_fixture(home.path())
+            .unwrap_or_else(|e| panic!("{} {label}: {e:#}", index + 1));
+        let engine = open(home.path());
+        assert_eq!(
+            engine.current_generation().unwrap().record(),
+            generation.record()
+        );
+        assert_eq!(
+            engine.startup_state().unwrap().disposition,
+            startup::StartupDisposition::RequiredUnbound
+        );
+        assert!(engine.startup_contract().unwrap().is_none());
+        assert_eq!(
+            std::fs::read(home.path().join(".ww/identity")).unwrap(),
+            b"unchanged initializer identity"
+        );
+        assert!(Receipt::load(&home.path().join(".ww")).unwrap().complete);
+    }
+    eprintln!(
+        "initialization owner: {} real process-exit checkpoints",
+        trace.len()
+    );
 }

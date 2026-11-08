@@ -101,6 +101,7 @@ impl LegacyRestartAdmission {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub struct LegacyRunningEvidence {
     pub pid: u32,
     pub artifact: ArtifactIdentity,
@@ -108,6 +109,7 @@ pub struct LegacyRunningEvidence {
     pub serving_ready: bool,
 }
 
+#[cfg(test)]
 impl LegacyRunningEvidence {
     pub fn verify(
         &self,
@@ -179,6 +181,7 @@ pub struct ProcessInstance {
     pub pid: u32,
     pub start: super::attestation::ProcessStartToken,
     pub launch_nonce: [u8; 32],
+    pub manager_invocation_id: String,
 }
 
 impl ProcessInstance {
@@ -186,6 +189,15 @@ impl ProcessInstance {
         ensure!(
             self.pid != 0 && self.launch_nonce != [0; 32],
             "missing process birth or execution nonce"
+        );
+        ensure!(
+            self.manager_invocation_id.len() == 32
+                && self
+                    .manager_invocation_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && self.manager_invocation_id.bytes().any(|byte| byte != b'0'),
+            "invalid systemd manager invocation identity"
         );
         match &self.start {
             super::attestation::ProcessStartToken::Linux {
@@ -258,6 +270,8 @@ pub struct ServiceDisposition {
     pub identity: Option<super::startup::ServiceIdentity>,
     pub original_process: Option<ProcessInstance>,
     pub original_contract: Option<super::startup::StartupContractV1>,
+    pub quiescence_contract: Option<super::startup::StartupContractV1>,
+    pub quiescence_permit: Option<super::startup::StartupPermitPayload>,
     pub stop_intent: bool,
     pub quiesced: Option<ServiceSnapshot>,
 }
@@ -268,7 +282,7 @@ impl ServiceDisposition {
             process.validate()?;
         }
         ensure!(
-            !self.quiesced.is_some() || self.stop_intent,
+            self.quiesced.is_none() || self.stop_intent,
             "quiescence has no durable stop intent"
         );
         if let Some(quiesced) = &self.quiesced {
@@ -381,6 +395,15 @@ pub trait ServiceControl {
     ) -> Result<RunningEvidence> {
         bail!("native guarded restart is not qualified")
     }
+    fn revalidate_running(
+        &mut self,
+        _evidence: &RunningEvidence,
+        _permit: &super::StartupPermit,
+        _expected: &super::attestation::VerifiedExecutable,
+        _deadline: Instant,
+    ) -> Result<()> {
+        bail!("native live evidence revalidation is not qualified")
+    }
     fn stop(
         &mut self,
         _expected: &super::startup::ServiceIdentity,
@@ -389,17 +412,21 @@ pub trait ServiceControl {
         bail!("native service containment is not qualified")
     }
     fn snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot>;
+    #[cfg(test)]
     fn legacy_admit_restart(&mut self, before: &ServiceSnapshot) -> Result<LegacyRestartAdmission>;
     /// Recheck prepared next-start inputs against the durable admission during
     /// recovery. The original process may already have stopped. Child-side
     /// enforcement remains required before publication or guest execution.
+    #[cfg(test)]
     fn legacy_revalidate_restart(&mut self, admission: &LegacyRestartAdmission) -> Result<()>;
+    #[cfg(test)]
     fn legacy_restart(
         &mut self,
         admission: &LegacyRestartAdmission,
         expected: &ArtifactIdentity,
         deadline: Instant,
     ) -> Result<LegacyRunningEvidence>;
+    #[cfg(test)]
     fn legacy_stop(&mut self, deadline: Instant) -> Result<()>;
     /// Execute the descriptor-bound preparation protocol with these exact captures.
     fn compatible(
@@ -409,6 +436,7 @@ pub trait ServiceControl {
         deadline: Instant,
     ) -> Result<CompatibilityEvidence>;
     /// Version-one recovery only. Never grants guarded startup authority.
+    #[cfg(test)]
     fn legacy_compatible(&mut self, artifact: &ArtifactIdentity, executable: &Path) -> Result<()>;
 }
 
@@ -793,7 +821,7 @@ impl ServiceControl for NativeService {
                 let Some(definition) = definition else {
                     return Ok(absent(disabled.stdout.as_bytes()));
                 };
-                let (executable, default_enabled) = plist_settings(&definition_path)?;
+                let (executable, default_enabled) = plist_settings(&definition_path, deadline)?;
                 return Ok(ServiceSnapshot {
                     registered: false,
                     enabled: if enabled == EnabledState::Unknown {
@@ -815,7 +843,7 @@ impl ServiceControl for NativeService {
                 fields.get("path").map(Path::new) == Some(definition_path.as_path()),
                 "loaded launchd service uses a different definition path"
             );
-            let (executable, default_enabled) = plist_settings(&definition_path)?;
+            let (executable, default_enabled) = plist_settings(&definition_path, deadline)?;
             let mut snapshot = launchd_snapshot(&print.stdout, &disabled.stdout, &definition)?;
             ensure!(
                 snapshot.executable.as_ref() == Some(&executable),
@@ -830,6 +858,7 @@ impl ServiceControl for NativeService {
         }
     }
 
+    #[cfg(test)]
     fn legacy_admit_restart(
         &mut self,
         _before: &ServiceSnapshot,
@@ -837,10 +866,12 @@ impl ServiceControl for NativeService {
         bail!("live Host upgrade requires reliable captured startup inputs and child-side admission; explicitly stop the managed service before upgrading")
     }
 
+    #[cfg(test)]
     fn legacy_revalidate_restart(&mut self, _admission: &LegacyRestartAdmission) -> Result<()> {
         bail!("native restart recovery requires reliable captured startup inputs and child-side admission; explicitly stop the managed service and resolve the pending transaction")
     }
 
+    #[cfg(test)]
     fn legacy_restart(
         &mut self,
         _admission: &LegacyRestartAdmission,
@@ -852,6 +883,7 @@ impl ServiceControl for NativeService {
         )
     }
 
+    #[cfg(test)]
     fn legacy_stop(&mut self, _deadline: Instant) -> Result<()> {
         bail!("native service mutation is not qualified; explicitly stop the managed service and verify its state")
     }
@@ -865,6 +897,7 @@ impl ServiceControl for NativeService {
         bail!("descriptor-bound native compatibility is not qualified")
     }
 
+    #[cfg(test)]
     fn legacy_compatible(
         &mut self,
         _artifact: &ArtifactIdentity,
@@ -1008,14 +1041,14 @@ fn read_definition(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-fn plist_settings(path: &Path) -> Result<(PathBuf, EnabledState)> {
+fn plist_settings(path: &Path, deadline: Instant) -> Result<(PathBuf, EnabledState)> {
     let path = path
         .to_str()
         .context("launchd definition path is not UTF-8")?;
-    let output = observe(
+    let output = observe_until(
         "/usr/bin/plutil",
         &["-convert", "json", "-o", "-", "--", path],
-        COMMAND_TIMEOUT,
+        deadline,
     )?;
     ensure!(
         output.status.success(),

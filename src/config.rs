@@ -106,9 +106,9 @@ impl TracingSettings {
             json,
             ansi: !json
                 && is_terminal
-                && !environment
+                && environment
                     .get("NO_COLOR")
-                    .is_some_and(|value| !value.is_empty()),
+                    .is_none_or(|value| value.is_empty()),
             invalid_format,
             invalid_telemetry: telemetry.is_err(),
             telemetry: telemetry.ok().flatten(),

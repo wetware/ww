@@ -464,7 +464,14 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
             )?;
         }
         let selected_artifact = Some(authenticated.artifact().clone());
-        let outcome = recover_prepared(&mut engine, &mut service, home, deadline).await?;
+        let outcome = match engine.recover_authenticated_without_preparation_until(
+            &mut service,
+            deadline,
+            &authenticated,
+        )? {
+            Some(outcome) => outcome,
+            None => recover_prepared(&mut engine, &mut service, home, deadline).await?,
+        };
         return completed(outcome, selected_artifact, target, before);
     }
     if args.check {
