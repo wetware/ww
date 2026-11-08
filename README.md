@@ -174,6 +174,7 @@ an image. A published guest requires an application-specific composition path.
 - [Architecture](doc/architecture.md): design principles and capability flow
 - [Capabilities](doc/capabilities.md): the capability model and Cap'n Proto schemas
 - [CLI reference](doc/cli.md): full command-line usage
+- [Release rehearsal](doc/release-rehearsal.md): disposable genuine-artifact and consumer qualification
 - [Image layout](doc/images.md): FHS convention, mounts, on-chain coordination
 - [Provider routing](doc/routing.md): independent discovery and host-PeerID announcement capabilities
 - [Keys & identity](doc/keys.md): Ed25519 identity management

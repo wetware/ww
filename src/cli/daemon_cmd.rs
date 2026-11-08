@@ -3,6 +3,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -533,7 +534,11 @@ fn install_locked(
         )?;
         let log_dir = home.join(".ww/logs");
         parents(home, &log_dir.join("ww.log"))?;
-        std::fs::create_dir_all(log_dir).context("create daemon log directory")?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(log_dir)
+            .context("create daemon log directory")?;
     }
     if existing.is_none() {
         write_file(home, &path, definition, true)?;
@@ -826,7 +831,10 @@ fn write_file(home: &Path, path: &Path, bytes: &[u8], new: bool) -> Result<()> {
         read_file(home, path)?;
     }
     let parent = path.parent().context("service file parent")?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
