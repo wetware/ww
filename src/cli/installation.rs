@@ -2,6 +2,7 @@
 use anyhow::{ensure, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use ww::installation_state::{MutationLock, Receipt};
 use ww::upgrade::storage as durable;
@@ -164,7 +165,10 @@ pub(super) fn persist_identity(path: &Path, key: &ed25519_dalek::SigningKey) -> 
     };
     let path = absolute.as_path();
     let parent = path.parent().context("identity parent")?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(ww::keys::encode(key).as_bytes())?;
     temp.as_file().sync_all()?;
@@ -196,7 +200,10 @@ fn atomic_write(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let parent = path.parent().context("installation file parent")?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
     durable::directory(parent)?;
     if durable::exists(path)? {
         durable::open_read(path)?;
@@ -446,7 +453,10 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         .map(|value| upgrade_cmd::release_cid(&value).map(|cid| cid.to_string()))
         .transpose()?;
     if !args.check {
-        std::fs::create_dir_all(&root)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)?;
         if key.is_none() {
             persist_identity(&identity, &ww::keys::generate()?)?;
         }
@@ -640,7 +650,10 @@ pub(super) async fn image_update(args: UpdateArgs) -> Result<()> {
         let _ = migrate(&root, &before)?;
         let store = root.join(".fhs-recovery");
         parents(&home, &store.join("artifact"))?;
-        std::fs::create_dir_all(&store)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&store)?;
         durable::directory(&store)?;
         for index in 1..3 {
             atomic_write(

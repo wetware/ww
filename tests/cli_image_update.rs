@@ -2,6 +2,8 @@
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -183,6 +185,13 @@ async fn update(home: &Path, server: &Server, fixture: &Fixture, check: bool) ->
     if check {
         command.arg("--check");
     }
+    // SAFETY: umask is async-signal-safe and affects only the spawned Host.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
     command.kill_on_drop(true);
     let output = tokio::time::timeout(std::time::Duration::from_secs(90), command.output())
         .await
@@ -280,6 +289,14 @@ async fn signed_image_update_changes_only_baseline_and_retains_complete_recovery
     assert!(!root.join("daemon.json").exists());
     assert!(!root.join("image-update.json").exists());
     assert!(root.join("image-update-retained.json").is_file());
+    assert_eq!(
+        std::fs::metadata(root.join(".fhs-recovery"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o022,
+        0
+    );
     for hash in [
         &receipt.hashes[1],
         &receipt.hashes[2],

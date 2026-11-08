@@ -1,5 +1,6 @@
 //! CLI error output and identity creation are public automation contracts.
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 fn ww(home: &std::path::Path) -> Command {
@@ -12,20 +13,40 @@ fn ww(home: &std::path::Path) -> Command {
 fn keygen_relative_filename_is_private_and_never_replaced() {
     let home = tempfile::tempdir().unwrap();
     std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
-    let output = ww(home.path())
-        .args(["keygen", "--output", "identity"])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let path = home.path().join("identity");
-    let original = std::fs::read(&path).unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
-    let again = ww(home.path())
-        .args(["keygen", "--output", "identity"])
-        .output()
-        .unwrap();
-    assert!(!again.status.success());
-    assert_eq!(std::fs::read(path).unwrap(), original);
+    for relative in ["identity", "new-parent/nested/identity"] {
+        let generate = || {
+            let mut command = ww(home.path());
+            command.args(["keygen", "--output", relative]);
+            // SAFETY: umask is async-signal-safe and affects only this child.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o002);
+                    Ok(())
+                });
+            }
+            command.output().unwrap()
+        };
+        let output = generate();
+        assert!(output.status.success(), "{output:?}");
+        let path = home.path().join(relative);
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        for parent in path
+            .parent()
+            .unwrap()
+            .ancestors()
+            .take_while(|p| *p != home.path())
+        {
+            assert_eq!(std::fs::metadata(parent).unwrap().mode() & 0o777, 0o700);
+        }
+        let again = generate();
+        assert!(!again.status.success());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(home.path()).unwrap().mode() & 0o777,
+            0o770
+        );
+    }
 }
 
 #[test]
