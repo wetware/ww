@@ -90,22 +90,14 @@ impl NormalizedRun {
     }
 
     pub fn identity(&self) -> Result<(ed25519_dalek::SigningKey, &'static str)> {
-        if let Some(path) = self
+        let path = self
             .config
             .identity_path
-            .as_ref()
-            .filter(|path| path.exists())
-        {
-            return Ok((
-                ww::keys::load(path.to_str().context("identity path is not UTF-8")?)?,
-                "file",
-            ));
-        }
-        ensure!(
-            self.config.insecure_ephemeral,
-            "persistent startup identity is missing"
-        );
-        Ok((ww::keys::generate()?, "ephemeral"))
+            .as_deref()
+            .context("normalized startup identity path is missing")?;
+        let (key, _, source) =
+            Commands::resolve_identity(Some(path), self.config.insecure_ephemeral)?;
+        Ok((key, source))
     }
 }
 

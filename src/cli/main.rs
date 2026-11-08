@@ -1092,13 +1092,11 @@ system::export!({iface_name}Guest);
         identity_path: Option<&std::path::Path>,
         allow_ephemeral: bool,
     ) -> Result<(ed25519_dalek::SigningKey, VerifyingKey, &'static str)> {
-        let default_path = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".ww/identity"));
-
-        let resolved_path = identity_path
-            .map(std::path::Path::to_path_buf)
-            .or(default_path);
+        let resolved_path = identity_path.map(std::path::Path::to_path_buf).or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".ww/identity"))
+        });
 
         if let Some(path) = resolved_path {
             if path.exists() {
@@ -1335,6 +1333,16 @@ system::export!({iface_name}Guest);
         };
         let namespace_capture = run.namespaces()?;
         let ns_configs = namespace_capture.configs.clone();
+        let guarded_start = guarded.is_some();
+        // Existing unguarded invocations retain startup diagnostics. Guarded
+        // invocations defer exporters and diagnostics until admission succeeds.
+        let mut telemetry_guard = if guarded_start {
+            None
+        } else {
+            let guard = run.config.runtime.tracing.clone().initialize();
+            tracing::debug!("resolving identity...");
+            guard
+        };
         let (sk, identity_source) = run.identity()?;
         let mounts = run.mounts.clone();
         let installed_baseline = run.baseline.clone();
@@ -1385,7 +1393,6 @@ system::export!({iface_name}Guest);
         let mut deployment_slot = None;
         let mut deployment_lifecycle_slot = None;
         let mut retained_startup_roots = Vec::new();
-        let mut telemetry_guard = None;
 
         let outcome: Result<i32> = async {
         let lifecycle = filesystem_resources
@@ -1411,13 +1418,15 @@ system::export!({iface_name}Guest);
         } else {
             None
         };
-        telemetry_guard = runtime.tracing.clone().initialize();
+        if guarded_start {
+            telemetry_guard = runtime.tracing.clone().initialize();
+            tracing::debug!("resolving identity...");
+        }
         ww::cell::engine::initialize_captured_cache(runtime.compilation_cache.clone())?;
 
         // Resolve the host identity and start the local admin plane before
         // waiting on Kubo or resolving mounts. This keeps liveness and boot
         // phase diagnostics available during dependency outages.
-        tracing::debug!("resolving identity...");
         tracing::info!(source = identity_source, "Node identity resolved");
         let keypair = ww::keys::to_libp2p(&sk)?;
         let peer_id = keypair.public().to_peer_id();
