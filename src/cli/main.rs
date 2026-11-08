@@ -15,6 +15,8 @@ mod image_cmd;
 mod installation;
 mod ns_cmd;
 mod p3_toolchain;
+mod startup;
+mod startup_cmd;
 mod upgrade_cmd;
 
 use ww::cell::image;
@@ -223,6 +225,12 @@ enum Commands {
     ///   ww run ./kernel.wasm:/boot/kernel.wasm
     ///   ww run /ipfs/<directory-cid>
     Run(RunArgs),
+
+    /// Admit or inspect exact installed Host startup inputs.
+    Startup {
+        #[command(subcommand)]
+        action: startup_cmd::StartupAction,
+    },
 
     /// Probe a running node's localhost admin endpoint.
     ///
@@ -669,70 +677,8 @@ impl Commands {
             Commands::Image { action } => action.run().await,
             Commands::Init { name } => Self::init(name).await,
             Commands::Build { path } => Self::build(path).await,
-            Commands::Run(RunArgs {
-                mounts: mount_args,
-                mut namespace_root,
-                fhs_root,
-                listen,
-                wasm_debug,
-                identity,
-                insecure_ephemeral,
-                stem,
-                ipns_stem,
-                ipns_routing_url,
-                rpc_url,
-                ws_url,
-                confirmation_depth,
-                executor_threads,
-                http_listen,
-                http_dial,
-                runtime_cache_policy,
-                with_http_admin,
-                ipfs_url,
-            }) => {
-                let (installed_baseline, mounts) = Self::startup_mounts(
-                    &mount_args,
-                    fhs_root,
-                    &mut namespace_root,
-                    stem.is_some() || ipns_stem.is_some(),
-                )?;
-                // Identity is passed separately — NOT as a mount.
-                // The host reads it to create the signing key for the Membrane.
-                // It must never enter the merged FHS tree (which is preopened
-                // to guests and published to IPFS).
-                let identity_path = identity.map(PathBuf::from);
-                let listen = if listen.is_empty() {
-                    daemon_cmd::default_listen()
-                        .iter()
-                        .map(|s| s.parse())
-                        .collect::<Result<Vec<_>, _>>()
-                        .context("parse default listen multiaddrs")?
-                } else {
-                    listen
-                };
-                Self::run_with_mounts(
-                    mounts,
-                    installed_baseline,
-                    namespace_root,
-                    identity_path,
-                    insecure_ephemeral,
-                    listen,
-                    wasm_debug,
-                    stem,
-                    ipns_stem,
-                    ipns_routing_url,
-                    rpc_url,
-                    ws_url,
-                    confirmation_depth,
-                    executor_threads,
-                    http_listen,
-                    http_dial,
-                    runtime_cache_policy,
-                    admin_listen_addr(with_http_admin),
-                    ipfs_url,
-                )
-                .await
-            }
+            Commands::Run(args) => Self::run_with_mounts(startup::normalize_run(args)?).await,
+            Commands::Startup { action } => action.run().await,
             Commands::Healthcheck {
                 admin,
                 ready,
@@ -1283,6 +1229,23 @@ system::export!({iface_name}Guest);
         authoritative_source: bool,
         installed_baseline: bool,
     ) -> Result<Vec<ww::ns::NamespaceConfig>> {
+        Ok(Self::startup_namespaces_captured(
+            mounts,
+            namespace_roots,
+            authoritative_source,
+            installed_baseline,
+        )?
+        .into_iter()
+        .map(|captured| captured.config)
+        .collect())
+    }
+
+    fn startup_namespaces_captured(
+        mounts: &[ww::cell::mount::Mount],
+        namespace_roots: &[PathBuf],
+        authoritative_source: bool,
+        installed_baseline: bool,
+    ) -> Result<Vec<ww::ns::CapturedNamespaceConfig>> {
         image::validate_mounts_virtual(mounts)?;
         // Metadata preflight keeps invalid local input actionable during a
         // backend outage. Capture still performs authoritative no-follow reads.
@@ -1312,10 +1275,11 @@ system::export!({iface_name}Guest);
             .map(PathBuf::as_path)
             .chain(local_roots)
             .collect();
-        let configs = ww::ns::scan_namespace_configs(&scan_roots)
+        let configs = ww::ns::capture_namespace_configs(&scan_roots)
             .context("Failed to scan namespace configs")?;
         let mut namespace_images = 0;
-        for config in &configs {
+        for captured in &configs {
+            let config = &captured.config;
             if let Some(source) = config.ipfs_path()? {
                 // Validate configured image syntax before waiting on Kubo.
                 ww::cell::mount::parse_args(&[source])?;
@@ -1361,28 +1325,44 @@ system::export!({iface_name}Guest);
     }
 
     /// Run a wetware environment from parsed mounts.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_with_mounts(
-        mounts: Vec<ww::cell::mount::Mount>,
-        installed_baseline: Option<ww::cell::mount::Mount>,
-        namespace_roots: Vec<PathBuf>,
-        identity: Option<PathBuf>,
-        insecure_ephemeral: bool,
-        listen: Vec<Multiaddr>,
-        wasm_debug: bool,
-        stem: Option<String>,
-        ipns_stem: Option<String>,
-        ipns_routing_url: String,
-        rpc_url: String,
-        ws_url: String,
-        confirmation_depth: u64,
-        executor_threads: usize,
-        http_listen: Option<String>,
-        http_dial: Vec<String>,
-        runtime_cache_policy: String,
-        with_http_admin: Option<String>,
-        ipfs_url: String,
-    ) -> Result<()> {
+    async fn run_with_mounts(run: startup::NormalizedRun) -> Result<()> {
+        // Classify the installed executable before any FHS-specific branch.
+        let guarded = startup::GuardedStartup::open(&run.config)?;
+        let baseline_guard = if guarded.is_none() {
+            installation::startup_guard(run.baseline.as_ref())?
+        } else {
+            None
+        };
+        let namespace_capture = run.namespaces()?;
+        let ns_configs = namespace_capture.configs.clone();
+        let (sk, identity_source) = run.identity()?;
+        let mounts = run.mounts.clone();
+        let installed_baseline = run.baseline.clone();
+        let ww::upgrade::inputs::EffectiveRunConfig {
+            home,
+            listen,
+            wasm_debug,
+            stem,
+            ipns_stem,
+            ipns_routing_url,
+            rpc_url,
+            ws_url,
+            confirmation_depth,
+            executor_threads,
+            http_listen,
+            http_dial,
+            runtime_cache_policy,
+            http_admin,
+            ipfs_url,
+            runtime,
+            ..
+        } = run.config.clone();
+        let listen = listen
+            .iter()
+            .map(|address| address.parse())
+            .collect::<Result<Vec<Multiaddr>, _>>()?;
+        let http_listen = http_listen.map(|address| address.to_string());
+        let with_http_admin = http_admin.map(|address| address.to_string());
         let stem_contract = stem.as_deref().map(parse_contract_address).transpose()?;
         let ipns_stem_name = ipns_stem
             .as_deref()
@@ -1390,13 +1370,7 @@ system::export!({iface_name}Guest);
             .transpose()
             .context("parse --ipns-stem")?;
         let authoritative_source = stem_contract.is_some() || ipns_stem_name.is_some();
-        let baseline_guard = installation::startup_guard(installed_baseline.as_ref())?;
-        let ns_configs = Self::startup_namespaces(
-            &mounts,
-            &namespace_roots,
-            authoritative_source,
-            installed_baseline.is_some(),
-        )?;
+        let mut instance_lease = None;
 
         let (filesystem_owner, filesystem_resources) = cache::HostFsOwner::start(
             tokio::runtime::Handle::current(),
@@ -1420,16 +1394,30 @@ system::export!({iface_name}Guest);
         let deployment_scope = lifecycle.0.clone();
         deployment_lifecycle_slot = Some(lifecycle);
 
-        telemetry_guard = ww::config::init_tracing();
-
         let ipfs_client = ipfs::HttpClient::new(ipfs_url);
+        let mut captured_startup = if let Some(guard) = guarded {
+            let transaction = filesystem_resources.try_foreground_transaction(
+                filesystem_resources.try_logical_io()?, &[&deployment_scope],
+            )?;
+            let readonly = ipfs::BootClient::one_attempt(
+                ipfs_client.clone(), std::time::Duration::from_secs(30),
+            );
+            let (_cancel_tx, mut cancel) = watch::channel(false);
+            let capture = startup::capture_startup(
+                &run, &ns_configs, &namespace_capture.inputs, &sk, &readonly, &transaction, &mut cancel,
+            ).await?;
+            instance_lease = Some(guard.admit(&capture.inputs)?);
+            Some(capture)
+        } else {
+            None
+        };
+        telemetry_guard = runtime.tracing.clone().initialize();
+        ww::cell::engine::initialize_captured_cache(runtime.compilation_cache.clone())?;
 
         // Resolve the host identity and start the local admin plane before
         // waiting on Kubo or resolving mounts. This keeps liveness and boot
         // phase diagnostics available during dependency outages.
         tracing::debug!("resolving identity...");
-        let (sk, _verifying_key, identity_source) =
-            Self::resolve_identity(identity.as_deref(), insecure_ephemeral)?;
         tracing::info!(source = identity_source, "Node identity resolved");
         let keypair = ww::keys::to_libp2p(&sk)?;
         let peer_id = keypair.public().to_peer_id();
@@ -1448,12 +1436,16 @@ system::export!({iface_name}Guest);
             // The OCI runtime digest is not intrinsically visible inside a
             // container. Deployments may inject the authoritative value;
             // deploy verification still checks pod.status.imageID directly.
-            oci_image_id: std::env::var("WW_OCI_IMAGE_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
+            oci_image_id: runtime.oci_image_id.clone(),
             kernel_identity: ww::kernel::IdentityState::pending(epoch_rx.clone()),
         };
         let kernel_identity = version_info.kernel_identity.clone();
+
+        if let Some(admitted) = &instance_lease {
+            supervisor.try_spawn("native-readiness", startup::ReadinessService::bind(
+                std::sync::Arc::clone(admitted), kernel_identity.clone(), kernel_ready_gate.clone(), route_registry.clone(),
+            )?)?;
+        }
 
         let wasmtime_cache_metrics = ww::cell::engine::wasmtime_cache_metrics();
         let executor_metrics = ww::services::ExecutorMetrics::default();
@@ -1492,9 +1484,9 @@ system::export!({iface_name}Guest);
         // outage remains observable through the already-running admin plane
         // instead of becoming a CrashLoopBackOff.
         runtime_status.set_phase("waiting-for-kubo");
-        let kubo_wait_max_secs = kubo_wait_max_secs()?;
-        let kubo_boot_retry_max_secs = kubo_boot_retry_max_secs()?;
-        let kubo_operation_timeout_secs = kubo_boot_operation_timeout_secs()?;
+        let kubo_wait_max_secs = runtime.kubo_wait_max_secs;
+        let kubo_boot_retry_max_secs = runtime.kubo_boot_retry_max_secs;
+        let kubo_operation_timeout_secs = runtime.kubo_operation_timeout_secs;
         let retry_status = runtime_status.clone();
         let boot_ipfs_client = ipfs::BootClient::new(
             ipfs_client.clone(),
@@ -1540,9 +1532,7 @@ system::export!({iface_name}Guest);
                         .expect("validated bootstrap path has /ipfs prefix")
                         .parse()
                         .context("parse default ww namespace bootstrap CID")?;
-                    let state_dir = dirs::home_dir()
-                        .context("default IPNS publication requires a HOME directory")?
-                        .join(".ww");
+                    let state_dir = home.join(".ww");
                     let routing = ww::ipns::RoutingClient::new(ipns_routing_url.clone())?;
                     let routing_ready = match routing.probe().await {
                         Ok(()) => true,
@@ -1600,7 +1590,7 @@ system::export!({iface_name}Guest);
         }
 
         // Namespace layers sit between stem (on-chain base) and user mounts.
-        if !runtime_ns_configs.is_empty() {
+        if captured_startup.is_none() && !runtime_ns_configs.is_empty() {
             let resolved = tokio::select! {
                 resolved = ww::ns::resolve_namespaces(
                     &runtime_ns_configs,
@@ -1632,13 +1622,17 @@ system::export!({iface_name}Guest);
             &[&deployment_scope],
         )?;
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-        let mut mount_resolution = Box::pin(image::resolve_frozen_mounts_with_cancel(
-            &all_mounts,
-            &boot_ipfs_client,
-            &mount_transaction,
-            authoritative_source,
-            &mut cancel_rx,
-        ));
+        let mut mount_resolution = Box::pin(async {
+            if let Some(captured) = captured_startup.take() {
+                captured.publish(&boot_ipfs_client, &mut cancel_rx).await
+                    .map(|(_, resolved)| resolved)
+            } else {
+                image::resolve_frozen_mounts_with_cancel(
+                    &all_mounts, &boot_ipfs_client, &mount_transaction,
+                    authoritative_source, &mut cancel_rx,
+                ).await
+            }
+        });
         let resolved_mounts = tokio::select! {
             result = &mut mount_resolution => result?,
             service_exit = supervisor.next_service_exit() => {
@@ -1797,6 +1791,7 @@ system::export!({iface_name}Guest);
             "compiler",
             ww::services::CompilationService {
                 request_rx: compile_rx,
+                workers: runtime.compile_workers,
             },
         )?;
 
@@ -1904,23 +1899,20 @@ system::export!({iface_name}Guest);
             "Booting environment"
         );
 
-        let cache_policy = match runtime_cache_policy.as_str() {
-            "shared" => ww::rpc::CachePolicy::Shared,
-            "isolated" => ww::rpc::CachePolicy::Isolated,
-            other => anyhow::bail!(
-                "invalid --runtime-cache-policy '{}' (expected 'shared' or 'isolated')",
-                other
-            ),
+        let cache_policy = match runtime_cache_policy {
+            ww::upgrade::inputs::RuntimeCachePolicy::Shared => ww::rpc::CachePolicy::Shared,
+            ww::upgrade::inputs::RuntimeCachePolicy::Isolated => ww::rpc::CachePolicy::Isolated,
         };
 
         let signing_key = std::sync::Arc::new(sk);
-        let interactive = ww::kernel::is_interactive();
-        let mut kernel_bootstrap = ww::kernel::Bootstrap::new(
+        let interactive = runtime.interactive;
+        let mut kernel_bootstrap = ww::kernel::Bootstrap::new_with_interactive(
             network_state.clone(),
             swarm_cmd_tx.clone(),
             signing_key,
             stream_control,
             http_dial,
+            interactive,
         );
         if let Some(ref registry) = route_registry {
             kernel_bootstrap = kernel_bootstrap.with_route_registry(registry.clone());

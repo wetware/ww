@@ -376,7 +376,7 @@ impl PreparedExecutor {
         // A blocking task also inhibits automatic advancement in paused-time
         // tests while the real compilation workers prepare the component.
         let compiler =
-            tokio::task::spawn_blocking(move || CompilationService { request_rx }.run(shutdown_rx));
+            tokio::task::spawn_blocking(move || CompilationService { request_rx, workers: 1 }.run(shutdown_rx));
         let runtime = create_runtime_client(
             false,
             authority::EpochGuard::fixed(authority::Epoch::zero()),

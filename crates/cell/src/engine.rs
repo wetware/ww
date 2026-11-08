@@ -159,10 +159,84 @@ impl WasmtimeCacheMetrics {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CacheSettings {
     directory: PathBuf,
     max_bytes: u64,
+}
+
+/// Parsed invocation-time cache policy. Capturing does not open the cache.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CapturedCacheSettings(Result<Option<CacheSettings>, String>);
+
+impl CapturedCacheSettings {
+    pub fn from_values(directory: Option<PathBuf>, max_bytes: Option<&str>) -> Self {
+        Self((|| {
+            let Some(directory) = directory else {
+                return Ok(None);
+            };
+            let max_bytes = max_bytes
+                .map(str::parse)
+                .transpose()
+                .map_err(|_| {
+                    "WW_CWASM_CACHE_MAX_BYTES must be a positive integer byte count".to_owned()
+                })?
+                .unwrap_or(DEFAULT_CWASM_CACHE_MAX_BYTES);
+            if max_bytes == 0 {
+                return Err("WW_CWASM_CACHE_MAX_BYTES must be greater than zero".to_owned());
+            }
+            Ok(Some(CacheSettings {
+                directory,
+                max_bytes,
+            }))
+        })())
+    }
+    /// Freeze relative cache paths against the invocation directory.
+    pub fn normalize(mut self, cwd: &std::path::Path) -> Self {
+        if let Ok(Some(settings)) = &mut self.0 {
+            if settings.directory.is_relative() {
+                settings.directory = cwd.join(&settings.directory);
+            }
+        }
+        self
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Ok(Some(settings)) = &self.0 {
+            anyhow::ensure!(
+                settings.directory.is_absolute(),
+                "captured cache path is not absolute"
+            );
+            anyhow::ensure!(settings.max_bytes > 0, "captured cache limit is zero");
+        }
+        Ok(())
+    }
+}
+
+pub fn capture_cache_settings() -> CapturedCacheSettings {
+    let directory = std::env::var_os(CWASM_DIR_ENV).map(PathBuf::from);
+    let max_bytes = std::env::var(CWASM_CACHE_MAX_BYTES_ENV);
+    match max_bytes {
+        Ok(value) => CapturedCacheSettings::from_values(directory, Some(&value)),
+        Err(std::env::VarError::NotPresent) => CapturedCacheSettings::from_values(directory, None),
+        Err(_) if directory.is_none() => CapturedCacheSettings(Ok(None)),
+        Err(_) => CapturedCacheSettings(Err(
+            "WW_CWASM_CACHE_MAX_BYTES must be a positive integer byte count".to_owned(),
+        )),
+    }
+}
+
+/// Initialize only after startup admission. Refuse a previously initialized
+/// factory so an admitted configuration cannot silently use another policy.
+pub fn initialize_captured_cache(settings: CapturedCacheSettings) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        FACTORY.get().is_none(),
+        "Wasmtime cache policy was initialized before startup admission"
+    );
+    FACTORY
+        .set(Arc::new(EngineFactory::from_settings(settings.0)))
+        .map_err(|_| anyhow::anyhow!("Wasmtime cache policy changed during startup admission"))
 }
 
 impl CacheSettings {
@@ -350,8 +424,9 @@ fn wasmtime_45_operator_cost() -> OperatorCost {
     }
 }
 
+static FACTORY: OnceLock<Arc<EngineFactory>> = OnceLock::new();
+
 fn engine_factory() -> &'static Arc<EngineFactory> {
-    static FACTORY: OnceLock<Arc<EngineFactory>> = OnceLock::new();
     FACTORY.get_or_init(|| Arc::new(EngineFactory::from_env()))
 }
 

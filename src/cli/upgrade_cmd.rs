@@ -6,28 +6,25 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args;
-use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use ww::release::auth::{TrustedKeys, MAX_MANIFEST_BYTES};
 use ww::release::descriptor::{
-    binding_cid, verify_transport_root, AuthenticatedRelease, Selection, COMPATIBILITY_PROFILE,
+    binding_cid, AuthenticatedRelease, Selection, SignedReleaseProof, COMPATIBILITY_PROFILE,
 };
+pub(super) use ww::upgrade::provenance::InstalledRelease;
+use ww::upgrade::provenance::{AuthenticatedGeneration, IndependentTrustSource};
 use ww::upgrade::service::ServiceControl;
-use ww::upgrade::{
-    ArtifactIdentity, DigestAlgorithm, Engine, Outcome, PreverifiedCandidate, UpgradeRequest,
-};
+use ww::upgrade::{ArtifactIdentity, DigestAlgorithm, Engine, Outcome, UpgradeRequest};
 
 const MAX_HOST_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_FHS_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ROOT_BYTES: usize = 2 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
-// The native adapter currently refuses operational admission. This bounds that
-// preflight; it is not a qualified live restart/readiness timeout.
-const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Args, Clone, Debug)]
 pub(super) struct ReleaseArgs {
@@ -57,11 +54,15 @@ pub(super) struct UpgradeArgs {
     #[command(flatten)]
     pub release: ReleaseArgs,
     /// Restore the previous artifact retained by the native upgrade engine.
-    #[arg(long, conflicts_with = "release")]
+    #[arg(long, conflicts_with = "release", requires = "timeout_secs")]
     pub rollback: bool,
     /// Authenticated bootstrap recovery; never selects a new operation.
-    #[arg(long, hide = true, requires = "release", conflicts_with_all = ["rollback", "check"])]
+    #[arg(long, hide = true, requires_all = ["release", "timeout_secs"], conflicts_with_all = ["rollback", "check"])]
     pub recover_only: bool,
+    /// Positive operation budget for changed upgrades, rollback and recovery.
+    /// Exact-artifact no-ops and read-only checks do not require this option.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub timeout_secs: Option<u32>,
     /// Authenticate and inspect without replacing installed files or restarting.
     #[arg(long)]
     pub check: bool,
@@ -80,19 +81,12 @@ pub(super) enum Scope {
 
 pub(super) struct SelectedRelease {
     pub root: cid::Cid,
-    pub authenticated: AuthenticatedRelease,
+    pub generation: AuthenticatedGeneration,
+    pub trust: IndependentTrustSource,
     pub selection: Selection,
     pub host: Option<Vec<u8>>,
     pub kernel: Option<Vec<u8>>,
     pub status: Option<Vec<u8>>,
-}
-
-/// This record is an untrusted locator, never authentication evidence.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct InstalledRelease {
-    pub version: u8,
-    pub release: String,
 }
 
 pub(super) fn platform() -> Result<&'static str> {
@@ -208,7 +202,8 @@ pub(super) async fn select_release(args: &ReleaseArgs, scope: Scope) -> Result<S
         )
     })?;
     let root = release_cid(selected)?;
-    let keys = TrustedKeys::from_bytes(&read_bounded(&args.trusted_release_keys, 122)?)?;
+    let trust = IndependentTrustSource::from_path(&args.trusted_release_keys)?;
+    let keys = TrustedKeys::from_bytes(trust.keyring())?;
     let client = http_client()?;
     let ipfs = ww::ipfs::HttpClient::with_http_client(args.ipfs_url.clone(), client.clone());
     tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
@@ -249,7 +244,8 @@ pub(super) async fn select_release(args: &ReleaseArgs, scope: Scope) -> Result<S
             &descriptor,
         )?;
         let root_bytes = ipfs.block_get(&root, MAX_ROOT_BYTES).await?;
-        verify_transport_root(root, &root_bytes, descriptor_cid)?;
+        let proof = SignedReleaseProof::capture(root, &root_bytes, &authenticated)?;
+        let generation = AuthenticatedGeneration::from_proof(proof, trust.keyring(), platform()?)?;
         let selection = authenticated.select(platform()?, COMPATIBILITY_PROFILE)?;
         let host = if matches!(scope, Scope::Host | Scope::Both) {
             Some(
@@ -290,7 +286,8 @@ pub(super) async fn select_release(args: &ReleaseArgs, scope: Scope) -> Result<S
         };
         Ok(SelectedRelease {
             root,
-            authenticated,
+            generation,
+            trust,
             selection,
             host,
             kernel,
@@ -399,83 +396,188 @@ async fn execute(args: &UpgradeArgs) -> Result<ExecutionReport> {
     execute_at(args, &home).await
 }
 
+fn operation_deadline(seconds: Option<u32>) -> Result<Option<Instant>> {
+    seconds
+        .map(|seconds| {
+            ensure!(seconds > 0, "--timeout-secs must be positive");
+            Instant::now()
+                .checked_add(Duration::from_secs(u64::from(seconds)))
+                .context("--timeout-secs exceeds the monotonic clock range")
+        })
+        .transpose()
+}
+
+fn require_deadline(deadline: Option<Instant>) -> Result<Instant> {
+    deadline.context("changed native upgrade, rollback and recovery require an explicit positive --timeout-secs N")
+}
+
+fn remaining_budget(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("native operation exceeded its --timeout-secs deadline")
+}
+
+async fn within_budget<T>(
+    deadline: Option<Instant>,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    if let Some(deadline) = deadline {
+        tokio::time::timeout(remaining_budget(deadline)?, operation)
+            .await
+            .context("native operation exceeded its --timeout-secs deadline")?
+    } else {
+        operation.await
+    }
+}
+
 async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> {
+    let deadline = operation_deadline(args.timeout_secs)?;
+    if args.recover_only || args.rollback {
+        require_deadline(deadline)?;
+    }
     let root = home.join(".ww");
     let target = root.join("bin/ww");
+    let lock = ww::installation_state::MutationLock::acquire(home)?;
+    lock.reject_pending_image()?;
+    let pending = ww::upgrade::storage::exists(&root.join("host-upgrade.json"))?;
     let mut service = ww::upgrade::service::NativeService::new(home)?;
     if args.recover_only {
-        let mut engine = Engine::open(home)?;
+        let deadline = require_deadline(deadline)?;
+        let mut engine = Engine::from_lock(lock)?;
         engine.require_pending_recovery()?;
         let before = observe_artifact(&target)?;
         let executable = read_bounded(&std::env::current_exe()?, MAX_HOST_BYTES)?;
-        let authenticated = authenticate_recovery_executable(&args.release, &executable).await?;
+        let authenticated = within_budget(
+            Some(deadline),
+            authenticate_recovery_executable(&args.release, &executable),
+        )
+        .await?;
+        engine.validate_recovery_executable(&authenticated)?;
+        // Only guarded recovery relies on this process enforcing the native
+        // protocol. Legacy unchanged-byte abort never grants startup authority.
+        if ww::upgrade::startup::metadata_present(home)? {
+            ww::upgrade::attestation::PinnedProcess::capture(
+                std::process::id(),
+                authenticated.artifact(),
+                deadline,
+            )?;
+        }
         let selected_artifact = Some(authenticated.artifact().clone());
-        let outcome =
-            engine.recover_authenticated(&mut service, ADMISSION_TIMEOUT, authenticated)?;
+        let outcome = recover_prepared(&mut engine, &mut service, home, deadline).await?;
         return completed(outcome, selected_artifact, target, before);
     }
     if args.check {
-        ensure!(!args.rollback, "rollback preflight remains unavailable until native compatibility admission is qualified");
-        let lock = ww::installation_state::MutationLock::acquire(home)?;
+        ensure!(
+            !args.rollback,
+            "rollback preflight is unavailable; --check cannot restore retained software"
+        );
         lock.reject_pending()?;
+    } else if pending {
+        let deadline = require_deadline(deadline)?;
+        let mut engine = Engine::from_lock(lock)?;
         let before = observe_artifact(&target)?;
+        let outcome = recover_prepared(&mut engine, &mut service, home, deadline).await?;
+        return completed(outcome, None, target, before);
+    }
+    let before = observe_artifact(&target)?;
+    if !ww::upgrade::startup::metadata_present(home)? {
+        ensure!(!args.rollback, "legacy native rollback requires separately reviewed migration; no startup authority was granted");
+        // Preserve exact-artifact no-ops for existing installations. No store,
+        // candidate payload, service observation, or admission is needed.
         let receipt = ww::installation_state::Receipt::load(&root)?;
-        let installed = installed_release(&root, &args.release).await?;
-        let installed_bytes = read_bounded(&root.join("bin/ww"), MAX_HOST_BYTES)?;
+        let installed = within_budget(deadline, installed_release(&root, &args.release)).await?;
+        let installed_bytes = read_bounded(&target, MAX_HOST_BYTES)?;
         installed.selection.verify_host(&installed_bytes)?;
         ensure!(
             receipt.executable_digest() == blake3::hash(&installed_bytes).to_hex().as_str(),
             "installed Host does not match ownership receipt"
         );
-        let candidate = select_release(&args.release, Scope::Host).await?;
-        let current = &installed.selection.host().artifact;
-        let next = &candidate.selection.host().artifact;
-        if current.sha256 == next.sha256 && current.size == next.size {
-            let selected =
-                PreverifiedCandidate::from_release(&candidate.authenticated, platform()?)?;
+        let candidate =
+            within_budget(deadline, select_release(&args.release, Scope::Metadata)).await?;
+        if installed.generation.artifact() == candidate.generation.artifact() {
             return completed(
                 Outcome::AlreadyInstalled,
-                Some(selected.artifact().clone()),
+                Some(candidate.generation.artifact().clone()),
                 target,
                 before,
             );
         }
-        let _snapshot = service.snapshot()?;
-        bail!("native Host upgrade preflight cannot certify candidate compatibility with the effective deployment; native operational integration remains unavailable; no Host or service was changed");
+        if !args.check {
+            require_deadline(deadline)?;
+        }
+        bail!("legacy installation has no guarded startup contract; native operational integration requires a separately reviewed migration; no Host or service was changed");
     }
-    let mut engine = Engine::open(home)?;
-    let before = observe_artifact(&target)?;
-    // Resolve recovery under the shared lock before any release discovery.
-    let recovery = engine.recover(&mut service, ADMISSION_TIMEOUT)?;
-    if recovery != Outcome::NoPendingTransaction {
-        return completed(recovery, None, target, before);
-    }
+    let mut engine = Engine::from_lock(lock)?;
+    let installed = engine.current_generation()?;
+    // Validate retained contract metadata even for an exact-artifact no-op.
+    engine.startup_contract()?;
     if args.rollback {
-        let outcome = engine.operator_rollback(&mut service, ADMISSION_TIMEOUT)?;
+        let deadline = require_deadline(deadline)?;
+        let contract = engine.preparation_contract()?;
+        let inputs = super::startup::capture_for_upgrade(home, &contract, deadline, None).await?;
+        let outcome = engine.operator_rollback_prepared_until(&mut service, deadline, &inputs)?;
         return completed(outcome, None, target, before);
     }
-    let installed = installed_release(&root, &args.release).await?;
-    let candidate = select_release(&args.release, Scope::Host).await?;
-    let request = UpgradeRequest {
-        installed: PreverifiedCandidate::from_release(&installed.authenticated, platform()?)?,
-        candidate: PreverifiedCandidate::from_release(&candidate.authenticated, platform()?)?,
-        bytes: std::io::Cursor::new(candidate.host.context("selected native artifact missing")?),
+    let candidate = within_budget(deadline, select_release(&args.release, Scope::Metadata)).await?;
+    if installed.artifact() == candidate.generation.artifact() {
+        return completed(
+            Outcome::AlreadyInstalled,
+            Some(candidate.generation.artifact().clone()),
+            target,
+            before,
+        );
+    }
+    // --check has a preparation-only budget. Every mutating operation requires
+    // the caller's explicit positive budget, including all capture and I/O.
+    let deadline = if args.check {
+        deadline.unwrap_or_else(|| Instant::now() + DOWNLOAD_TIMEOUT)
+    } else {
+        require_deadline(deadline)?
     };
-    let selected_artifact = Some(request.candidate.artifact().clone());
-    let outcome = engine.operator_upgrade(&mut service, ADMISSION_TIMEOUT, || Ok(request))?;
+    let contract = engine.preparation_contract()?;
+    let inputs = super::startup::capture_for_upgrade(home, &contract, deadline, None).await?;
+    let candidate =
+        within_budget(Some(deadline), select_release(&args.release, Scope::Host)).await?;
+    let selected_artifact = Some(candidate.generation.artifact().clone());
+    let request = UpgradeRequest {
+        installed,
+        candidate: candidate.generation,
+        bytes: std::io::Cursor::new(candidate.host.context("selected native artifact missing")?),
+        inputs,
+    };
+    let outcome = if args.check {
+        engine.check_upgrade_until(&mut service, deadline, request)?
+    } else {
+        engine.operator_upgrade_until(&mut service, deadline, || Ok(request))?
+    };
     completed(outcome, selected_artifact, target, before)
+}
+
+async fn recover_prepared(
+    engine: &mut Engine,
+    service: &mut impl ServiceControl,
+    home: &Path,
+    deadline: Instant,
+) -> Result<Outcome> {
+    if let Some(outcome) = engine.recover_without_preparation_until(service, deadline)? {
+        return Ok(outcome);
+    }
+    let contract = engine.preparation_contract()?;
+    let inputs = super::startup::capture_for_upgrade(home, &contract, deadline, None).await?;
+    engine.recover_prepared_until(service, deadline, &inputs)
 }
 
 async fn authenticate_recovery_executable(
     args: &ReleaseArgs,
     executable: &[u8],
-) -> Result<PreverifiedCandidate> {
+) -> Result<AuthenticatedGeneration> {
     let selected = select_release(args, Scope::Host).await?;
     ensure!(
         selected.host.as_deref() == Some(executable),
         "running recovery executable does not match the authenticated selected Host"
     );
-    PreverifiedCandidate::from_release(&selected.authenticated, platform()?)
+    Ok(selected.generation)
 }
 
 async fn installed_release(root: &Path, args: &ReleaseArgs) -> Result<SelectedRelease> {
@@ -564,6 +666,10 @@ mod tests {
 
     impl Fixture {
         fn new(target: &str) -> Self {
+            Self::with_host(target, b"authenticated Host")
+        }
+
+        fn with_host(target: &str, host_bytes: &[u8]) -> Self {
             let key = SigningKey::from_bytes(&[7; 32]);
             let name = libp2p::identity::Keypair::generate_ed25519()
                 .public()
@@ -573,7 +679,7 @@ mod tests {
                 revision: "a".repeat(40),
                 builder: "test".into(),
             };
-            let host = file(platform_path(target).unwrap(), b"authenticated Host");
+            let host = file(platform_path(target).unwrap(), host_bytes);
             let kernel = file("fhs/boot/kernel.wasm", b"authenticated kernel");
             let status = file("fhs/bin/status.wasm", b"authenticated status");
             let descriptor = Descriptor {
@@ -629,10 +735,7 @@ mod tests {
                     descriptor.encode().unwrap(),
                 ),
                 (format!("block/get:{root}"), root_bytes),
-                (
-                    format!("cat:/ipfs/{}", host.root),
-                    b"authenticated Host".to_vec(),
-                ),
+                (format!("cat:/ipfs/{}", host.root), host_bytes.to_vec()),
                 (
                     format!("cat:/ipfs/{}", kernel.root),
                     b"authenticated kernel".to_vec(),
@@ -753,6 +856,8 @@ mod tests {
             "--recover-only",
             "--release",
             "CID",
+            "--timeout-secs",
+            "15",
             "--json",
         ])
         .unwrap();
@@ -763,6 +868,53 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn timeout_grammar_accepts_positive_budget_and_exempts_inspection() {
+        for arguments in [
+            vec!["ww", "upgrade", "--release", "CID", "--timeout-secs", "17"],
+            vec!["ww", "upgrade", "--rollback", "--timeout-secs", "17"],
+            vec![
+                "ww",
+                "upgrade",
+                "--recover-only",
+                "--release",
+                "CID",
+                "--timeout-secs",
+                "17",
+            ],
+            vec!["ww", "upgrade", "--check", "--release", "CID"],
+            vec!["ww", "upgrade", "--release", "CID"],
+        ] {
+            assert!(
+                super::super::Cli::try_parse_from(&arguments).is_ok(),
+                "{arguments:?}"
+            );
+        }
+        for value in ["0", "-1", "NaN", "1.5", "18446744073709551616"] {
+            assert!(
+                super::super::Cli::try_parse_from([
+                    "ww",
+                    "upgrade",
+                    "--release",
+                    "CID",
+                    "--timeout-secs",
+                    value
+                ])
+                .is_err(),
+                "{value}"
+            );
+        }
+        assert!(super::super::Cli::try_parse_from(["ww", "upgrade", "--rollback"]).is_err());
+        assert!(super::super::Cli::try_parse_from([
+            "ww",
+            "upgrade",
+            "--recover-only",
+            "--release",
+            "CID"
+        ])
+        .is_err());
     }
 
     #[tokio::test]
@@ -781,6 +933,7 @@ mod tests {
                 release: args(&fixture, &server, home.path()),
                 rollback: false,
                 recover_only: true,
+                timeout_secs: Some(15),
                 check: false,
                 json: false,
             };
@@ -896,11 +1049,25 @@ mod tests {
             "cat:/ipfs/{}",
             fixture.descriptor.hosts[0].artifact.root
         )));
-        let candidate =
-            PreverifiedCandidate::from_release(&selected.authenticated, platform().unwrap())
-                .unwrap();
+        let candidate = selected.generation.selection();
         assert!(format!("{candidate:?}")
             .contains(&hex::encode(fixture.descriptor.hosts[0].artifact.sha256)));
+        let retained = selected.generation.record();
+        assert_eq!(retained.transport_root, fixture.root.to_string());
+        assert_eq!(
+            retained.descriptor,
+            fixture.descriptor.cid().unwrap().to_string()
+        );
+        let proof = retained
+            .proof
+            .verify(selected.generation.proof_bytes())
+            .unwrap();
+        let keys = TrustedKeys::from_bytes(&read_bounded(&args.trusted_release_keys, 122).unwrap())
+            .unwrap();
+        assert_eq!(
+            proof.authenticate(&keys).unwrap().descriptor(),
+            &fixture.descriptor
+        );
         let selected = select_release(&args, Scope::Both).await.unwrap();
         assert_eq!(selected.host.as_deref(), Some(&b"authenticated Host"[..]));
         // Immutable selection creates no persistent consumer floor.
@@ -991,5 +1158,126 @@ mod tests {
         assert!(read_bounded(&link, 10).is_err());
         assert!(read_bounded(&source, 4).is_err());
         assert_eq!(read_bounded(&source, 5).unwrap(), b"12345");
+    }
+    fn installed_fixture(home: &Path, fixture: &Fixture, bytes: &[u8]) {
+        let root = home.join(".ww");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/ww"), bytes).unwrap();
+        let receipt = ww::installation_state::Receipt {
+            version: 2,
+            hashes: [
+                blake3::hash(bytes).to_hex().to_string(),
+                "kernel".into(),
+                "status".into(),
+                "namespace".into(),
+                "service".into(),
+            ],
+            previous: None,
+            complete: true,
+        };
+        std::fs::write(root.join("installation.json"), receipt.encode().unwrap()).unwrap();
+        std::fs::write(
+            root.join("installed-release.json"),
+            serde_json::to_vec(&InstalledRelease::from_root(fixture.root).unwrap()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_artifact_without_timeout_preserves_provenance_and_skips_payload() {
+        let installed = Fixture::new(platform().unwrap());
+        let candidate = Fixture::new(platform().unwrap());
+        assert_ne!(installed.root, candidate.root);
+        let mut routes = installed.routes.clone();
+        routes.extend(candidate.routes.clone());
+        let server = Server::start(routes).await;
+        let home = tempfile::tempdir().unwrap();
+        installed_fixture(home.path(), &installed, b"authenticated Host");
+        let locator = home.path().join(".ww/installed-release.json");
+        let before = std::fs::read(&locator).unwrap();
+        let args = UpgradeArgs {
+            release: args(&candidate, &server, home.path()),
+            rollback: false,
+            recover_only: false,
+            timeout_secs: None,
+            check: false,
+            json: false,
+        };
+        let report = execute_at(&args, home.path()).await.unwrap();
+        assert_eq!(report.outcome, Outcome::AlreadyInstalled);
+        assert_eq!(std::fs::read(locator).unwrap(), before);
+        assert!(report.changed_paths.is_empty());
+        assert!(!home.path().join(".ww/bin/.ww-host-upgrade").exists());
+        assert!(!server.requests.lock().unwrap().contains(&format!(
+            "cat:/ipfs/{}",
+            candidate.descriptor.hosts[0].artifact.root
+        )));
+    }
+
+    #[tokio::test]
+    async fn changed_artifact_requires_budget_before_payload_or_engine_store() {
+        let installed = Fixture::new(platform().unwrap());
+        let candidate = Fixture::with_host(platform().unwrap(), b"different authenticated Host");
+        assert_eq!(installed.descriptor.version, candidate.descriptor.version);
+        let mut routes = installed.routes.clone();
+        routes.extend(candidate.routes.clone());
+        let server = Server::start(routes).await;
+        let home = tempfile::tempdir().unwrap();
+        installed_fixture(home.path(), &installed, b"authenticated Host");
+        let args = UpgradeArgs {
+            release: args(&candidate, &server, home.path()),
+            rollback: false,
+            recover_only: false,
+            timeout_secs: None,
+            check: false,
+            json: false,
+        };
+        let error = execute_at(&args, home.path()).await.err().unwrap();
+        assert!(error.to_string().contains("--timeout-secs"), "{error:#}");
+        assert_eq!(
+            std::fs::read(home.path().join(".ww/bin/ww")).unwrap(),
+            b"authenticated Host"
+        );
+        assert!(!home.path().join(".ww/bin/.ww-host-upgrade").exists());
+        assert!(!server.requests.lock().unwrap().contains(&format!(
+            "cat:/ipfs/{}",
+            candidate.descriptor.hosts[0].artifact.root
+        )));
+    }
+
+    #[tokio::test]
+    async fn recovery_budget_is_checked_before_lock_creation_or_download() {
+        for recovery_only in [false, true] {
+            let fixture = Fixture::new(platform().unwrap());
+            let server = Server::start(fixture.routes.clone()).await;
+            let home = tempfile::tempdir().unwrap();
+            let args = UpgradeArgs {
+                release: args(&fixture, &server, home.path()),
+                rollback: !recovery_only,
+                recover_only: recovery_only,
+                timeout_secs: None,
+                check: false,
+                json: false,
+            };
+            let error = execute_at(&args, home.path()).await.err().unwrap();
+            assert!(error.to_string().contains("--timeout-secs"));
+            assert!(!home.path().join(".ww-installation.lock").exists());
+            assert!(!home.path().join(".ww").exists());
+            assert!(server.requests.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_budget_does_not_poll_download_future() {
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let result = within_budget(Some(deadline), async {
+            called.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(operation_deadline(Some(0)).is_err());
     }
 }

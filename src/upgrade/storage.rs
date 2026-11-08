@@ -18,6 +18,8 @@ pub(super) struct Paths {
     pub retained: PathBuf,
     pub receipt: PathBuf,
     pub store: PathBuf,
+    pub locator: PathBuf,
+    pub proofs: PathBuf,
 }
 
 impl Paths {
@@ -44,6 +46,31 @@ impl Paths {
             journal: root.join("host-upgrade.json"),
             retained: root.join("host-upgrade-retained.json"),
             receipt: root.join("installation.json"),
+            locator: root.join("installed-release.json"),
+            proofs: store.join("proofs"),
+            store,
+        })
+    }
+
+    /// Open existing metadata paths without creating or syncing directories.
+    pub(super) fn existing(home: &Path) -> Result<Self> {
+        let root = home.join(".ww");
+        let store = root.join("bin/.ww-host-upgrade");
+        for path in [
+            home,
+            root.as_path(),
+            root.join("bin").as_path(),
+            store.as_path(),
+        ] {
+            directory(path)?;
+        }
+        Ok(Self {
+            executable: root.join("bin/ww"),
+            journal: root.join("host-upgrade.json"),
+            retained: root.join("host-upgrade-retained.json"),
+            receipt: root.join("installation.json"),
+            locator: root.join("installed-release.json"),
+            proofs: store.join("proofs"),
             store,
         })
     }
@@ -138,6 +165,21 @@ pub fn read_record(path: &Path) -> Result<Option<Vec<u8>>> {
         "{} exceeds the 64 KiB record limit",
         path.display()
     );
+    Ok(Some(bytes))
+}
+
+pub(super) fn read_private_record(path: &Path) -> Result<Option<Vec<u8>>> {
+    if !exists(path)? {
+        return Ok(None);
+    }
+    let file = open_read(path)?;
+    ensure!(
+        file.metadata()?.mode() & 0o177 == 0,
+        "guarded record must be private and non-executable"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_RECORD, "guarded record exceeds 64 KiB");
     Ok(Some(bytes))
 }
 
@@ -369,5 +411,132 @@ pub(super) mod faults {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+
+    #[test]
+    fn proof_storage_is_bounded_immutable_and_private() {
+        faults::configure(None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proof");
+        write_proof(&path, b"retained signed envelope").unwrap();
+        assert_eq!(read_proof(&path).unwrap(), b"retained signed envelope");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        write_proof(&path, b"retained signed envelope").unwrap();
+        assert!(write_proof(&path, b"different signed envelope").is_err());
+        assert_eq!(read_proof(&path).unwrap(), b"retained signed envelope");
+        assert!(write_proof(&dir.path().join("too-large"), &vec![0; MAX_PROOF + 1]).is_err());
+        assert!(!dir.path().join("too-large").exists());
+        let large = dir.path().join("oversize-read");
+        std::fs::write(&large, vec![0; MAX_PROOF + 1]).unwrap();
+        std::fs::set_permissions(&large, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_proof(&large).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_proof(&path).is_err());
+    }
+
+    #[test]
+    fn proof_storage_refuses_symlinks_and_hardlinks_without_target_changes() {
+        use std::os::unix::fs::symlink;
+        faults::configure(None);
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        write_proof(&original, b"preserved").unwrap();
+        let link = dir.path().join("link");
+        symlink(&original, &link).unwrap();
+        assert!(write_proof(&link, b"overwrite").is_err());
+        assert!(read_proof(&link).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::hard_link(&original, &link).unwrap();
+        assert!(write_proof(&link, b"overwrite").is_err());
+        assert!(read_proof(&link).is_err());
+        assert_eq!(std::fs::read(original).unwrap(), b"preserved");
+    }
+}
+
+const MAX_PROOF: usize = 8 * 1024 * 1024;
+
+pub(super) fn read_proof(path: &Path) -> Result<Vec<u8>> {
+    let file = open_read(path)?;
+    ensure!(
+        file.metadata()?.mode() & 0o177 == 0,
+        "retained proof must be private and non-executable"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_PROOF as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_PROOF, "retained proof exceeds 8 MiB");
+    Ok(bytes)
+}
+
+/// Persist one immutable, journal-owned envelope. The transaction must first
+/// record ownership of this exact proof reference. Existing evidence is never
+/// overwritten merely because it has the same transport-root filename.
+pub(super) fn write_proof(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_PROOF,
+        "retained proof must contain at most 8 MiB"
+    );
+    if exists(path)? {
+        ensure!(
+            read_proof(path)? == bytes,
+            "existing retained proof has different bytes"
+        );
+        // A prior process may have died after rename but before parent sync.
+        open_read(path)?.sync_all()?;
+        checkpoint("proof.reuse.sync.after")?;
+        sync_parent(path)?;
+        return Ok(());
+    }
+    let temporary = path.with_file_name(format!(
+        ".{}.pending",
+        path.file_name()
+            .context("proof filename")?
+            .to_string_lossy()
+    ));
+    if exists(&temporary)? {
+        let file = open_read(&temporary)?;
+        ensure!(
+            file.metadata()?.mode() & 0o177 == 0,
+            "pending proof must be private and non-executable"
+        );
+    }
+    checkpoint("proof.open.before")?;
+    let mut file = open_write(&temporary, false)?;
+    checkpoint("proof.open.after")?;
+    file.write_all(bytes)?;
+    checkpoint("proof.write.after")?;
+    file.sync_all()?;
+    checkpoint("proof.sync.after")?;
+    rename(&temporary, path)?;
+    ensure!(read_proof(path)? == bytes, "persisted proof changed");
+    Ok(())
+}
+
+impl Paths {
+    pub(super) fn proof(&self, reference: &super::provenance::ProofReference) -> Result<PathBuf> {
+        reference.validate()?;
+        Ok(self.proofs.join(&reference.root))
+    }
+
+    /// Called only after initialization intent or the transaction journal owns
+    /// the reference. Directory creation alone grants no release authority.
+    pub(super) fn create_proof_directory(&self) -> Result<()> {
+        if !exists(&self.proofs)? {
+            checkpoint("proof.directory.before")?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&self.proofs)?;
+            checkpoint("proof.directory.after")?;
+        }
+        directory(&self.proofs)?;
+        ensure!(
+            std::fs::symlink_metadata(&self.proofs)?.mode() & 0o077 == 0,
+            "retained proof directory must be private"
+        );
+        sync_parent(&self.proofs)
     }
 }

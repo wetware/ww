@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::bail;
-use service::{RunningEvidence, StartupIdentity};
+use service::{LegacyRunningEvidence, StartupIdentity};
 use sha2::Digest;
 use std::io::{Cursor, Error, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
@@ -109,18 +109,119 @@ impl FakeService {
 }
 
 impl ServiceControl for FakeService {
-    fn snapshot(&mut self) -> Result<ServiceSnapshot> {
+    fn snapshot(&mut self, _: Instant) -> Result<ServiceSnapshot> {
         Ok(self.snapshot.clone())
     }
 
-    fn admit_restart(&mut self, before: &ServiceSnapshot) -> Result<RestartAdmission> {
+    fn admit_restart(
+        &mut self,
+        before: &ServiceSnapshot,
+        contract: &startup::StartupContractV1,
+        executable: &attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<service::RestartAdmission> {
+        executable.revalidate(deadline)?;
+        let RunningState::Running { pid } = before.running else {
+            bail!("not running")
+        };
+        let startup::InvocationBinding::Managed { service } = &contract.invocation else {
+            bail!("not managed")
+        };
+        ensure!(
+            contract.startup == self.startup && !self.admission_unavailable,
+            "startup admission unavailable"
+        );
+        Ok(service::RestartAdmission {
+            contract: contract.clone(),
+            original_process: fixture_process(pid),
+            service: service.clone(),
+            transaction_id: [0; 32],
+        })
+    }
+    fn revalidate_restart(
+        &mut self,
+        admission: &service::RestartAdmission,
+        _: Instant,
+    ) -> Result<()> {
+        ensure!(
+            admission.contract.startup == self.startup,
+            "captured startup inputs changed"
+        );
+        Ok(())
+    }
+    fn quiesce(
+        &mut self,
+        intent: &service::ServiceDisposition,
+        _: Instant,
+    ) -> Result<service::ServiceDisposition> {
+        intent.validate()?;
+        ensure!(intent.stop_intent, "missing stop intent");
+        ensure!(!self.stop_failure, "service stop failed");
+        if matches!(self.snapshot.running, RunningState::Running { .. }) {
+            self.stops += 1;
+        }
+        self.snapshot.running = RunningState::Stopped;
+        self.snapshot.failed = false;
+        self.running_artifact = None;
+        self.save_state()?;
+        let mut confirmed = intent.clone();
+        confirmed.quiesced = Some(self.snapshot.clone());
+        Ok(confirmed)
+    }
+    fn restart(
+        &mut self,
+        admission: &service::RestartAdmission,
+        permit: &StartupPermit,
+        executable: &attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<service::RunningEvidence> {
+        self.restarts += 1;
+        self.revalidate_restart(admission, deadline)?;
+        ensure!(!self.restart_failure, "manager restart failed");
+        executable.revalidate(deadline)?;
+        self.next_pid += 1;
+        self.snapshot.running = RunningState::Running { pid: self.next_pid };
+        self.running_artifact = Some(executable.artifact().clone());
+        self.effects += 1;
+        self.save_state()?;
+        ensure!(
+            !self.readiness_timeout && !self.not_ready,
+            "readiness unavailable"
+        );
+        Ok(service::RunningEvidence {
+            process: fixture_process(self.next_pid),
+            artifact: if self.wrong_running_artifact {
+                signed_generation(THIRD, 3).artifact().clone()
+            } else {
+                executable.artifact().clone()
+            },
+            startup: self.startup.clone(),
+            service: admission.service.clone(),
+            contract: permit.contract().identity.clone(),
+            transaction_id: Some(permit.payload().transaction_id),
+            permit_digest: Some(permit.payload().digest()?),
+            epoch_seq: 1,
+            effective_root: "fixture-root".into(),
+            kernel_source: "fixture-kernel".into(),
+            kernel_runtime: "fixture-runtime".into(),
+        })
+    }
+    fn stop(&mut self, _: &startup::ServiceIdentity, _: Instant) -> Result<()> {
+        ensure!(!self.stop_failure, "stop failed");
+        self.stops += 1;
+        self.snapshot.running = RunningState::Stopped;
+        self.running_artifact = None;
+        self.save_state()
+    }
+
+    fn legacy_admit_restart(&mut self, before: &ServiceSnapshot) -> Result<LegacyRestartAdmission> {
         if self.admission_unavailable {
             bail!("running Host has no captured startup evidence; explicitly stop service");
         }
         let RunningState::Running { pid } = before.running else {
             bail!("not running");
         };
-        let admission = RestartAdmission {
+        let admission = LegacyRestartAdmission {
             startup: self.startup.clone(),
             configuration_identity: before.configuration_identity.clone(),
             prior_pid: pid,
@@ -131,7 +232,7 @@ impl ServiceControl for FakeService {
         Ok(admission)
     }
 
-    fn revalidate_restart(&mut self, admission: &RestartAdmission) -> Result<()> {
+    fn legacy_revalidate_restart(&mut self, admission: &LegacyRestartAdmission) -> Result<()> {
         ensure!(
             admission.startup == self.startup,
             "prepared startup inputs changed"
@@ -139,19 +240,19 @@ impl ServiceControl for FakeService {
         Ok(())
     }
 
-    fn restart(
+    fn legacy_restart(
         &mut self,
-        admission: &RestartAdmission,
+        admission: &LegacyRestartAdmission,
         expected: &ArtifactIdentity,
         deadline: Instant,
-    ) -> Result<RunningEvidence> {
+    ) -> Result<LegacyRunningEvidence> {
         self.restart_deadline = Some(deadline);
         self.restarts += 1;
         if self.pending_in_restart {
             self.startup.publisher_target = Some("pending-publisher-target".into());
         }
         // Model the required child-side check before publication or guest effects.
-        self.revalidate_restart(admission)?;
+        self.legacy_revalidate_restart(admission)?;
         if self.restart_failure {
             bail!("service manager restart failed");
         }
@@ -170,7 +271,7 @@ impl ServiceControl for FakeService {
         if self.readiness_timeout {
             bail!("serving readiness deadline expired");
         }
-        Ok(RunningEvidence {
+        Ok(LegacyRunningEvidence {
             pid: self.next_pid,
             artifact: if self.wrong_running_artifact {
                 selected(OLD).artifact
@@ -182,7 +283,7 @@ impl ServiceControl for FakeService {
         })
     }
 
-    fn stop(&mut self, _: Instant) -> Result<()> {
+    fn legacy_stop(&mut self, _: Instant) -> Result<()> {
         self.stops += 1;
         if self.stop_failure {
             bail!("service manager stop failed");
@@ -194,7 +295,34 @@ impl ServiceControl for FakeService {
         Ok(())
     }
 
-    fn compatible(&mut self, artifact: &ArtifactIdentity, executable: &Path) -> Result<()> {
+    fn compatible(
+        &mut self,
+        executable: &attestation::VerifiedExecutable,
+        inputs: &inputs::PreflightInputs,
+        deadline: Instant,
+    ) -> Result<service::CompatibilityEvidence> {
+        executable.revalidate(deadline)?;
+        ensure!(
+            self.incompatible.as_ref() != Some(executable.artifact()),
+            "incompatible fixture"
+        );
+        Ok(service::CompatibilityEvidence {
+            artifact: executable.artifact().clone(),
+            capture_digest: inputs.capture_digest()?,
+            protocol_version: inputs::NATIVE_PROTOCOL_VERSION,
+            prepared: inputs::PreparedHead {
+                effective_root: "fixture-root".into(),
+                kernel_source: "fixture-kernel".into(),
+                kernel_runtime: "fixture-runtime".into(),
+                kernel_source_cid: "fixture-source".into(),
+                kernel_wasm_blake3: "00".repeat(32),
+                kernel_size: 1,
+                authoritative_head: None,
+            },
+        })
+    }
+
+    fn legacy_compatible(&mut self, artifact: &ArtifactIdentity, executable: &Path) -> Result<()> {
         storage::verify(executable, artifact)?;
         if self.delay_final_compatibility {
             if let Some(deadline) = self.restart_deadline {
@@ -225,8 +353,8 @@ fn selected(bytes: &[u8]) -> PreverifiedCandidate {
     }
 }
 
-fn request(old: &'static [u8], new: &'static [u8]) -> UpgradeRequest<&'static [u8]> {
-    UpgradeRequest {
+fn request(old: &'static [u8], new: &'static [u8]) -> LegacyUpgradeRequest<&'static [u8]> {
+    LegacyUpgradeRequest {
         installed: selected(old),
         candidate: selected(new),
         bytes: new,
@@ -324,7 +452,7 @@ fn install(
     new: &'static [u8],
 ) -> Outcome {
     open(home)
-        .operator_upgrade(service, TIMEOUT, || Ok(request(old, new)))
+        .legacy_operator_upgrade(service, TIMEOUT, || Ok(request(old, new)))
         .unwrap()
 }
 
@@ -363,13 +491,14 @@ fn exact_artifact_is_noop_without_reading_candidate_stream() {
     }
     let home = fixture();
     let original = std::fs::read(home.path().join(".ww/installation.json")).unwrap();
-    let result = open(home.path()).operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
-        Ok(UpgradeRequest {
-            installed: selected(OLD),
-            candidate: selected(OLD),
-            bytes: MustNotRead,
-        })
-    });
+    let result =
+        open(home.path()).legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
+            Ok(LegacyUpgradeRequest {
+                installed: selected(OLD),
+                candidate: selected(OLD),
+                bytes: MustNotRead,
+            })
+        });
     assert_eq!(result.unwrap(), Outcome::AlreadyInstalled);
     assert_eq!(
         std::fs::read(home.path().join(".ww/installation.json")).unwrap(),
@@ -392,8 +521,8 @@ fn invalid_digest_algorithm_size_and_platform_leave_installed_bytes_unchanged() 
             _ => unreachable!(),
         }
         let result =
-            open(home.path()).operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
-                Ok(UpgradeRequest {
+            open(home.path()).legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
+                Ok(LegacyUpgradeRequest {
                     installed: selected(OLD),
                     candidate,
                     bytes: NEW,
@@ -402,7 +531,7 @@ fn invalid_digest_algorithm_size_and_platform_leave_installed_bytes_unchanged() 
         assert!(result.is_err(), "invalid case {invalid}");
         assert_eq!(disk_matches_receipt(home.path()), OLD);
         open(home.path())
-            .recover(&mut FakeService::absent(), TIMEOUT)
+            .legacy_recover(&mut FakeService::absent(), TIMEOUT)
             .unwrap();
         unchanged_user_state(home.path());
     }
@@ -419,8 +548,8 @@ fn explicitly_selected_blake3_is_verified_as_blake3() {
     candidate.artifact.algorithm = DigestAlgorithm::Blake3;
     candidate.artifact.digest = blake3::hash(NEW).to_hex().to_string();
     open(home.path())
-        .operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
-            Ok(UpgradeRequest {
+        .legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
+            Ok(LegacyUpgradeRequest {
                 installed: selected(OLD),
                 candidate,
                 bytes: NEW,
@@ -450,18 +579,19 @@ fn partial_download_and_io_error_leave_installed_executable_unchanged() {
         }
     }
     let home = fixture();
-    let result = open(home.path()).operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
-        Ok(UpgradeRequest {
-            installed: selected(OLD),
-            candidate: selected(NEW),
-            bytes: Interrupted { first: true },
-        })
-    });
+    let result =
+        open(home.path()).legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
+            Ok(LegacyUpgradeRequest {
+                installed: selected(OLD),
+                candidate: selected(NEW),
+                bytes: Interrupted { first: true },
+            })
+        });
     assert!(format!("{:#}", result.unwrap_err()).contains("selected native artifact"));
     assert_eq!(disk_matches_receipt(home.path()), OLD);
     assert!(home.path().join(".ww/host-upgrade.json").exists());
     open(home.path())
-        .recover(&mut FakeService::absent(), TIMEOUT)
+        .legacy_recover(&mut FakeService::absent(), TIMEOUT)
         .unwrap();
     assert!(!home.path().join(".ww/bin/.ww-host-upgrade/stage").exists());
     unchanged_user_state(home.path());
@@ -474,7 +604,7 @@ fn lock_contention_precedes_selection() {
     assert!(Engine::open(home.path()).is_err());
     drop(first);
     assert!(open(home.path())
-        .operator_upgrade(&mut FakeService::absent(), TIMEOUT, || Ok(request(
+        .legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || Ok(request(
             OLD, NEW
         )))
         .is_ok());
@@ -497,7 +627,7 @@ fn malformed_incomplete_receipts_and_unauthenticated_old_bytes_refuse() {
         )
         .unwrap();
         let result =
-            open(home.path()).operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
+            open(home.path()).legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
                 let mut request = request(OLD, NEW);
                 if invalid == 3 {
                     request.installed = selected(b"unrelated old bytes");
@@ -523,11 +653,13 @@ fn incompatible_candidate_and_unknown_service_state_refuse_before_replacement() 
             _ => unreachable!(),
         }
         assert!(open(home.path())
-            .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+            .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
             .is_err());
         assert_eq!(disk_matches_receipt(home.path()), OLD);
         if invalid == 0 {
-            open(home.path()).recover(&mut service, TIMEOUT).unwrap();
+            open(home.path())
+                .legacy_recover(&mut service, TIMEOUT)
+                .unwrap();
         }
         assert!(!home.path().join(".ww/host-upgrade.json").exists());
         assert_eq!((service.restarts, service.stops), (0, 0));
@@ -587,11 +719,13 @@ fn pending_fhs_sources_namespace_or_publisher_inputs_refuse_before_replacement()
         }
         service.pending_before_restart = Some(pending);
         assert!(open(home.path())
-            .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+            .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
             .is_err());
         assert_eq!(disk_matches_receipt(home.path()), OLD);
         assert_eq!((service.restarts, service.effects), (0, 0));
-        open(home.path()).recover(&mut service, TIMEOUT).unwrap();
+        open(home.path())
+            .legacy_recover(&mut service, TIMEOUT)
+            .unwrap();
         unchanged_user_state(home.path());
     }
 }
@@ -602,7 +736,7 @@ fn changed_inputs_at_child_admission_have_no_publication_or_guest_effects() {
     let mut service = FakeService::running(home.path());
     service.pending_in_restart = true;
     assert!(open(home.path())
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         .is_err());
     assert_eq!(service.effects, 0);
     assert_eq!(service.snapshot.running, RunningState::Stopped);
@@ -623,7 +757,7 @@ fn restart_failure_timeout_wrong_running_binary_and_unready_keep_recovery() {
             _ => unreachable!(),
         }
         let error = open(home.path())
-            .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+            .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
             .unwrap_err();
         assert!(format!("{error:#}").contains("previous bytes retained"));
         assert_eq!(service.snapshot.running, RunningState::Stopped);
@@ -635,7 +769,9 @@ fn restart_failure_timeout_wrong_running_binary_and_unready_keep_recovery() {
         service.wrong_running_artifact = false;
         service.not_ready = false;
         assert_eq!(
-            open(home.path()).recover(&mut service, TIMEOUT).unwrap(),
+            open(home.path())
+                .legacy_recover(&mut service, TIMEOUT)
+                .unwrap(),
             Outcome::Recovered {
                 artifact: selected(OLD).artifact,
                 action: RecoveryAction::RestoredPrevious,
@@ -654,7 +790,7 @@ fn failed_stop_reports_unconfirmed_residual_process_state() {
     service.not_ready = true;
     service.stop_failure = true;
     let error = open(home.path())
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         .unwrap_err();
     assert!(format!("{error:#}").contains("state is unconfirmed"));
     assert!(home.path().join(".ww/host-upgrade.json").exists());
@@ -667,12 +803,12 @@ fn incompatible_previous_host_stays_stopped_without_rewinding_deployment() {
     let mut service = FakeService::running(home.path());
     service.restart_failure = true;
     assert!(open(home.path())
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         .is_err());
     service.restart_failure = false;
     service.incompatible = Some(selected(OLD).artifact);
     let error = open(home.path())
-        .recover(&mut service, TIMEOUT)
+        .legacy_recover(&mut service, TIMEOUT)
         .unwrap_err();
     assert!(format!("{error:#}").contains("previous Host is incompatible"));
     assert_eq!(service.snapshot.running, RunningState::Stopped);
@@ -686,11 +822,11 @@ fn pending_recovery_runs_before_new_release_selection() {
     let mut service = FakeService::running(home.path());
     service.restart_failure = true;
     assert!(open(home.path())
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         .is_err());
     service.restart_failure = false;
     let result =
-        open(home.path()).operator_upgrade::<Cursor<Vec<u8>>>(&mut service, TIMEOUT, || {
+        open(home.path()).legacy_operator_upgrade::<Cursor<Vec<u8>>>(&mut service, TIMEOUT, || {
             panic!("selected another release before recovery")
         });
     assert_eq!(
@@ -712,12 +848,12 @@ fn authenticated_recovery_accepts_only_exact_recorded_generations() {
         service.incompatible = Some(selected(NEW).artifact);
         let mut engine = open(home.path());
         assert!(engine
-            .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+            .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
             .is_err());
         engine.require_pending_recovery().unwrap();
         assert_eq!(
             engine
-                .recover_authenticated(&mut service, TIMEOUT, selected(executable))
+                .legacy_recover_authenticated(&mut service, TIMEOUT, selected(executable))
                 .unwrap(),
             Outcome::Recovered {
                 artifact: selected(OLD).artifact,
@@ -740,7 +876,7 @@ fn authenticated_recovery_rejects_unrelated_artifact_or_provenance_without_chang
         service.incompatible = Some(selected(NEW).artifact);
         let mut engine = open(home.path());
         assert!(engine
-            .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+            .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
             .is_err());
         let journal = std::fs::read(&engine.paths.journal).unwrap();
         let mut executable = selected(OLD);
@@ -753,7 +889,7 @@ fn authenticated_recovery_rejects_unrelated_artifact_or_provenance_without_chang
             _ => unreachable!(),
         }
         let error = engine
-            .recover_authenticated(&mut service, TIMEOUT, executable)
+            .legacy_recover_authenticated(&mut service, TIMEOUT, executable)
             .unwrap_err();
         assert!(error.to_string().contains("not a recorded Host generation"));
         assert_eq!(std::fs::read(&engine.paths.journal).unwrap(), journal);
@@ -770,7 +906,7 @@ fn authenticated_recovery_requires_pending_ownership_and_preserves_service_gates
         let mut engine = open(home.path());
         assert!(engine.require_pending_recovery().is_err());
         assert!(engine
-            .recover_authenticated(&mut FakeService::absent(), TIMEOUT, selected(OLD))
+            .legacy_recover_authenticated(&mut FakeService::absent(), TIMEOUT, selected(OLD))
             .is_err());
         assert_eq!(disk_matches_receipt(home.path()), OLD);
         assert!(!engine.paths.journal.exists());
@@ -780,7 +916,7 @@ fn authenticated_recovery_requires_pending_ownership_and_preserves_service_gates
     let mut service = FakeService::absent();
     service.incompatible = Some(selected(OLD).artifact);
     let error = engine
-        .recover_authenticated(&mut service, TIMEOUT, selected(OLD))
+        .legacy_recover_authenticated(&mut service, TIMEOUT, selected(OLD))
         .unwrap_err();
     assert!(format!("{error:#}").contains("previous Host is incompatible"));
     assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), NEW);
@@ -803,7 +939,7 @@ fn explicit_rollback_uses_retained_artifact_and_preserves_current_receipt_fields
     .unwrap();
     assert_eq!(
         open(home.path())
-            .operator_rollback(&mut service, TIMEOUT)
+            .legacy_operator_rollback(&mut service, TIMEOUT)
             .unwrap(),
         Outcome::Installed { live_ready: false }
     );
@@ -841,14 +977,14 @@ fn repeated_upgrades_retain_only_current_and_one_previous_host() {
 fn missing_retained_or_recovery_artifact_fails_closed() {
     let home = fixture();
     assert!(open(home.path())
-        .operator_rollback(&mut FakeService::absent(), TIMEOUT)
+        .legacy_operator_rollback(&mut FakeService::absent(), TIMEOUT)
         .is_err());
     install(home.path(), &mut FakeService::absent(), OLD, NEW);
     let engine = open(home.path());
     std::fs::remove_file(engine.paths.artifact(&selected(OLD).artifact)).unwrap();
     drop(engine);
     assert!(open(home.path())
-        .operator_rollback(&mut FakeService::absent(), TIMEOUT)
+        .legacy_operator_rollback(&mut FakeService::absent(), TIMEOUT)
         .is_err());
     assert_eq!(disk_matches_receipt(home.path()), NEW);
 
@@ -856,13 +992,15 @@ fn missing_retained_or_recovery_artifact_fails_closed() {
     let mut service = FakeService::running(home.path());
     service.restart_failure = true;
     assert!(open(home.path())
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         .is_err());
     let engine = open(home.path());
     std::fs::remove_file(engine.paths.artifact(&selected(OLD).artifact)).unwrap();
     drop(engine);
     service.restart_failure = false;
-    assert!(open(home.path()).recover(&mut service, TIMEOUT).is_err());
+    assert!(open(home.path())
+        .legacy_recover(&mut service, TIMEOUT)
+        .is_err());
     assert_eq!(service.snapshot.running, RunningState::Stopped);
     assert!(home.path().join(".ww/host-upgrade.json").exists());
 }
@@ -876,7 +1014,7 @@ fn malformed_bounded_journal_and_symlink_targets_fail_closed() {
         let home = fixture();
         std::fs::write(home.path().join(".ww/host-upgrade.json"), content).unwrap();
         assert!(open(home.path())
-            .recover(&mut FakeService::absent(), TIMEOUT)
+            .legacy_recover(&mut FakeService::absent(), TIMEOUT)
             .is_err());
         assert_eq!(disk_matches_receipt(home.path()), OLD);
     }
@@ -888,7 +1026,7 @@ fn malformed_bounded_journal_and_symlink_targets_fail_closed() {
     )
     .unwrap();
     assert!(engine
-        .operator_upgrade(&mut FakeService::absent(), TIMEOUT, || Ok(request(
+        .legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || Ok(request(
             OLD, NEW
         )))
         .is_err());
@@ -902,13 +1040,15 @@ fn external_receipt_edit_is_never_overwritten_by_recovery() {
     let mut service = FakeService::running(home.path());
     service.restart_failure = true;
     assert!(open(home.path())
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         .is_err());
     let mut edited = Receipt::load(&home.path().join(".ww")).unwrap();
     edited.hashes[1] = "external-edit".into();
     let edited = edited.encode().unwrap();
     std::fs::write(home.path().join(".ww/installation.json"), &edited).unwrap();
-    assert!(open(home.path()).recover(&mut service, TIMEOUT).is_err());
+    assert!(open(home.path())
+        .legacy_recover(&mut service, TIMEOUT)
+        .is_err());
     assert_eq!(
         std::fs::read(home.path().join(".ww/installation.json")).unwrap(),
         edited
@@ -918,7 +1058,7 @@ fn external_receipt_edit_is_never_overwritten_by_recovery() {
 #[test]
 fn zero_deadline_never_calls_selection() {
     let home = fixture();
-    let result = open(home.path()).operator_upgrade::<Cursor<Vec<u8>>>(
+    let result = open(home.path()).legacy_operator_upgrade::<Cursor<Vec<u8>>>(
         &mut FakeService::absent(),
         Duration::ZERO,
         || panic!("selected with invalid deadline"),
@@ -935,12 +1075,14 @@ fn run_operation(home: &Path, action: &str) -> Result<Outcome> {
     };
     let mut engine = Engine::open(home)?;
     match action.strip_prefix("running-").unwrap_or(action) {
-        "upgrade" => engine.operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW))),
-        "second-upgrade" => {
-            engine.operator_upgrade(&mut service, TIMEOUT, || Ok(request(NEW, THIRD)))
+        "upgrade" => {
+            engine.legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         }
-        "rollback" => engine.operator_rollback(&mut service, TIMEOUT),
-        "recover" => engine.recover(&mut service, TIMEOUT),
+        "second-upgrade" => {
+            engine.legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(NEW, THIRD)))
+        }
+        "rollback" => engine.legacy_operator_rollback(&mut service, TIMEOUT),
+        "recover" => engine.legacy_recover(&mut service, TIMEOUT),
         _ => panic!("unknown crash operation"),
     }
 }
@@ -1043,7 +1185,7 @@ fn abrupt_process_exit_at_every_upgrade_rollback_and_recovery_transition() {
                 FakeService::absent()
             };
             engine
-                .recover(&mut service, TIMEOUT)
+                .legacy_recover(&mut service, TIMEOUT)
                 .unwrap_or_else(|error| {
                     panic!("recover {action} {} {label}: {error:#}", index + 1)
                 });
@@ -1112,7 +1254,7 @@ fn advancing_authoritative_head_is_rechecked_after_restart() {
     let mut service = FakeService::running(home.path());
     service.make_incompatible_on_restart = true;
     let error = open(home.path())
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         .unwrap_err();
     assert!(format!("{error:#}").contains("deployment became incompatible"));
     assert_eq!(service.snapshot.running, RunningState::Stopped);
@@ -1148,7 +1290,7 @@ fn corrupted_journal_receipt_digests_cannot_relabel_recovery_bytes() {
         std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
         let before = std::fs::read(home.path().join(".ww/installation.json")).unwrap();
         let error = open(home.path())
-            .recover(&mut FakeService::absent(), TIMEOUT)
+            .legacy_recover(&mut FakeService::absent(), TIMEOUT)
             .unwrap_err();
         assert!(format!("{error:#}").contains("does not match verified"));
         assert_eq!(
@@ -1165,7 +1307,7 @@ fn compatibility_finishing_after_deadline_cannot_report_live_readiness() {
     let mut service = FakeService::running(home.path());
     service.delay_final_compatibility = true;
     let error = open(home.path())
-        .operator_upgrade(&mut service, Duration::from_secs(2), || {
+        .legacy_operator_upgrade(&mut service, Duration::from_secs(2), || {
             Ok(request(OLD, NEW))
         })
         .unwrap_err();
@@ -1184,7 +1326,7 @@ fn aborted_upgrades_do_not_accumulate_unreferenced_hosts_across_reinstalls() {
     let mut baseline_engine = open(baseline.path());
     storage::faults::configure(None);
     baseline_engine
-        .operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
+        .legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
             Ok(request(OLD, NEW))
         })
         .unwrap();
@@ -1208,14 +1350,16 @@ fn aborted_upgrades_do_not_accumulate_unreferenced_hosts_across_reinstalls() {
         let mut engine = open(home.path());
         storage::faults::configure(Some(point));
         assert!(engine
-            .operator_upgrade(&mut FakeService::absent(), TIMEOUT, || Ok(request(
+            .legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || Ok(request(
                 current, NEW
             )))
             .is_err());
         drop(engine);
         storage::faults::configure(None);
         let mut engine = open(home.path());
-        engine.recover(&mut FakeService::absent(), TIMEOUT).unwrap();
+        engine
+            .legacy_recover(&mut FakeService::absent(), TIMEOUT)
+            .unwrap();
         assert_eq!(disk_matches_receipt(home.path()), current);
         assert_eq!(
             std::fs::read_dir(&engine.paths.store).unwrap().count(),
@@ -1231,10 +1375,12 @@ fn assert_stopped_deadline_boundary(action: &str, after_copy: bool) {
     let mut baseline_engine = open(baseline.path());
     storage::faults::configure(None);
     match action {
-        "upgrade" => baseline_engine.operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
-            Ok(request(OLD, NEW))
-        }),
-        "recover" => baseline_engine.recover(&mut FakeService::absent(), TIMEOUT),
+        "upgrade" => {
+            baseline_engine.legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
+                Ok(request(OLD, NEW))
+            })
+        }
+        "recover" => baseline_engine.legacy_recover(&mut FakeService::absent(), TIMEOUT),
         _ => unreachable!(),
     }
     .unwrap();
@@ -1268,10 +1414,10 @@ fn assert_stopped_deadline_boundary(action: &str, after_copy: bool) {
     // models elapsed I/O time deterministically without a wall-clock sleep.
     storage::faults::advance_clock_at(point);
     let result = match action {
-        "upgrade" => engine.operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
+        "upgrade" => engine.legacy_operator_upgrade(&mut FakeService::absent(), TIMEOUT, || {
             Ok(request(OLD, NEW))
         }),
-        "recover" => engine.recover(&mut FakeService::absent(), TIMEOUT),
+        "recover" => engine.legacy_recover(&mut FakeService::absent(), TIMEOUT),
         _ => unreachable!(),
     };
     storage::faults::configure(None);
@@ -1296,7 +1442,9 @@ fn assert_stopped_deadline_boundary(action: &str, after_copy: bool) {
         &selected(OLD).artifact,
     )
     .unwrap();
-    engine.recover(&mut FakeService::absent(), TIMEOUT).unwrap();
+    engine
+        .legacy_recover(&mut FakeService::absent(), TIMEOUT)
+        .unwrap();
     assert_eq!(disk_matches_receipt(home.path()), OLD);
     unchanged_user_state(home.path());
 }
@@ -1331,11 +1479,11 @@ fn scoped_v2_receipt_survives_refusal_recovery_upgrade_and_rollback() {
     let mut service = FakeService::absent();
     service.incompatible = Some(selected(NEW).artifact);
     assert!(open(home.path())
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
+        .legacy_operator_upgrade(&mut service, TIMEOUT, || Ok(request(OLD, NEW)))
         .is_err());
     assert!(root.join("host-upgrade.json").exists());
     let recovery = open(home.path())
-        .operator_upgrade::<&[u8]>(&mut service, TIMEOUT, || {
+        .legacy_operator_upgrade::<&[u8]>(&mut service, TIMEOUT, || {
             panic!("recovery must precede release selection")
         })
         .unwrap();
@@ -1359,9 +1507,705 @@ fn scoped_v2_receipt_survives_refusal_recovery_upgrade_and_rollback() {
     ));
     assert_eq!(Receipt::load(&root).unwrap().version, 2);
     open(home.path())
-        .operator_rollback(&mut service, TIMEOUT)
+        .legacy_operator_rollback(&mut service, TIMEOUT)
         .unwrap();
     assert_eq!(std::fs::read(root.join("bin/ww")).unwrap(), OLD);
     assert_eq!(Receipt::load(&root).unwrap().version, 2);
     unchanged_user_state(home.path());
+}
+
+// Genuine signatures over disposable protocol fixtures. These are not producer
+// artifacts and never qualify native restart or the public release pipeline.
+fn signed_generation(bytes: &[u8], sequence: u64) -> provenance::AuthenticatedGeneration {
+    use crate::release::auth::TrustedKeys;
+    use crate::release::descriptor::{
+        Artifact, AuthenticatedRelease, DeploymentArtifact, Descriptor, HostArtifact, Provenance,
+        SignedReleaseProof, COMPATIBILITY_PROFILE, SOURCE_REPOSITORY,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+    fn cid(codec: u64, bytes: &[u8]) -> cid::Cid {
+        cid::Cid::new_v1(
+            codec,
+            cid::multihash::Multihash::wrap(0x12, &sha2::Sha256::digest(bytes)).unwrap(),
+        )
+    }
+    fn file(path: &str, bytes: &[u8]) -> Artifact {
+        Artifact {
+            path: path.into(),
+            root: cid(0x55, bytes),
+            sha256: sha2::Sha256::digest(bytes).into(),
+            size: bytes.len() as u64,
+        }
+    }
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let mut der = vec![
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    der.extend_from_slice(key.verifying_key().as_bytes());
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut keys = Vec::new();
+    for block in der.chunks(3) {
+        let value = (u32::from(block[0]) << 16)
+            | (u32::from(*block.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*block.get(2).unwrap_or(&0));
+        keys.extend([
+            alphabet[(value >> 18) as usize],
+            alphabet[((value >> 12) & 63) as usize],
+            if block.len() > 1 {
+                alphabet[((value >> 6) & 63) as usize]
+            } else {
+                b'='
+            },
+            if block.len() > 2 {
+                alphabet[(value & 63) as usize]
+            } else {
+                b'='
+            },
+        ]);
+    }
+    keys.push(b'\n');
+    let target = "aarch64-unknown-linux-gnu";
+    let source = Provenance {
+        repository: SOURCE_REPOSITORY.into(),
+        revision: "a".repeat(40),
+        builder: "disposable-unit-fixture".into(),
+    };
+    let host = file(
+        crate::release::descriptor::platform_path(target).unwrap(),
+        bytes,
+    );
+    let kernel = file("fhs/boot/kernel.wasm", b"kernel fixture");
+    let status = file("fhs/bin/status.wasm", b"status fixture");
+    let descriptor = Descriptor {
+        channel: crate::ipns::canonical_name(
+            libp2p::identity::Keypair::ed25519_from_bytes([42; 32])
+                .unwrap()
+                .public()
+                .to_peer_id(),
+        ),
+        sequence,
+        version: "0.1.1".into(),
+        source: source.clone(),
+        hosts: vec![HostArtifact {
+            target: target.into(),
+            artifact: host.clone(),
+            provenance: source,
+            compatibility: COMPATIBILITY_PROFILE.into(),
+        }],
+        deployment: DeploymentArtifact {
+            root: cid(0x70, b"disposable FHS"),
+            kernel: kernel.clone(),
+            status: status.clone(),
+            compatibility: COMPATIBILITY_PROFILE.into(),
+        },
+    };
+    let binding = descriptor.binding().unwrap();
+    let mut manifest = format!(
+        "# sha256\n{}  RELEASE-DESCRIPTOR\n",
+        hex::encode(sha2::Sha256::digest(&binding))
+    );
+    for artifact in [&host, &kernel, &status] {
+        manifest.push_str(&format!(
+            "{}  {}\n",
+            hex::encode(artifact.sha256),
+            artifact.path
+        ));
+    }
+    let descriptor_cid = descriptor.cid().unwrap();
+    let mut link = vec![0x0a, descriptor_cid.to_bytes().len() as u8];
+    link.extend(descriptor_cid.to_bytes());
+    link.extend([0x12, 18]);
+    link.extend(b"release-descriptor");
+    let mut root_bytes = vec![0x0a, 2, 8, 1, 0x12, link.len() as u8];
+    root_bytes.extend(link);
+    let release = AuthenticatedRelease::authenticate(
+        &TrustedKeys::from_bytes(&keys).unwrap(),
+        manifest.as_bytes(),
+        &key.sign(manifest.as_bytes()).to_bytes(),
+        &binding,
+        descriptor_cid,
+        &descriptor.encode().unwrap(),
+    )
+    .unwrap();
+    let proof = SignedReleaseProof::capture(cid(0x70, &root_bytes), &root_bytes, &release).unwrap();
+    provenance::AuthenticatedGeneration::from_proof(proof, &keys, target).unwrap()
+}
+
+#[test]
+fn steady_start_requires_exact_committed_proof_locator_receipt_and_contract() {
+    use startup::{
+        InitializationIdentityPolicy, InstanceLease, InvocationBinding, StartupContractV1,
+        StartupDisposition, StartupLease, StartupStateV1,
+    };
+    let home = fixture();
+    let generation = signed_generation(OLD, 1);
+    let engine = open(home.path());
+    let _instance = InstanceLease::exclusive_create(engine.mutation_lock()).unwrap();
+    let mut lease = StartupLease::exclusive_create(engine.mutation_lock()).unwrap();
+    let mut receipt = Receipt::load(&home.path().join(".ww")).unwrap();
+    receipt.complete = false;
+    let receipt_bytes = receipt.encode().unwrap();
+    let contract = StartupContractV1::new(
+        [9; 32],
+        1,
+        generation.artifact().clone(),
+        FakeService::absent().startup,
+        InvocationBinding::Standalone,
+        PathBuf::from("/etc/wetware/release-keys"),
+    )
+    .unwrap();
+    let mut state = StartupStateV1 {
+        version: 1,
+        installation_id: [9; 32],
+        native: generation.record().clone(),
+        trusted_release_keys: contract.trusted_release_keys.clone(),
+        disposition: StartupDisposition::RequiredUnbound,
+        initializing_receipt: Some(receipt_bytes.clone()),
+        initializing_receipt_sha256: Some(sha2::Sha256::digest(&receipt_bytes).into()),
+        initializing_identity: Some(InitializationIdentityPolicy::PreserveExisting),
+        initializing_previous_proofs: Vec::new(),
+    };
+    lease.write_state(&state).unwrap();
+    storage::write_record(&engine.paths.receipt, &receipt_bytes).unwrap();
+    lease.initialize_marker(&state, &generation).unwrap();
+    engine.paths.create_proof_directory().unwrap();
+    storage::write_proof(
+        &engine.paths.proof(&generation.record().proof).unwrap(),
+        generation.proof_bytes(),
+    )
+    .unwrap();
+    let locator = serde_json::to_vec(
+        &provenance::InstalledRelease::from_root(
+            generation.record().transport_root.parse().unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    storage::write_record(&engine.paths.locator, &locator).unwrap();
+    let retained = RetainedV2 {
+        version: 2,
+        installation_id: [9; 32],
+        current: generation.record().clone(),
+        previous: None,
+        contract: Some(contract.identity.clone()),
+    };
+    storage::write_record(&engine.paths.retained, &retained.encode().unwrap()).unwrap();
+    receipt.complete = true;
+    storage::write_record(&engine.paths.receipt, &receipt.encode().unwrap()).unwrap();
+    state.initializing_receipt = None;
+    state.initializing_receipt_sha256 = None;
+    state.initializing_identity = None;
+    lease.write_state(&state).unwrap();
+    lease.write_contract(&contract).unwrap();
+    state.disposition = StartupDisposition::Committed {
+        contract: contract.identity.clone(),
+    };
+    lease.write_state(&state).unwrap();
+    validate_steady_start(&lease, &state, &contract).unwrap();
+    storage::write_record(&engine.paths.locator, b"{}").unwrap();
+    assert!(validate_steady_start(&lease, &state, &contract).is_err());
+    storage::write_record(&engine.paths.locator, &locator).unwrap();
+    storage::remove(&engine.paths.proof(&generation.record().proof).unwrap()).unwrap();
+    assert!(validate_steady_start(&lease, &state, &contract).is_err());
+}
+
+fn initialization_fixture() -> (
+    tempfile::TempDir,
+    provenance::AuthenticatedGeneration,
+    provenance::IndependentTrustSource,
+    Receipt,
+) {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".ww/bin")).unwrap();
+    let generation = signed_generation(OLD, 1);
+    let keys = home.path().join("release-keys");
+    std::fs::write(&keys, &generation.record().verification_keys).unwrap();
+    let trust = provenance::IndependentTrustSource::from_path(&keys).unwrap();
+    let receipt = Receipt {
+        version: 2,
+        hashes: [
+            blake3::hash(OLD).to_hex().to_string(),
+            blake3::hash(b"kernel fixture").to_hex().to_string(),
+            blake3::hash(b"status fixture").to_hex().to_string(),
+            String::new(),
+            String::new(),
+        ],
+        previous: None,
+        complete: false,
+    };
+    (home, generation, trust, receipt)
+}
+
+fn write_initialization_software(home: &Path) {
+    std::fs::write(home.join(".ww/bin/ww"), OLD).unwrap();
+    std::fs::set_permissions(
+        home.join(".ww/bin/ww"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join(".ww/fhs/boot")).unwrap();
+    std::fs::create_dir_all(home.join(".ww/fhs/bin")).unwrap();
+    std::fs::write(home.join(".ww/fhs/boot/kernel.wasm"), b"kernel fixture").unwrap();
+    std::fs::write(home.join(".ww/fhs/bin/status.wasm"), b"status fixture").unwrap();
+}
+
+#[test]
+fn initialization_holds_leases_and_completes_exact_authenticated_tuple_unbound() {
+    storage::faults::configure(None);
+    let (home, generation, trust, mut receipt) = initialization_fixture();
+    let mut engine = open(home.path());
+    let guard = engine
+        .prepare_initialization(&generation, &receipt, &trust)
+        .unwrap();
+    assert!(guard.may_create_identity().unwrap());
+    assert!(startup::InstanceLease::shared(home.path()).is_err());
+    assert!(startup::StartupLease::shared(home.path()).is_err());
+    assert!(
+        !Receipt::decode(&std::fs::read(home.path().join(".ww/installation.json")).unwrap())
+            .unwrap()
+            .complete
+    );
+    write_initialization_software(home.path());
+    std::fs::write(
+        home.path().join(".ww/identity"),
+        b"private key fixture, not release authority",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        home.path().join(".ww/identity"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    receipt.complete = true;
+    guard.finish(&receipt).unwrap();
+    let lease = startup::StartupLease::shared(home.path()).unwrap();
+    let state = lease.read_state().unwrap().unwrap();
+    assert_eq!(
+        state.disposition,
+        startup::StartupDisposition::RequiredUnbound
+    );
+    assert!(state.initializing_receipt.is_none());
+    assert!(lease.read_contract().unwrap().is_none());
+    let retained = read_retained_v2(&engine.paths).unwrap();
+    assert_eq!(retained.current, *generation.record());
+    assert!(retained.previous.is_none());
+    validate_committed_native(&engine.paths, &state, &retained).unwrap();
+}
+
+#[test]
+fn initialization_retry_refuses_another_signed_root_with_identical_host_bytes() {
+    storage::faults::configure(None);
+    let (home, generation, trust, receipt) = initialization_fixture();
+    let mut engine = open(home.path());
+    drop(
+        engine
+            .prepare_initialization(&generation, &receipt, &trust)
+            .unwrap(),
+    );
+    let other = signed_generation(OLD, 2);
+    assert!(engine
+        .prepare_initialization(&other, &receipt, &trust)
+        .is_err());
+    let guard = engine
+        .prepare_initialization(&generation, &receipt, &trust)
+        .unwrap();
+    assert!(guard.may_create_identity().unwrap());
+}
+
+pub(super) fn completed_initialization() -> (
+    tempfile::TempDir,
+    Engine,
+    provenance::AuthenticatedGeneration,
+) {
+    let (home, generation, trust, mut receipt) = initialization_fixture();
+    let mut engine = open(home.path());
+    let guard = engine
+        .prepare_initialization(&generation, &receipt, &trust)
+        .unwrap();
+    write_initialization_software(home.path());
+    std::fs::write(home.path().join(".ww/identity"), b"identity fixture").unwrap();
+    std::fs::set_permissions(
+        home.path().join(".ww/identity"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    receipt.complete = true;
+    guard.finish(&receipt).unwrap();
+    (home, engine, generation)
+}
+
+fn admission_inputs(home: &Path) -> inputs::PreflightInputs {
+    inputs::PreflightInputs {
+        version: 1,
+        config: inputs::EffectiveRunConfig {
+            cwd: home.to_owned(), home: home.to_owned(), uid: unsafe { libc::geteuid() },
+            mounts: Vec::new(), fhs_root: None, namespace_roots: Vec::new(), listen: Vec::new(),
+            wasm_debug: false, identity_path: Some(home.join(".ww/identity")), insecure_ephemeral: false,
+            stem: None, ipns_stem: None, ipns_routing_url: "http://127.0.0.1:8180".into(),
+            rpc_url: "http://127.0.0.1:8545".into(), ws_url: "ws://127.0.0.1:8546".into(),
+            confirmation_depth: 1, executor_threads: 1, http_listen: None, http_dial: Vec::new(),
+            runtime_cache_policy: inputs::RuntimeCachePolicy::Isolated, http_admin: None,
+            ipfs_url: "http://127.0.0.1:5001".into(),
+            runtime: inputs::RuntimeSettings {
+                kubo_wait_max_secs: 1, kubo_boot_retry_max_secs: 1, kubo_operation_timeout_secs: 1,
+                compile_workers: 1, tracing: serde_json::from_value(serde_json::json!({"filter":"warn","json":false,"ansi":false,"invalid_format":false,"invalid_telemetry":false,"telemetry":null})).unwrap(),
+                compilation_cache: crate::cell::engine::CapturedCacheSettings::from_values(None,None),
+                interactive: false, oci_image_id: None, unsupported_environment: Vec::new(),
+            },
+        },
+        namespaces: Vec::new(), identity_fingerprint: [12;32], operation_digests: Vec::new(),
+        has_baseline: false, sources: Vec::new(), publisher: None,
+    }
+}
+
+fn desired_contract(
+    engine: &Engine,
+    inputs: &inputs::PreflightInputs,
+) -> startup::StartupContractV1 {
+    let state = engine.startup_state().unwrap();
+    let generation = engine
+        .startup_contract()
+        .unwrap()
+        .map(|c| c.identity.next_generation().unwrap())
+        .unwrap_or(1);
+    startup::StartupContractV1::new(
+        state.installation_id,
+        generation,
+        state.native.artifact,
+        inputs.startup_identity().unwrap(),
+        startup::InvocationBinding::Standalone,
+        state.trusted_release_keys,
+    )
+    .unwrap()
+}
+
+#[test]
+fn admission_checks_without_metadata_writes_then_commits_one_contract() {
+    storage::faults::configure(None);
+    let (home, mut engine, generation) = completed_initialization();
+    let inputs = admission_inputs(home.path());
+    let desired = desired_contract(&engine, &inputs);
+    let state_before = std::fs::read(engine.paths.store.join("startup-state.json")).unwrap();
+    let retained_before = std::fs::read(&engine.paths.retained).unwrap();
+    let mut service = FakeService::absent();
+    let guard = engine
+        .begin_admission(&mut service, Instant::now() + TIMEOUT)
+        .unwrap();
+    assert!(startup::InstanceLease::shared(home.path()).is_err());
+    assert!(matches!(
+        guard
+            .finish(&mut service, desired.clone(), &inputs, true)
+            .unwrap(),
+        AdmissionOutcome::Checked { .. }
+    ));
+    assert_eq!(
+        std::fs::read(engine.paths.store.join("startup-state.json")).unwrap(),
+        state_before
+    );
+    assert_eq!(
+        std::fs::read(&engine.paths.retained).unwrap(),
+        retained_before
+    );
+    assert!(!engine.paths.journal.exists());
+    assert!(matches!(
+        engine
+            .operator_admit(&mut service, TIMEOUT, desired.clone(), &inputs, false)
+            .unwrap(),
+        AdmissionOutcome::Admitted { .. }
+    ));
+    assert_eq!(engine.startup_contract().unwrap(), Some(desired));
+    assert_eq!(
+        engine.current_generation().unwrap().record(),
+        generation.record()
+    );
+    assert!(!engine.paths.journal.exists());
+    assert_eq!(
+        (service.restarts, service.stops, service.effects),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn admission_refuses_running_process_and_expired_deadline_before_capture() {
+    storage::faults::configure(None);
+    let (home, mut engine, _) = completed_initialization();
+    let mut running = FakeService::running(home.path());
+    assert!(engine
+        .begin_admission(&mut running, Instant::now() + TIMEOUT)
+        .is_err());
+    let mut stopped = FakeService::absent();
+    assert!(engine
+        .begin_admission(&mut stopped, Instant::now())
+        .is_err());
+    let live = startup::InstanceLease::shared(home.path()).unwrap();
+    assert!(engine
+        .begin_admission(&mut stopped, Instant::now() + TIMEOUT)
+        .is_err());
+    drop(live);
+    assert!(!engine.paths.journal.exists());
+}
+
+fn run_admission_fixture(home: &Path) -> Result<()> {
+    let mut engine = Engine::open(home)?;
+    let mut inputs = admission_inputs(home);
+    inputs.config.rpc_url.push_str("/new-admission");
+    let desired = desired_contract(&engine, &inputs);
+    engine.operator_admit(&mut FakeService::absent(), TIMEOUT, desired, &inputs, false)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "subprocess worker; invoked by admission crash matrix"]
+fn admission_crash_worker() {
+    let home = PathBuf::from(std::env::var_os("WW_ADMISSION_CRASH_HOME").unwrap());
+    let point: usize = std::env::var("WW_ADMISSION_CRASH_POINT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    storage::faults::exit_at(point);
+    run_admission_fixture(&home).unwrap();
+    panic!("requested admission crash was not reached");
+}
+
+#[test]
+fn admission_process_exit_at_every_durable_boundary_restores_or_commits_exact_contract() {
+    for readmission in [false, true] {
+        let prepare = || {
+            storage::faults::configure(None);
+            let (home, mut engine, generation) = completed_initialization();
+            if readmission {
+                let inputs = admission_inputs(home.path());
+                let desired = desired_contract(&engine, &inputs);
+                engine
+                    .operator_admit(&mut FakeService::absent(), TIMEOUT, desired, &inputs, false)
+                    .unwrap();
+            }
+            let original = engine.startup_contract().unwrap();
+            drop(engine);
+            (home, original, generation)
+        };
+        let (baseline, _, _) = prepare();
+        storage::faults::configure(None);
+        run_admission_fixture(baseline.path()).unwrap();
+        let trace = storage::faults::trace();
+        assert!(trace.iter().any(|s| s == "admit.committed"));
+        for (index, label) in trace.iter().enumerate() {
+            let (home, original, generation) = prepare();
+            let receipt = std::fs::read(home.path().join(".ww/installation.json")).unwrap();
+            let locator = std::fs::read(home.path().join(".ww/installed-release.json")).unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "upgrade::tests::admission_crash_worker",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("WW_ADMISSION_CRASH_HOME", home.path())
+                .env("WW_ADMISSION_CRASH_POINT", (index + 1).to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.code(),
+                Some(86),
+                "{readmission} {} {label}",
+                index + 1
+            );
+            storage::faults::configure(None);
+            let mut engine = open(home.path());
+            engine
+                .recover_admission(&mut FakeService::absent(), Instant::now() + TIMEOUT, false)
+                .unwrap_or_else(|e| panic!("{readmission} {} {label}: {e:#}", index + 1));
+            assert_eq!(
+                engine.current_generation().unwrap().record(),
+                generation.record()
+            );
+            assert_eq!(std::fs::read(&engine.paths.receipt).unwrap(), receipt);
+            assert_eq!(std::fs::read(&engine.paths.locator).unwrap(), locator);
+            assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+            assert!(!engine.paths.journal.exists());
+            let resulting = engine.startup_contract().unwrap();
+            if resulting != original {
+                let resulting = resulting.unwrap();
+                assert_eq!(
+                    resulting.identity.generation,
+                    if readmission { 2 } else { 1 }
+                );
+                let lease = startup::StartupLease::shared(home.path()).unwrap();
+                validate_steady_start(&lease, &engine.startup_state().unwrap(), &resulting)
+                    .unwrap();
+            }
+        }
+        eprintln!(
+            "admission readmission={readmission}: {} real process-exit checkpoints",
+            trace.len()
+        );
+    }
+}
+
+fn fixture_process(pid: u32) -> service::ProcessInstance {
+    service::ProcessInstance {
+        pid,
+        start: attestation::ProcessStartToken::Linux {
+            boot_id: "00000000-0000-0000-0000-000000000001".into(),
+            start_ticks: u64::from(pid),
+        },
+        launch_nonce: [(pid % 255 + 1) as u8; 32],
+    }
+}
+
+fn native_fixture(
+    running: bool,
+) -> (
+    tempfile::TempDir,
+    Engine,
+    provenance::AuthenticatedGeneration,
+    inputs::PreflightInputs,
+    FakeService,
+) {
+    let (home, mut engine, current) = completed_initialization();
+    let inputs = admission_inputs(home.path());
+    let mut contract = desired_contract(&engine, &inputs);
+    let mut service = FakeService::absent();
+    if running {
+        let identity = startup::ServiceIdentity {
+            manager: startup::ServiceManager::Systemd,
+            domain: "user/1000".into(),
+            name: "ww.service".into(),
+            definition: [1; 32],
+            drop_ins: [2; 32],
+            environment_files: [3; 32],
+            effective_argv: [4; 32],
+            effective_environment: [5; 32],
+            registered: true,
+            enabled: EnabledState::Enabled,
+        };
+        contract = startup::StartupContractV1::new(
+            contract.installation_id,
+            1,
+            contract.artifact,
+            contract.startup,
+            startup::InvocationBinding::Managed { service: identity },
+            contract.trusted_release_keys,
+        )
+        .unwrap();
+        service = FakeService::running(home.path());
+        service.snapshot.running = RunningState::Stopped;
+        service.running_artifact = None;
+    }
+    service.startup = inputs.startup_identity().unwrap();
+    engine
+        .operator_admit(&mut service, TIMEOUT, contract, &inputs, false)
+        .unwrap();
+    if running {
+        service.snapshot.running = RunningState::Running { pid: 321 };
+        service.running_artifact = Some(current.artifact().clone());
+    }
+    (home, engine, current, inputs, service)
+}
+
+fn native_request(
+    current: provenance::AuthenticatedGeneration,
+    inputs: inputs::PreflightInputs,
+    bytes: &[u8],
+    sequence: u64,
+) -> UpgradeRequest<Cursor<Vec<u8>>> {
+    UpgradeRequest {
+        installed: current,
+        candidate: signed_generation(bytes, sequence),
+        bytes: Cursor::new(bytes.to_vec()),
+        inputs,
+    }
+}
+
+#[test]
+fn native_v2_stopped_upgrade_and_rollback_preserve_complete_tuple_and_inputs() {
+    storage::faults::configure(None);
+    let (home, mut engine, current, inputs, mut service) = native_fixture(false);
+    let before = engine.startup_contract().unwrap().unwrap();
+    assert_eq!(
+        engine
+            .operator_upgrade(&mut service, TIMEOUT, || Ok(native_request(
+                current,
+                inputs.clone(),
+                NEW,
+                2
+            )))
+            .unwrap(),
+        Outcome::Installed { live_ready: false }
+    );
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), NEW);
+    let retained = read_retained_v2(&engine.paths).unwrap();
+    assert_eq!(retained.current, *signed_generation(NEW, 2).record());
+    assert_eq!(
+        retained.previous.as_ref(),
+        Some(signed_generation(OLD, 1).record())
+    );
+    let after = engine.startup_contract().unwrap().unwrap();
+    assert_eq!(after.startup, before.startup);
+    assert_eq!(after.identity.generation, 2);
+    assert_eq!(
+        engine
+            .operator_rollback_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+            .unwrap(),
+        Outcome::Installed { live_ready: false }
+    );
+    assert_eq!(std::fs::read(home.path().join(".ww/bin/ww")).unwrap(), OLD);
+    assert_eq!(
+        engine
+            .startup_contract()
+            .unwrap()
+            .unwrap()
+            .identity
+            .generation,
+        3
+    );
+    assert_eq!(
+        (service.restarts, service.stops, service.effects),
+        (0, 0, 0)
+    );
+    assert!(!engine.paths.journal.exists());
+}
+
+#[test]
+fn native_v2_running_upgrade_consumes_exact_permit_and_recovers_failed_restart() {
+    storage::faults::configure(None);
+    let (_home, mut engine, current, inputs, mut service) = native_fixture(true);
+    service.restart_failure = true;
+    assert!(engine
+        .operator_upgrade(&mut service, TIMEOUT, || Ok(native_request(
+            current,
+            inputs.clone(),
+            NEW,
+            2
+        )))
+        .is_err());
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), NEW);
+    assert!(engine.paths.journal.exists());
+    service.restart_failure = false;
+    assert!(matches!(
+        engine
+            .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+            .unwrap(),
+        Outcome::Recovered {
+            live_ready: true,
+            ..
+        }
+    ));
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+    assert_eq!(
+        engine
+            .startup_contract()
+            .unwrap()
+            .unwrap()
+            .identity
+            .generation,
+        1
+    );
+    assert_eq!(
+        service.running_artifact.as_ref(),
+        Some(signed_generation(OLD, 1).artifact())
+    );
+    assert!(!engine.paths.journal.exists());
 }

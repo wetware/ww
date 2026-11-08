@@ -503,6 +503,170 @@ impl AuthenticatedRelease {
     }
 }
 
+/// Retained release evidence. Decoding or capturing a proof does not grant trust.
+///
+/// Every consumer must call `authenticate` with independently provisioned keys.
+/// This type contains no keyring, freshness floor, installation state or publisher
+/// authority. Its versioned encoding retains the original signed bytes.
+#[derive(Clone, Debug)]
+pub struct SignedReleaseProof {
+    root: Cid,
+    root_block: Vec<u8>,
+    manifest: Vec<u8>,
+    signature: Vec<u8>,
+    binding: Vec<u8>,
+    descriptor: Vec<u8>,
+}
+
+/// Maximum encoded proof size; installation owners bound reads before decoding.
+pub const MAX_SIGNED_RELEASE_PROOF_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedReleaseProofV1 {
+    version: u32,
+    root: String,
+    root_block: String,
+    manifest: String,
+    signature: String,
+    binding: String,
+    descriptor: String,
+}
+
+impl SignedReleaseProof {
+    /// Retain an authenticated envelope only when the supplied transport root
+    /// binds the same descriptor. The consumer still chooses its own trust.
+    pub fn capture(root: Cid, root_block: &[u8], release: &AuthenticatedRelease) -> Result<Self> {
+        verify_transport_root(root, root_block, release.cid)?;
+        let proof = Self {
+            root,
+            root_block: root_block.to_vec(),
+            manifest: release.manifest.clone(),
+            signature: release.signature.clone(),
+            binding: release.binding.clone(),
+            descriptor: release.descriptor_bytes.clone(),
+        };
+        proof.validate_bounds()?;
+        Ok(proof)
+    }
+
+    /// Decode bounded, canonical evidence without authenticating its contents.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() <= MAX_SIGNED_RELEASE_PROOF_BYTES,
+            "signed release proof exceeds byte limit"
+        );
+        let wire: SignedReleaseProofV1 =
+            serde_json::from_slice(bytes).context("invalid signed release proof envelope")?;
+        ensure!(wire.version == 1, "unknown signed release proof version");
+        ensure!(
+            serde_json::to_vec(&wire)? == bytes,
+            "noncanonical signed release proof envelope"
+        );
+        ensure!(
+            wire.root.len() <= MAX_BINDING_BYTES,
+            "release proof root exceeds limit"
+        );
+        let root = ipfs::cid_identity::parse_cid(&wire.root)?;
+        ensure!(
+            root.to_string() == wire.root,
+            "noncanonical release proof root"
+        );
+        sha256_cid(root, &[0x70])?;
+        let proof = Self {
+            root,
+            root_block: decode_proof_field(&wire.root_block, MAX_ROOT_BYTES, "root block")?,
+            manifest: decode_proof_field(&wire.manifest, MAX_MANIFEST_BYTES, "manifest")?,
+            signature: decode_proof_field(&wire.signature, 64, "signature")?,
+            binding: decode_proof_field(&wire.binding, MAX_BINDING_BYTES, "binding")?,
+            descriptor: decode_proof_field(
+                &wire.descriptor,
+                ipfs::map::MAX_BLOCK_BYTES,
+                "descriptor",
+            )?,
+        };
+        proof.validate_bounds()?;
+        Ok(proof)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate_bounds()?;
+        let bytes = serde_json::to_vec(&SignedReleaseProofV1 {
+            version: 1,
+            root: self.root.to_string(),
+            root_block: STANDARD.encode(&self.root_block),
+            manifest: STANDARD.encode(&self.manifest),
+            signature: STANDARD.encode(&self.signature),
+            binding: STANDARD.encode(&self.binding),
+            descriptor: STANDARD.encode(&self.descriptor),
+        })?;
+        ensure!(
+            bytes.len() <= MAX_SIGNED_RELEASE_PROOF_BYTES,
+            "signed release proof exceeds byte limit"
+        );
+        Ok(bytes)
+    }
+
+    /// Recheck the original signature, descriptor and transport-root binding.
+    /// The supplied keys are the sole trust source; a proof cannot provide keys.
+    pub fn authenticate(&self, keys: &TrustedKeys) -> Result<AuthenticatedRelease> {
+        self.validate_bounds()?;
+        let release = AuthenticatedRelease::authenticate(
+            keys,
+            &self.manifest,
+            &self.signature,
+            &self.binding,
+            binding_cid(&self.binding)?,
+            &self.descriptor,
+        )?;
+        verify_transport_root(self.root, &self.root_block, release.cid)?;
+        Ok(release)
+    }
+
+    /// The recorded transport root is untrusted until authentication succeeds.
+    pub fn transport_root(&self) -> Cid {
+        self.root
+    }
+
+    fn validate_bounds(&self) -> Result<()> {
+        for (name, bytes, maximum) in [
+            ("root block", self.root_block.as_slice(), MAX_ROOT_BYTES),
+            ("manifest", self.manifest.as_slice(), MAX_MANIFEST_BYTES),
+            ("binding", self.binding.as_slice(), MAX_BINDING_BYTES),
+            (
+                "descriptor",
+                self.descriptor.as_slice(),
+                ipfs::map::MAX_BLOCK_BYTES,
+            ),
+        ] {
+            ensure!(
+                !bytes.is_empty() && bytes.len() <= maximum,
+                "invalid signed release proof {name} size"
+            );
+        }
+        ensure!(
+            self.signature.len() == 64,
+            "release signature must contain exactly 64 bytes"
+        );
+        Ok(())
+    }
+}
+
+fn decode_proof_field(value: &str, maximum: usize, name: &str) -> Result<Vec<u8>> {
+    ensure!(
+        value.len() <= maximum.div_ceil(3) * 4,
+        "signed release proof {name} exceeds byte limit"
+    );
+    let bytes = STANDARD
+        .decode(value)
+        .with_context(|| format!("invalid signed release proof {name} base64"))?;
+    ensure!(
+        bytes.len() <= maximum && STANDARD.encode(&bytes) == value,
+        "invalid signed release proof {name} encoding or size"
+    );
+    Ok(bytes)
+}
+
 /// Authenticated selection metadata. Verify fetched bytes before consumption.
 #[derive(Clone, Debug)]
 pub struct Selection {

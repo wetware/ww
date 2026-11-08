@@ -273,7 +273,8 @@ impl NativeManager {
 }
 impl Manager for NativeManager {
     fn snapshot(&mut self) -> Result<ServiceSnapshot> {
-        let snapshot = NativeService::new(&self.home)?.snapshot()?;
+        let snapshot =
+            NativeService::new(&self.home)?.snapshot(Instant::now() + Duration::from_secs(30))?;
         if self.platform == Platform::Linux {
             let output = command_output(
                 "/usr/bin/systemctl",

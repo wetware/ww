@@ -27,7 +27,10 @@ pub use capture::{
     CaptureBatch, CaptureCancellation, CaptureRequest, CaptureStats, CapturedSource,
 };
 pub use operation::{CompositionError, FrozenMount, FrozenSource, GuestTarget, SourceKind};
-pub use resolution::{resolve_frozen_mounts_with_cancel, MountResolutionFailure, ResolvedMounts};
+pub use resolution::{
+    capture_frozen_mounts_with_cancel, resolve_frozen_mounts_with_cancel, CapturedMounts,
+    MountResolutionFailure, ResolvedMounts,
+};
 pub use selection::{select_kernel_file, KernelFileError, KernelFileFailure, VerifiedKernelFile};
 pub use snapshot::{PublishedSources, SnapshotPublicationFailure};
 

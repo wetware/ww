@@ -113,6 +113,36 @@ pub struct Config {
     spans_per_second: u32,
 }
 
+impl serde::Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut fields = serializer.serialize_struct("TelemetryConfig", 3)?;
+        fields.serialize_field("endpoint", self.endpoint.as_str())?;
+        fields.serialize_field("sample_ratio", &self.sample_ratio)?;
+        fields.serialize_field("spans_per_second", &self.spans_per_second)?;
+        fields.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            endpoint: String,
+            sample_ratio: f64,
+            spans_per_second: u32,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(
+            &fields.endpoint,
+            fields.sample_ratio,
+            fields.spans_per_second,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 impl Config {
     pub fn new(endpoint: &str, sample_ratio: f64, spans_per_second: u32) -> anyhow::Result<Self> {
         let endpoint =

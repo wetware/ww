@@ -295,6 +295,39 @@ fn startup_guard_at(
     Ok(Some(lock))
 }
 
+#[cfg(target_os = "linux")]
+fn verify_guard_capability(
+    bytes: &[u8],
+    generation: &ww::upgrade::provenance::AuthenticatedGeneration,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    // This is a protocol observation budget, not a service restart default.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut temporary = tempfile::NamedTempFile::new()?;
+    temporary.write_all(bytes)?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    temporary.as_file().sync_all()?;
+    let temporary = temporary.into_temp_path();
+    let executable = ww::upgrade::attestation::VerifiedExecutable::open(
+        &temporary,
+        generation.artifact(),
+        deadline,
+    )?;
+    ww::upgrade::native_linux::verify_guard_capability(&executable, deadline)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_guard_capability(
+    _: &[u8],
+    _: &ww::upgrade::provenance::AuthenticatedGeneration,
+) -> Result<()> {
+    anyhow::bail!("guarded native installation is unavailable: exact running-executable evidence is not qualified on this platform")
+}
+
 pub(super) async fn install(args: InstallArgs) -> Result<()> {
     let home = dirs::home_dir().context("cannot determine HOME")?;
     let lock = MutationLock::acquire(&home)?;
@@ -302,17 +335,32 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
     let root = home.join(".ww");
     let selected = if args.release.release.is_some() {
         Some(upgrade_cmd::select_release(&args.release, Scope::Both).await?)
+    } else if let Some(root) = &args.bootstrap_release {
+        // The shell's manifest/locator handoff does not carry the complete
+        // signed descriptor proof. Fetch immutable metadata through the same
+        // independent verifier before any guarded installation writes.
+        let mut release = args.release.clone();
+        release.release = Some(root.clone());
+        Some(upgrade_cmd::select_release(&release, Scope::Metadata).await?)
     } else {
         None
     };
     let state = Receipt::read(&root)?;
+    let guarded_metadata = ww::upgrade::startup::metadata_present(&home)?;
+    ensure!(!guarded_metadata || selected.is_some(), "guarded installation requires its exact authenticated release; use ww install --release <RECORDED_ROOT>");
+    let guarded = selected.is_some() && (state.is_none() || guarded_metadata);
     ensure!(selected.is_some() || args.payload.is_some() || state.is_some(), "automatic release discovery awaits trusted channel provisioning; use ww install --release <CID> or the authenticated shell bootstrap");
     let current = std::env::current_exe()?.canonicalize()?;
-    let native = match &selected {
-        Some(s) => s.host.clone().context("selected Host bytes missing")?,
-        None => std::fs::read(&current)?,
+    let native = if args.release.release.is_some() {
+        selected
+            .as_ref()
+            .and_then(|s| s.host.clone())
+            .context("selected Host bytes missing")?
+    } else {
+        std::fs::read(&current)?
     };
-    let (kernel, status) = if let Some(s) = &selected {
+    let (kernel, status) = if args.release.release.is_some() {
+        let s = selected.as_ref().context("selected release missing")?;
         (
             s.kernel.clone().context("selected kernel missing")?,
             s.status.clone().context("selected status missing")?,
@@ -334,6 +382,10 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         )
     };
     let bytes = [native, kernel, status];
+    if let Some(selected) = &selected {
+        selected.selection.verify_host(&bytes[0])?;
+        selected.selection.verify_deployment(&bytes[1], &bytes[2])?;
+    }
     if args.payload.is_some() {
         let keys = ww::release::auth::TrustedKeys::from_bytes(&upgrade_cmd::read_bounded(
             &args.release.trusted_release_keys,
@@ -405,7 +457,9 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         None
     };
     ensure!(
-        state.is_none() || key.is_some(),
+        state.is_none()
+            || key.is_some()
+            || (guarded && state.as_ref().is_some_and(|s| !s.complete)),
         "managed installation identity is missing; restore the original identity from backup"
     );
     if let Some(s) = &state {
@@ -427,6 +481,15 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
             }
         }
     }
+    if guarded && !state.as_ref().is_some_and(|state| state.complete) {
+        verify_guard_capability(
+            &bytes[0],
+            &selected
+                .as_ref()
+                .context("guarded proof missing")?
+                .generation,
+        )?;
+    }
     let changed_paths = SOFTWARE
         .iter()
         .zip(&bytes)
@@ -439,17 +502,36 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         })
         .chain(key.is_none().then_some(identity.clone()))
         .collect();
-    let release = selected
+    let mut release = selected
         .as_ref()
         .map(|s| s.root.to_string())
         .or(args.bootstrap_release)
         .map(|value| upgrade_cmd::release_cid(&value).map(|cid| cid.to_string()))
         .transpose()?;
+    if args.check && guarded && state.as_ref().is_some_and(|receipt| receipt.complete) {
+        let lease = ww::upgrade::startup::StartupLease::shared(&home)?;
+        let startup = ww::upgrade::validate_owned_installation(&lock, &lease)?;
+        ensure!(
+            matches!(
+                startup.disposition,
+                ww::upgrade::startup::StartupDisposition::RequiredUnbound
+                    | ww::upgrade::startup::StartupDisposition::Committed { .. }
+            ),
+            "finish guarded recovery before checking installation"
+        );
+        ensure!(
+            selected
+                .as_ref()
+                .context("guarded proof missing")?
+                .generation
+                .artifact()
+                == &startup.native.artifact,
+            "installation contains another authenticated native artifact"
+        );
+        release = Some(startup.native.transport_root);
+    }
     if !args.check {
         std::fs::create_dir_all(&root)?;
-        if key.is_none() {
-            persist_identity(&identity, &ww::keys::generate()?)?;
-        }
         let mut next = state.clone().unwrap_or(Receipt {
             version: 2,
             hashes: std::array::from_fn(|_| digest(b"")),
@@ -461,33 +543,84 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         if next.version == 1 && next.complete {
             next = migrate(&root, &next)?;
         }
-        next.previous = Some(next.hashes.clone());
+        // A guarded retry must reproduce the first intent byte-for-byte.
+        // Recomputing previous from an incomplete receipt changes that intent.
+        if next.complete {
+            next.previous = Some(next.hashes.clone());
+        }
         for (index, payload) in bytes.iter().enumerate() {
             next.hashes[index] = digest(payload);
         }
         next.complete = false;
-        durable::write_record(&root.join("installation.json"), &next.encode()?)?;
-        for index in 0..3 {
-            let path = root.join(SOFTWARE[index]);
-            if read_regular(&path)?.as_deref() != Some(bytes[index].as_slice()) {
-                atomic_write(&path, &bytes[index], index == 0)?;
+        if guarded {
+            for path in SOFTWARE {
+                std::fs::create_dir_all(root.join(path).parent().context("software parent")?)?;
             }
-        }
-        next.complete = true;
-        next.previous = None;
-        durable::write_record(&root.join("installation.json"), &next.encode()?)?;
-        if next.version == 1 {
-            let migrated = migrate(&root, &next)?;
-            durable::write_record(&root.join("installation.json"), &migrated.encode()?)?;
-        }
-        if let Some(release) = &release {
-            durable::write_record(
-                &root.join("installed-release.json"),
-                &serde_json::to_vec(&upgrade_cmd::InstalledRelease {
-                    version: 1,
-                    release: release.clone(),
-                })?,
-            )?;
+            let selected = selected.as_ref().context("guarded release proof missing")?;
+            let mut engine = ww::upgrade::Engine::from_lock(lock)?;
+            let repeated = if let Some(receipt) = state.as_ref().filter(|state| state.complete) {
+                engine.verify_complete_installation(&selected.generation, receipt)?
+            } else {
+                false
+            };
+            if repeated {
+                release = Some(engine.startup_state()?.native.transport_root);
+            } else {
+                let initialization =
+                    engine.prepare_initialization(&selected.generation, &next, &selected.trust)?;
+                if key.is_none() {
+                    ensure!(
+                        initialization.may_create_identity()?,
+                        "recorded installation identity is missing; restore the original identity"
+                    );
+                    persist_identity(&identity, &ww::keys::generate()?)?;
+                }
+                for index in 0..3 {
+                    let path = root.join(SOFTWARE[index]);
+                    if read_regular(&path)?.as_deref() != Some(bytes[index].as_slice()) {
+                        atomic_write(&path, &bytes[index], index == 0)?;
+                    }
+                }
+                // The incomplete receipt remains the startup fence until both
+                // FHS slots and the native/proof/locator tuple are durable.
+                for index in 1..3 {
+                    ensure!(
+                        read_regular(&root.join(SOFTWARE[index]))?.as_deref()
+                            == Some(bytes[index].as_slice()),
+                        "installed FHS differs from the authenticated initialization"
+                    );
+                }
+                next.complete = true;
+                next.previous = None;
+                initialization.finish(&next)?;
+            }
+        } else {
+            if key.is_none() {
+                persist_identity(&identity, &ww::keys::generate()?)?;
+            }
+            durable::write_record(&root.join("installation.json"), &next.encode()?)?;
+            for index in 0..3 {
+                let path = root.join(SOFTWARE[index]);
+                if read_regular(&path)?.as_deref() != Some(bytes[index].as_slice()) {
+                    atomic_write(&path, &bytes[index], index == 0)?;
+                }
+            }
+            next.complete = true;
+            next.previous = None;
+            durable::write_record(&root.join("installation.json"), &next.encode()?)?;
+            if next.version == 1 {
+                let migrated = migrate(&root, &next)?;
+                durable::write_record(&root.join("installation.json"), &migrated.encode()?)?;
+            }
+            if let Some(release) = &release {
+                durable::write_record(
+                    &root.join("installed-release.json"),
+                    &serde_json::to_vec(&upgrade_cmd::InstalledRelease {
+                        version: 1,
+                        release: release.clone(),
+                    })?,
+                )?;
+            }
         }
     }
     Report { version: 1, operation: "install", changed_paths, target: root, release, fhs: Some(FhsDigests {kernel_blake3: digest(&bytes[1]), status_blake3: digest(&bytes[2])}), previous_fhs: state.as_ref().map(FhsDigests::from), activation: false, check: args.check, recovery: None,
@@ -736,7 +869,17 @@ fn uninstall_with(
     ] {
         durable::read_record(&root.join(name))?;
     }
+    // The shared native owner validates guarded provenance and blocks starts
+    // before lifecycle commands can stop the owned service.
+    let removal = ww::upgrade::removal::prepare(lock, check)?;
     let service = remove_service(lock, check)?;
+    let _quiescent = if check {
+        None
+    } else {
+        removal
+            .map(ww::upgrade::removal::Removal::quiesce)
+            .transpose()?
+    };
     if !check {
         let _ = migrate(&root, &state)?;
         durable::write_record(&root.join("uninstalled-software.json"), &state.encode()?)?;
