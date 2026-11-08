@@ -19,7 +19,7 @@ use super::{startup, RunArgs};
 #[derive(Subcommand)]
 pub(super) enum StartupAction {
     /// Authorize exact startup inputs while the installation is stopped.
-    Admit(AdmitArgs),
+    Admit(Box<AdmitArgs>),
     /// Private, descriptor-bound static preparation protocol.
     #[command(hide = true)]
     Preflight {
@@ -70,11 +70,15 @@ impl StartupAction {
                         }
                     };
                     println!("{}", serde_json::to_string(&value)?);
-                } else if result.is_ok() {
-                    eprintln!(
-                        "Startup inputs {}. No service was started.",
-                        if args.check { "checked" } else { "admitted" }
-                    );
+                } else if let Ok(value) = &result {
+                    if value["kind"] == "recovered" {
+                        eprintln!("Recovered the recorded startup admission. Rerun to select new inputs. No service was started.");
+                    } else {
+                        eprintln!(
+                            "Startup inputs {}. No service was started.",
+                            if args.check { "checked" } else { "admitted" }
+                        );
+                    }
                 }
                 result.map(|_| ())
             }

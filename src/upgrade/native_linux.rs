@@ -4,6 +4,10 @@
 //! the engine, startup child, evidence protocol and disposable platform probes
 //! establish the entire transaction contract.
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "native_linux_acceptance.rs"]
+mod acceptance;
+
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fs::OpenOptions;
@@ -121,7 +125,8 @@ pub fn snapshot(home: &Path, deadline: Instant) -> Result<ServiceSnapshot> {
         return Ok(observe(home, deadline)?.snapshot);
     }
     ensure!(
-        string(&before.unit, "LoadState")? == "not-found"
+        string(&before.unit, "Id")? == UNIT
+            && string(&before.unit, "LoadState")? == "not-found"
             && string(&before.unit, "ActiveState")? == "inactive"
             && string(&before.unit, "SubState")? == "dead"
             && string(&before.unit, "FragmentPath")?.is_empty()
@@ -1473,6 +1478,8 @@ pub fn observe_execution(
         "managed Host changed during readiness exchange"
     );
     process.revalidate(deadline)?;
+    require_live_stream(&stream, deadline)?;
+    write_stream(&stream, &[0x06], deadline)?;
     Ok(LiveEvidence {
         process,
         response,
@@ -1604,6 +1611,35 @@ fn wait_stream(stream: &UnixStream, events: libc::c_short, deadline: Instant) ->
             );
             return Ok(());
         }
+    }
+}
+
+fn require_live_stream(stream: &UnixStream, deadline: Instant) -> Result<()> {
+    loop {
+        check_deadline(deadline)?;
+        let mut byte = 0u8;
+        // SAFETY: recv peeks one byte into a live writable buffer without
+        // blocking. The complete bounded response has already been consumed.
+        let count = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            ensure!(
+                error.kind() == std::io::ErrorKind::WouldBlock,
+                "native evidence connection failed before acknowledgement: {error}"
+            );
+            return Ok(());
+        }
+        anyhow::bail!("native evidence peer closed or sent extra data before acknowledgement");
     }
 }
 
@@ -1751,6 +1787,7 @@ fn launch_preflight(
             );
             executable.revalidate(deadline)?;
             pinned.revalidate(deadline)?;
+            require_live_stream(&parent, deadline)?;
             write_stream(&parent, &[0x06], deadline)?;
             loop {
                 check_deadline(deadline)?;
@@ -1901,6 +1938,19 @@ mod tests {
         let start = Instant::now();
         assert!(read_stream(&parent, &mut [0; 2], start + Duration::from_millis(35)).is_err());
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn completed_response_requires_a_live_silent_peer_until_ack() {
+        let (parent, mut child) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(require_live_stream(&parent, deadline).is_ok());
+        child.write_all(&[1]).unwrap();
+        assert!(require_live_stream(&parent, deadline).is_err());
+        parent.set_nonblocking(true).unwrap();
+        read_stream(&parent, &mut [0; 1], deadline).unwrap();
+        drop(child);
+        assert!(require_live_stream(&parent, deadline).is_err());
     }
 
     #[test]

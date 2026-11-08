@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import os
+import socket
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -101,6 +102,26 @@ class Inputs(unittest.TestCase):
 
 
 class Commands(unittest.TestCase):
+    def test_reply_acknowledgement_requires_live_peer_without_extra_bytes(self):
+        for state in ("live", "closed", "extra"):
+            with self.subTest(state=state):
+                # Create and close both descriptors explicitly for each case.
+                left, right = socket.socketpair()
+                try:
+                    if state == "closed":
+                        right.close()
+                    elif state == "extra":
+                        right.sendall(b"unexpected")
+                    if state == "live":
+                        MODULE.acknowledge_live_reply(left)
+                        self.assertEqual(right.recv(1), b"\x06")
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "closed or sent extra"):
+                            MODULE.acknowledge_live_reply(left)
+                finally:
+                    left.close()
+                    right.close()
+
     def test_command_failure_and_output_overflow_preserve_non_success_ledger(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

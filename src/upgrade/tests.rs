@@ -21,6 +21,8 @@ struct FakeService {
     pending_before_restart: Option<StartupIdentity>,
     pending_in_restart: bool,
     restart_failure: bool,
+    #[serde(skip)]
+    interrupt_guarded_restart: bool,
     readiness_timeout: bool,
     wrong_running_artifact: bool,
     not_ready: bool,
@@ -59,6 +61,7 @@ impl FakeService {
             pending_before_restart: None,
             pending_in_restart: false,
             restart_failure: false,
+            interrupt_guarded_restart: false,
             readiness_timeout: false,
             wrong_running_artifact: false,
             not_ready: false,
@@ -175,6 +178,10 @@ impl ServiceControl for FakeService {
         executable: &attestation::VerifiedExecutable,
         deadline: Instant,
     ) -> Result<service::RunningEvidence> {
+        assert!(
+            !self.interrupt_guarded_restart,
+            "simulated interruption after runnable permit publication"
+        );
         self.restarts += 1;
         self.revalidate_restart(admission, deadline)?;
         ensure!(!self.restart_failure, "manager restart failed");
@@ -2307,6 +2314,11 @@ fn prepare_native_crash(running: bool, action: &str) -> tempfile::TempDir {
 
 #[test]
 fn native_v2_process_exit_at_every_upgrade_rollback_and_recovery_boundary() {
+    // Cargo can replace the shared test binary while another focused test builds.
+    // Every crash worker must execute this matrix's immutable binary snapshot.
+    let worker_directory = tempfile::tempdir().unwrap();
+    let worker_executable = worker_directory.path().join("native-v2-worker");
+    std::fs::copy(std::env::current_exe().unwrap(), &worker_executable).unwrap();
     for running in [false, true] {
         for action in ["upgrade", "second", "rollback", "recover"] {
             let baseline = prepare_native_crash(running, action);
@@ -2319,7 +2331,7 @@ fn native_v2_process_exit_at_every_upgrade_rollback_and_recovery_boundary() {
             );
             for (index, label) in trace.iter().enumerate() {
                 let home = prepare_native_crash(running, action);
-                let status = Command::new(std::env::current_exe().unwrap())
+                let status = Command::new(&worker_executable)
                     .args([
                         "--exact",
                         "upgrade::tests::native_v2_crash_worker",
@@ -2382,15 +2394,14 @@ fn native_v2_pending_child_rereads_current_trust_but_restored_before_uses_exact_
     storage::faults::configure(None);
     let (home, mut engine, current, inputs, mut service) = native_fixture(true);
     let original = engine.startup_contract().unwrap().unwrap();
-    service.restart_failure = true;
-    assert!(engine
-        .operator_upgrade(&mut service, TIMEOUT, || Ok(native_request(
-            current,
-            inputs.clone(),
-            NEW,
-            2
-        )))
-        .is_err());
+    service.interrupt_guarded_restart = true;
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(native_request(current, inputs.clone(), NEW, 2))
+        })
+    }))
+    .is_err());
+    service.interrupt_guarded_restart = false;
     {
         let lease = startup::StartupLease::shared(home.path()).unwrap();
         assert!(
@@ -2569,5 +2580,208 @@ fn initialization_process_exit_at_every_owner_boundary_resumes_exact_unbound_gen
     eprintln!(
         "initialization owner: {} real process-exit checkpoints",
         trace.len()
+    );
+}
+
+#[test]
+fn legacy_postreplacement_requires_exact_independent_evidence_and_stays_stopped_without_guard_authority(
+) {
+    storage::faults::configure(None);
+    let home = fixture();
+    let mut engine = open(home.path());
+    let previous = signed_generation(OLD, 1);
+    let candidate = signed_generation(NEW, 2);
+    let receipt = Receipt::load(&home.path().join(".ww")).unwrap();
+    storage::stage(
+        Cursor::new(OLD),
+        &engine.paths.artifact(previous.artifact()),
+        previous.artifact(),
+    )
+    .unwrap();
+    storage::stage(
+        Cursor::new(NEW),
+        &engine.paths.artifact(candidate.artifact()),
+        candidate.artifact(),
+    )
+    .unwrap();
+    std::fs::write(&engine.paths.executable, NEW).unwrap();
+    let journal = Journal {
+        version: 1,
+        operation: Operation::Upgrade,
+        phase: Phase::Installed,
+        previous: previous.selection().clone().into(),
+        candidate: candidate.selection().clone().into(),
+        before: FakeService::absent().snapshot,
+        admission: None,
+        receipt_before: receipt.encode().unwrap(),
+        receipt_after: Some(
+            receipt
+                .with_executable_digest(blake3::hash(NEW).to_hex().to_string())
+                .encode()
+                .unwrap(),
+        ),
+        retained_before: None,
+    };
+    storage::write_record(
+        &engine.paths.journal,
+        &serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+    let mut service = FakeService::absent();
+    assert!(engine
+        .recover_before(&mut service, Instant::now() + TIMEOUT)
+        .is_err());
+    assert!(engine
+        .recover_authenticated_without_preparation_until(
+            &mut service,
+            Instant::now() + TIMEOUT,
+            &candidate
+        )
+        .is_err());
+    assert!(matches!(
+        engine
+            .recover_authenticated_without_preparation_until(
+                &mut service,
+                Instant::now() + TIMEOUT,
+                &previous
+            )
+            .unwrap(),
+        Some(Outcome::Recovered {
+            action: RecoveryAction::RestoredPrevious,
+            live_ready: false,
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+    assert_eq!(
+        Receipt::load(&home.path().join(".ww"))
+            .unwrap()
+            .encode()
+            .unwrap(),
+        receipt.encode().unwrap()
+    );
+    assert!(!startup::metadata_present(home.path()).unwrap());
+    assert!(!engine.paths.locator.exists());
+    assert!(!engine.paths.journal.exists());
+    assert_eq!(
+        (service.stops, service.restarts, service.effects),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn native_v2_failed_readiness_and_wrong_binary_are_blocked_and_contained_within_caller_deadline() {
+    for failure in ["unready", "wrong-binary", "timeout"] {
+        storage::faults::configure(None);
+        let (home, mut engine, current, inputs, mut service) = native_fixture(true);
+        match failure {
+            "unready" => service.not_ready = true,
+            "wrong-binary" => service.wrong_running_artifact = true,
+            _ => service.readiness_timeout = true,
+        }
+        assert!(engine
+            .operator_upgrade(&mut service, TIMEOUT, || Ok(native_request(
+                current,
+                inputs.clone(),
+                NEW,
+                2
+            )))
+            .is_err());
+        assert_eq!(service.snapshot.running, RunningState::Stopped, "{failure}");
+        let lease = startup::StartupLease::shared(home.path()).unwrap();
+        assert_eq!(
+            lease.read_state().unwrap().unwrap().disposition,
+            startup::StartupDisposition::Blocked
+        );
+        drop(lease);
+        assert!(engine.paths.journal.exists());
+        service.not_ready = false;
+        service.wrong_running_artifact = false;
+        service.readiness_timeout = false;
+        engine
+            .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+            .unwrap();
+        assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+        assert!(!engine.paths.journal.exists());
+    }
+}
+
+#[test]
+fn native_v2_expired_commit_budget_keeps_journal_and_does_not_claim_containment() {
+    storage::faults::configure(None);
+    let (_baseline, mut owner, current, inputs, mut service) = native_fixture(true);
+    storage::faults::configure(None);
+    owner
+        .operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(native_request(current, inputs, NEW, 2))
+        })
+        .unwrap();
+    let trace = storage::faults::trace();
+    let point = trace
+        .iter()
+        .position(|s| s == "native.phase.Verified")
+        .unwrap()
+        + 1;
+    storage::faults::configure(None);
+    let (home, mut engine, current, inputs, mut service) = native_fixture(true);
+    let receipt_before = std::fs::read(&engine.paths.receipt).unwrap();
+    storage::faults::advance_clock_at(point);
+    let error = engine
+        .operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(native_request(current, inputs.clone(), NEW, 2))
+        })
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("containment is unconfirmed"));
+    assert_eq!(
+        std::fs::read(&engine.paths.receipt).unwrap(),
+        receipt_before
+    );
+    assert!(engine.paths.journal.exists());
+    assert!(matches!(
+        service.snapshot.running,
+        RunningState::Running { .. }
+    ));
+    storage::faults::configure(None);
+    let lease = startup::StartupLease::shared(home.path()).unwrap();
+    assert_eq!(
+        lease.read_state().unwrap().unwrap().disposition,
+        startup::StartupDisposition::Blocked
+    );
+    drop(lease);
+    engine
+        .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        .unwrap();
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+}
+
+#[test]
+fn native_v2_manual_instance_blocks_replacement_until_explicit_exit() {
+    storage::faults::configure(None);
+    let (home, mut engine, current, inputs, mut service) = native_fixture(false);
+    let process = startup::InstanceLease::shared(home.path()).unwrap();
+    assert!(engine
+        .operator_upgrade(&mut service, TIMEOUT, || Ok(native_request(
+            current,
+            inputs.clone(),
+            NEW,
+            2
+        )))
+        .is_err());
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+    assert!(engine.paths.journal.exists());
+    assert!(engine
+        .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        .is_err());
+    drop(process);
+    engine
+        .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        .unwrap();
+    assert_eq!(
+        engine.current_generation().unwrap().record(),
+        signed_generation(OLD, 1).record()
+    );
+    assert_eq!(
+        (service.stops, service.restarts, service.effects),
+        (0, 0, 0)
     );
 }

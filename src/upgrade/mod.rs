@@ -279,7 +279,7 @@ impl Engine {
     /// in-flight filesystem operation. Once a commit is admitted, required
     /// durability work and terminal cleanup complete even if the budget expires.
     #[cfg(test)]
-    pub(crate) fn legacy_operator_upgrade<R: Read>(
+    fn legacy_operator_upgrade<R: Read>(
         &mut self,
         service: &mut impl ServiceControl,
         timeout: Duration,
@@ -289,7 +289,7 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn legacy_operator_upgrade_until<R: Read>(
+    fn legacy_operator_upgrade_until<R: Read>(
         &mut self,
         service: &mut impl ServiceControl,
         deadline: Instant,
@@ -315,7 +315,7 @@ impl Engine {
     /// Select only the previous authenticated artifact retained by this owner.
     /// No release discovery, freshness watermark, or deployment head is changed.
     #[cfg(test)]
-    pub(crate) fn legacy_operator_rollback(
+    fn legacy_operator_rollback(
         &mut self,
         service: &mut impl ServiceControl,
         timeout: Duration,
@@ -324,7 +324,7 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn legacy_operator_rollback_until(
+    fn legacy_operator_rollback_until(
         &mut self,
         service: &mut impl ServiceControl,
         deadline: Instant,
@@ -355,7 +355,7 @@ impl Engine {
 
     /// Recover the recorded operation without selecting another release.
     #[cfg(test)]
-    pub(crate) fn legacy_recover(
+    fn legacy_recover(
         &mut self,
         service: &mut impl ServiceControl,
         timeout: Duration,
@@ -364,7 +364,7 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn legacy_recover_before(
+    fn legacy_recover_before(
         &mut self,
         service: &mut impl ServiceControl,
         deadline: Instant,
@@ -400,7 +400,7 @@ impl Engine {
     /// The caller must verify that its running recovery executable has the exact
     /// selected bytes. A local journal supplies scope, never release authority.
     #[cfg(test)]
-    pub(crate) fn legacy_recover_authenticated(
+    fn legacy_recover_authenticated(
         &mut self,
         service: &mut impl ServiceControl,
         timeout: Duration,
@@ -410,7 +410,7 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn legacy_recover_authenticated_until(
+    fn legacy_recover_authenticated_until(
         &mut self,
         service: &mut impl ServiceControl,
         deadline: Instant,

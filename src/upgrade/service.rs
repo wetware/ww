@@ -332,7 +332,9 @@ impl RunningEvidence {
         self.process.validate()?;
         ensure!(
             self.process != admission.original_process
-                && self.process.launch_nonce != admission.original_process.launch_nonce,
+                && self.process.launch_nonce != admission.original_process.launch_nonce
+                && self.process.manager_invocation_id
+                    != admission.original_process.manager_invocation_id,
             "restart did not establish a fresh admitted execution"
         );
         ensure!(
@@ -442,6 +444,7 @@ pub trait ServiceControl {
 
 const MAX_OBSERVATION_BYTES: usize = 64 * 1024;
 const MAX_IDENTITY_BYTES: usize = 4096;
+#[cfg(test)]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl StartupIdentity {
@@ -753,6 +756,10 @@ fn launchd_snapshot(print: &str, enabled: &str, definition: &[u8]) -> Result<Ser
 
 /// Read-only native adapter. Candidate compatibility, exact process identity,
 /// and startup admission remain production integration gates.
+// Remains false until the full disposable native upgrade acceptance passes.
+// No environment variable or command-line option can bypass this gate.
+const NATIVE_LINUX_QUALIFIED: bool = false;
+
 pub struct NativeService {
     home: PathBuf,
 }
@@ -766,7 +773,82 @@ impl NativeService {
 }
 
 impl ServiceControl for NativeService {
+    fn admit_restart(
+        &mut self,
+        before: &ServiceSnapshot,
+        contract: &super::startup::StartupContractV1,
+        expected: &super::attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<RestartAdmission> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native live admission is not qualified"
+        );
+        super::native_linux::admit_restart(&self.home, before, contract, expected, deadline)
+    }
+    fn revalidate_restart(
+        &mut self,
+        admission: &RestartAdmission,
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native live admission revalidation is not qualified"
+        );
+        super::native_linux::revalidate_restart(&self.home, admission, deadline)
+    }
+    fn quiesce(
+        &mut self,
+        intent: &ServiceDisposition,
+        deadline: Instant,
+    ) -> Result<ServiceDisposition> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native quiescence is not qualified"
+        );
+        super::native_linux::quiesce(&self.home, intent, deadline)
+    }
+    fn restart(
+        &mut self,
+        admission: &RestartAdmission,
+        permit: &super::StartupPermit,
+        expected: &super::attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<RunningEvidence> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native guarded restart is not qualified"
+        );
+        super::native_linux::restart(&self.home, admission, permit, expected, deadline)
+    }
+    fn revalidate_running(
+        &mut self,
+        evidence: &RunningEvidence,
+        permit: &super::StartupPermit,
+        expected: &super::attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native live evidence revalidation is not qualified"
+        );
+        super::native_linux::revalidate_running(&self.home, evidence, permit, expected, deadline)
+    }
+    fn stop(
+        &mut self,
+        expected: &super::startup::ServiceIdentity,
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native service containment is not qualified"
+        );
+        super::native_linux::stop(&self.home, expected, deadline)
+    }
     fn snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot> {
+        if NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux") {
+            return super::native_linux::snapshot(&self.home, deadline);
+        }
         if cfg!(target_os = "linux") {
             let show = observe_until("/usr/bin/systemctl", &[
                 "--user", "show", "ww.service", "--no-pager",
@@ -890,11 +972,15 @@ impl ServiceControl for NativeService {
 
     fn compatible(
         &mut self,
-        _executable: &super::attestation::VerifiedExecutable,
-        _inputs: &super::inputs::PreflightInputs,
-        _deadline: Instant,
+        executable: &super::attestation::VerifiedExecutable,
+        inputs: &super::inputs::PreflightInputs,
+        deadline: Instant,
     ) -> Result<CompatibilityEvidence> {
-        bail!("descriptor-bound native compatibility is not qualified")
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "descriptor-bound native compatibility is not qualified"
+        );
+        super::native_linux::compatible(executable, inputs, deadline)
     }
 
     #[cfg(test)]
@@ -914,6 +1000,7 @@ pub(super) struct Observation {
     pub(super) stderr: String,
 }
 
+#[cfg(test)]
 fn observe(program: &str, args: &[&str], timeout: Duration) -> Result<Observation> {
     ensure!(
         !timeout.is_zero(),

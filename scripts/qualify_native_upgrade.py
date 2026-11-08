@@ -242,6 +242,30 @@ def recv_exact(stream, size):
     return bytes(chunks)
 
 
+def acknowledge_live_reply(stream):
+    # The Host keeps this CLOEXEC socket open until acknowledgement. EOF or
+    # extra bytes invalidate the reply before the verifier releases the Host.
+    stream.setblocking(False)
+    try:
+        stream.recv(1, socket.MSG_PEEK)
+    except BlockingIOError:
+        stream.sendall(b"\x06")
+    else:
+        raise RuntimeError("readiness peer closed or sent extra data before acknowledgement")
+
+
+def manager_process(runner, name):
+    output = runner.run(name, ["/usr/bin/systemctl", "--user", "show", "ww.service",
+                               "--property=MainPID", "--property=InvocationID"])
+    values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    require(set(values) == {"MainPID", "InvocationID"}
+            and re.fullmatch(r"[0-9a-f]{32}", values["InvocationID"]),
+            "manager did not identify a service invocation")
+    pid = int(values["MainPID"])
+    require(pid > 0, "service has no main process")
+    return pid, values["InvocationID"]
+
+
 @contextmanager
 def pinned_pid(pid):
     descriptor = os.pidfd_open(pid, 0)
@@ -260,8 +284,7 @@ def readiness(runner, state, name):
     last_error = "no running process"
     while time.monotonic() < deadline:
         try:
-            pid = int(runner.run(name + "-pid", ["/usr/bin/systemctl", "--user", "show", "ww.service", "--property=MainPID", "--value"]).strip())
-            require(pid > 0, "service has no main process")
+            pid, invocation = manager_process(runner, name + "-process")
             with pinned_pid(pid):
                 token = process_token(pid)
                 expected = state["native"]["artifact"]["digest"]
@@ -282,14 +305,19 @@ def readiness(runner, state, name):
                     length = int.from_bytes(recv_exact(stream, 4), "big")
                     require(0 < length <= MAX_RECORD, "readiness reply exceeds bound")
                     response = json.loads(recv_exact(stream, length))
-                require(response["version"] == 1 and response["nonce"] == nonce
-                        and response["artifact"] == state["native"]["artifact"], "readiness reply identifies another request or artifact")
-                require(response["contract"] == state["disposition"]["contract"], "readiness contract differs from committed state")
-                require(process_token(pid) == token and sha256(Path(f"/proc/{pid}/exe")) == expected,
-                        "process changed across readiness observation")
-                require(response["serving_ready"] and response["effective_root"]
-                        and response["kernel_source"] and response["kernel_runtime"], "Host is not serving ready")
-                runner.save(name + "-readiness.json", {"pid": pid, "process_start": token, "response": response})
+                    require(response["version"] == 1 and response["nonce"] == nonce
+                            and response["artifact"] == state["native"]["artifact"], "readiness reply identifies another request or artifact")
+                    require(response["contract"] == state["disposition"]["contract"], "readiness contract differs from committed state")
+                    require(process_token(pid) == token and sha256(Path(f"/proc/{pid}/exe")) == expected,
+                            "process changed across readiness observation")
+                    require(manager_process(runner, name + "-process-after") == (pid, invocation),
+                            "manager invocation changed across readiness observation")
+                    require(response["serving_ready"] and response["effective_root"]
+                            and response["kernel_source"] and response["kernel_runtime"], "Host is not serving ready")
+                    require(time.monotonic() < deadline, "readiness deadline expired before acknowledgement")
+                    acknowledge_live_reply(stream)
+                runner.save(name + "-readiness.json", {"pid": pid, "invocation": invocation,
+                                                       "process_start": token, "response": response})
                 return response
         except (RuntimeError, OSError, KeyError, ValueError) as error:
             last_error = str(error)
@@ -383,7 +411,8 @@ def main():
         finally:
             report["executed_checks"] = len(report["checks"])
             runner.save("report.json", report)
+    return 0 if report["status"] == "PASS" else 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

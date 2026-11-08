@@ -934,7 +934,14 @@ mod tests {
             std::fs::create_dir_all(root.join("bin")).unwrap();
             std::fs::write(root.join("identity"), b"preserved").unwrap();
             if malformed_journal {
-                std::fs::write(root.join("host-upgrade.json"), b"invalid journal").unwrap();
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut journal = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(root.join("host-upgrade.json"))
+                    .unwrap();
+                std::io::Write::write_all(&mut journal, b"invalid journal").unwrap();
             }
             let args = UpgradeArgs {
                 release: args(&fixture, &server, home.path()),
@@ -945,11 +952,14 @@ mod tests {
                 json: false,
             };
             let error = execute_at(&args, home.path()).await.err().unwrap();
-            assert!(error.to_string().contains(if malformed_journal {
-                "invalid Host transaction journal"
-            } else {
-                "no pending Host transaction"
-            }));
+            assert!(
+                error.to_string().contains(if malformed_journal {
+                    "invalid Host transaction journal"
+                } else {
+                    "no pending Host transaction"
+                }),
+                "{error:#}"
+            );
             assert!(server.requests.lock().unwrap().is_empty());
             assert_eq!(std::fs::read(root.join("identity")).unwrap(), b"preserved");
             assert!(!root.join("installation.json").exists());

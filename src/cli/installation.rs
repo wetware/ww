@@ -636,8 +636,28 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
             }
         }
     }
-    Report { version: 1, operation: "install", changed_paths, target: root, release, fhs: Some(FhsDigests {kernel_blake3: digest(&bytes[1]), status_blake3: digest(&bytes[2])}), previous_fhs: state.as_ref().map(FhsDigests::from), activation: false, check: args.check, recovery: None,
-        warnings: vec!["Host, baseline FHS, and identity only. Register a daemon separately with ww daemon install.".into()], service: None }.print(args.json)
+    let mut warnings = vec!["Host, baseline FHS, and identity only. Register a daemon separately with ww daemon install.".into()];
+    if guarded {
+        warnings.push("Guarded startup requires admitted inputs. Use ww startup admit --timeout-secs N service or ww startup admit --timeout-secs N run [RUN_OPTIONS]. Exact repeat installation preserves existing admission.".into());
+    }
+    Report {
+        version: 1,
+        operation: "install",
+        changed_paths,
+        target: root,
+        release,
+        fhs: Some(FhsDigests {
+            kernel_blake3: digest(&bytes[1]),
+            status_blake3: digest(&bytes[2]),
+        }),
+        previous_fhs: state.as_ref().map(FhsDigests::from),
+        activation: false,
+        check: args.check,
+        recovery: None,
+        warnings,
+        service: None,
+    }
+    .print(args.json)
 }
 
 fn service_path(home: &Path) -> PathBuf {
@@ -767,6 +787,9 @@ pub(super) async fn image_update(args: UpdateArgs) -> Result<()> {
     after.previous = None;
     let changed = before.hashes[1..3] != after.hashes[1..3];
     let mut warnings = vec!["Baseline only; the Host was not restarted. Activation requires an explicit later start or restart.".into()];
+    if changed && ww::upgrade::startup::metadata_present(&home)? {
+        warnings.push("The changed baseline invalidates the admitted next-start inputs. Stop the Host and run ww startup admit --timeout-secs N with the intended invocation before starting again.".into());
+    }
     if root.join("etc/ns").is_dir() {
         for entry in std::fs::read_dir(root.join("etc/ns"))? {
             let path = entry?.path();

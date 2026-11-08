@@ -443,9 +443,11 @@ pub(super) async fn daemon_install(run: super::RunArgs, check: bool, json: bool)
         platform,
         home: home.clone(),
     };
+    let startup_admission = ww::upgrade::startup::metadata_present(&home)?
+        .then_some("ww startup admit --timeout-secs N service");
     let changed = install_locked(&lock, platform, definition.as_bytes(), check, &mut manager)?;
     let observed = manager.snapshot()?;
-    let report = serde_json::json!({"version":1,"operation":"daemon install","changed":changed,"checked":check,"path":platform.path(&home),"activation":false,"definition_present":read_file(&home, &platform.path(&home))?.is_some(),"loaded":observed.registered,"running":observed.running,"enabled":observed.enabled});
+    let report = serde_json::json!({"version":1,"operation":"daemon install","changed":changed,"checked":check,"path":platform.path(&home),"activation":false,"definition_present":read_file(&home, &platform.path(&home))?.is_some(),"loaded":observed.registered,"running":observed.running,"enabled":observed.enabled,"startup_admission":startup_admission});
     if json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
@@ -460,6 +462,9 @@ pub(super) async fn daemon_install(run: super::RunArgs, check: bool, json: bool)
             },
             platform.path(&home).display()
         );
+        if let Some(command) = startup_admission {
+            eprintln!("Before first start, admit the stopped service: {command}");
+        }
         eprintln!("Service start and login activation require an explicit native service command.");
     }
     Ok(())

@@ -1,7 +1,8 @@
 //! Capture startup inputs before admission, then consume the same capture.
 
+#[cfg(any(target_os = "linux", test))]
+use std::collections::BTreeMap;
 use std::{
-    collections::BTreeMap,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -169,6 +170,7 @@ pub(super) struct InvocationContext {
 }
 
 impl InvocationContext {
+    #[cfg(any(target_os = "linux", test))]
     pub fn service(
         cwd: PathBuf,
         home: PathBuf,
@@ -355,6 +357,7 @@ pub(super) fn normalize_with_context(
 
 /// Parse the manager's actual argv and consumed environment. Clap's ambient
 /// environment lookup is disabled; the caller's shell cannot fill missing values.
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn normalize_service_run(
     argv: &[String],
     environment: &BTreeMap<String, String>,
@@ -568,6 +571,79 @@ fn classify_guarded_home(executable: &Path, argv0: &Path, cwd: &Path) -> Result<
     Ok(Some(home.to_owned()))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn owned_service_cgroup(bytes: &[u8]) -> Result<bool> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= 65_536 && bytes.ends_with(b"\n"),
+        "cgroup evidence is empty, incomplete, or exceeds its bound"
+    );
+    let text = std::str::from_utf8(bytes).context("cgroup evidence is not UTF-8")?;
+    let mut hierarchies = std::collections::BTreeSet::new();
+    let mut owned = false;
+    for (index, line) in text.split_terminator('\n').enumerate() {
+        ensure!(index < 256, "cgroup evidence exceeds its record bound");
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next().context("cgroup hierarchy is missing")?;
+        let controllers = fields.next().context("cgroup controllers are missing")?;
+        let path = fields.next().context("cgroup path is missing")?;
+        let number: u32 = hierarchy.parse().context("invalid cgroup hierarchy")?;
+        ensure!(
+            number.to_string() == hierarchy && hierarchies.insert(number),
+            "cgroup hierarchy is noncanonical or repeated"
+        );
+        ensure!(
+            (number == 0 && controllers.is_empty())
+                || (number != 0
+                    && controllers.split(',').all(|controller| {
+                        !controller.is_empty()
+                            && controller
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || b"_=.-".contains(&byte))
+                    })),
+            "invalid cgroup controllers"
+        );
+        ensure!(
+            path.starts_with('/') && !path.bytes().any(|byte| byte.is_ascii_control()),
+            "cgroup path is not an absolute kernel path"
+        );
+        if path != "/" {
+            for component in path[1..].split('/') {
+                ensure!(
+                    !component.is_empty() && component != "." && component != "..",
+                    "cgroup path contains an ambiguous component"
+                );
+                owned |= component == "ww.service";
+            }
+        }
+    }
+    Ok(owned)
+}
+
+#[cfg(target_os = "linux")]
+fn read_owned_service_cgroup() -> Result<bool> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open("/proc/self/cgroup")
+        .context("standalone startup cannot read kernel cgroup evidence")?;
+    let mut bytes = Vec::new();
+    file.take(65_537)
+        .read_to_end(&mut bytes)
+        .context("standalone startup cannot read complete cgroup evidence")?;
+    owned_service_cgroup(&bytes).context("standalone startup lacks valid kernel cgroup evidence")
+}
+
+#[cfg(target_os = "linux")]
+fn validate_standalone_cgroup() -> Result<()> {
+    ensure!(
+        !read_owned_service_cgroup()?,
+        "standalone startup contract cannot authorize ww.service; admit the service invocation"
+    );
+    Ok(())
+}
+
 impl GuardedStartup {
     pub fn open(config: &EffectiveRunConfig) -> Result<Option<Self>> {
         let executable = std::env::current_exe().context("identify executing Host path")?;
@@ -627,6 +703,10 @@ impl GuardedStartup {
         let contract = startup
             .read_contract()?
             .context("required startup contract is missing")?;
+        #[cfg(target_os = "linux")]
+        if matches!(contract.invocation, InvocationBinding::Standalone) {
+            validate_standalone_cgroup()?;
+        }
         if let InvocationBinding::Managed { service } = &contract.invocation {
             #[cfg(target_os = "linux")]
             ww::upgrade::native_linux::validate_managed_start(
@@ -694,6 +774,10 @@ impl GuardedStartup {
                 &current == expected,
                 "transaction launch permit changed during source capture"
             );
+        }
+        #[cfg(target_os = "linux")]
+        if matches!(self.contract.invocation, InvocationBinding::Standalone) {
+            validate_standalone_cgroup()?;
         }
         if let InvocationBinding::Managed { service } = &self.contract.invocation {
             #[cfg(target_os = "linux")]
@@ -801,8 +885,12 @@ impl ReadinessService {
             stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
             "readiness peer has another owner"
         );
-        let challenge: ReadinessChallenge = tokio::time::timeout(Duration::from_secs(30), read_frame(&mut stream, MAX_NATIVE_RESPONSE_BYTES))
-            .await.context("readiness challenge frame deadline expired")??;
+        let challenge: ReadinessChallenge = tokio::time::timeout(
+            Duration::from_secs(30),
+            read_frame(&mut stream, MAX_NATIVE_RESPONSE_BYTES),
+        )
+        .await
+        .context("readiness challenge frame deadline expired")??;
         ensure!(
             challenge.version == NATIVE_PROTOCOL_VERSION && challenge.nonce != [0; 32],
             "invalid readiness challenge"
@@ -813,12 +901,16 @@ impl ReadinessService {
                 .is_none_or(|nonce| nonce == self.startup.launch_nonce),
             "readiness launch nonce changed"
         );
-        ensure!(challenge.timeout_millis > 0, "readiness request budget must be positive");
-        let deadline = Instant::now() + Duration::from_millis(challenge.timeout_millis.min(300_000));
-        self.startup
-            .process
-            .revalidate(deadline)?;
-        let current = self.identity.ready_snapshot(&self.ready, self.routes.as_ref());
+        ensure!(
+            challenge.timeout_millis > 0,
+            "readiness request budget must be positive"
+        );
+        let deadline =
+            Instant::now() + Duration::from_millis(challenge.timeout_millis.min(300_000));
+        self.startup.process.revalidate(deadline)?;
+        let current = self
+            .identity
+            .ready_snapshot(&self.ready, self.routes.as_ref());
         let response = ReadinessResponse {
             version: NATIVE_PROTOCOL_VERSION,
             nonce: challenge.nonce,
@@ -838,14 +930,25 @@ impl ReadinessService {
             artifact: self.startup.contract.artifact.clone(),
             startup: self.startup.contract.startup.clone(),
             serving_ready: current.is_some(),
-            epoch_seq: current.as_ref().map(|identity| identity.epoch_seq).unwrap_or(0),
-            effective_root: current.as_ref().map(|identity| identity.effective_root.to_string()).unwrap_or_default(),
-            kernel_source: current.as_ref().map(|identity| identity.content.source.clone()).unwrap_or_default(),
-            kernel_runtime: current.as_ref().map(|identity| identity.content.cid.clone()).unwrap_or_default(),
+            epoch_seq: current
+                .as_ref()
+                .map(|identity| identity.epoch_seq)
+                .unwrap_or(0),
+            effective_root: current
+                .as_ref()
+                .map(|identity| identity.effective_root.to_string())
+                .unwrap_or_default(),
+            kernel_source: current
+                .as_ref()
+                .map(|identity| identity.content.source.clone())
+                .unwrap_or_default(),
+            kernel_runtime: current
+                .as_ref()
+                .map(|identity| identity.content.cid.clone())
+                .unwrap_or_default(),
             kernel_source_cid: current.and_then(|identity| identity.content.source_cid),
         };
-        tokio::time::timeout_at(deadline.into(), write_frame(&mut stream, &response, MAX_NATIVE_RESPONSE_BYTES)).await
-            .context("readiness reply deadline expired")?
+        reply_until_ack(&mut stream, &response, MAX_NATIVE_RESPONSE_BYTES, deadline).await
     }
 }
 
@@ -861,8 +964,9 @@ impl ww::services::Service for ReadinessService {
                     _ = shutdown.changed() => return Ok(()),
                     accepted = listener.accept() => {
                         let (stream, _) = accepted?;
-                        // A malformed request or a not-ready generation closes
-                        // only that connection. Neither condition stops Host.
+                        // Protocol failures close only this connection. An
+                        // unready generation still identifies its admitted
+                        // execution so recovery can quiesce that exact process.
                         tokio::select! {
                             _ = shutdown.changed() => return Ok(()),
                             _ = self.respond(stream) => {},
@@ -1049,6 +1153,28 @@ async fn write_frame(
     Ok(())
 }
 
+async fn reply_until_ack(
+    stream: &mut tokio::net::UnixStream,
+    response: &impl serde::Serialize,
+    maximum: usize,
+    deadline: Instant,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout_at(deadline.into(), async {
+        write_frame(stream, response, maximum).await?;
+        // Keep this CLOEXEC connection alive through the parent's final
+        // independent observations. EOF after a same-process exec must be
+        // distinguishable from a completed response.
+        ensure!(
+            stream.read_u8().await? == 0x06,
+            "invalid native protocol acknowledgement"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("native reply/acknowledgement deadline expired")?
+}
+
 fn inherited_private_stream(fd: i32) -> Result<tokio::net::UnixStream> {
     use std::os::fd::{AsRawFd, FromRawFd};
     ensure!(
@@ -1126,7 +1252,6 @@ fn inherited_private_stream(fd: i32) -> Result<tokio::net::UnixStream> {
 /// A private preflight child performs the production static preparation path.
 /// The child neither starts guests nor claims independent release authority.
 pub(super) async fn native_preflight(fd: i32) -> Result<()> {
-    use tokio::io::AsyncReadExt;
     use ww::upgrade::inputs::*;
     let mut stream = inherited_private_stream(fd)?;
     let request: PreflightRequest = tokio::time::timeout(
@@ -1164,18 +1289,7 @@ pub(super) async fn native_preflight(fd: i32) -> Result<()> {
         capture_digest,
         prepared,
     };
-    tokio::time::timeout_at(deadline.into(), async {
-        write_frame(&mut stream, &response, MAX_NATIVE_RESPONSE_BYTES).await?;
-        // Keep the exact child alive while the parent independently verifies
-        // the held executable and process evidence. EOF is never success.
-        ensure!(
-            stream.read_u8().await? == 0x06,
-            "invalid preflight acknowledgement"
-        );
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("preflight acknowledgement deadline expired")??;
+    reply_until_ack(&mut stream, &response, MAX_NATIVE_RESPONSE_BYTES, deadline).await?;
     Ok(())
 }
 
@@ -1305,13 +1419,72 @@ async fn prepare_preflight(
 mod tests {
     use super::*;
 
+    #[test]
+    fn owned_service_cgroup_requires_exact_component_and_valid_kernel_records() {
+        // Captured from MainPID 230 in the disposable systemd 255 user manager.
+        let owned = b"0::/user.slice/user-1001.slice/user@1001.service/app.slice/ww.service\n";
+        assert!(owned_service_cgroup(owned).unwrap());
+        assert!(owned_service_cgroup(b"0::/app.slice/ww.service/child\n").unwrap());
+        assert!(owned_service_cgroup(b"7:name=systemd:/user.slice/ww.service\n").unwrap());
+        assert!(owned_service_cgroup(b"2:cpu,cpuacct:/\n7:name=systemd:/ww.service\n").unwrap());
+        for manual in [
+            "0::/\n",
+            "0::/init.scope\n",
+            "0::/user.slice/other-ww.service\n",
+            "0::/user.slice/ww.service-extra\n",
+            "4:cpu,cpuacct:/user.slice/manual.scope\n",
+        ] {
+            assert!(
+                !owned_service_cgroup(manual.as_bytes()).unwrap(),
+                "{manual}"
+            );
+        }
+        for malformed in [
+            "",
+            "0::/\n\n",
+            "0::relative\n",
+            "0::/app.slice//ww.service\n",
+            "0::/app.slice/../ww.service\n",
+            "0::/app.slice/./ww.service\n",
+            "0::/ww.service/\n",
+            "0:cpu:/\n",
+            "1::/\n",
+            "01:cpu:/\n",
+            "x:cpu:/\n",
+            "1:cpu,,io:/\n",
+            "0::/\n0::/ww.service\n",
+            "0::/ww.service\nmalformed\n",
+            "0::/ww.service\r\n",
+        ] {
+            assert!(
+                owned_service_cgroup(malformed.as_bytes()).is_err(),
+                "{malformed:?}"
+            );
+        }
+        assert!(owned_service_cgroup(&[0xff]).is_err());
+        assert!(owned_service_cgroup(&vec![b'x'; 65_537]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_linux_cgroup_is_readable_and_parser_matches_kernel_record() {
+        let bytes = std::fs::read("/proc/self/cgroup").unwrap();
+        assert_eq!(
+            read_owned_service_cgroup().unwrap(),
+            owned_service_cgroup(&bytes).unwrap()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires the explicit disposable systemd fixture; retains shared Kubo pins"]
     async fn export_disposable_native_preflight_inputs() {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        assert_eq!(std::env::var("WW739_DISPOSABLE_SYSTEMD").as_deref(), Ok("1"));
+        assert_eq!(
+            std::env::var("WW739_DISPOSABLE_SYSTEMD").as_deref(),
+            Ok("1")
+        );
         assert!(Path::new("/.dockerenv").is_file());
         // SAFETY: geteuid has no pointer arguments.
         assert_eq!(unsafe { libc::geteuid() }, 1001);
@@ -1323,12 +1496,54 @@ mod tests {
         inputs.validate().unwrap();
         let bytes = serde_json::to_vec(&inputs).unwrap();
         assert!(bytes.len() <= ww::upgrade::inputs::MAX_PREFLIGHT_REQUEST_BYTES);
-        let mut output = std::fs::OpenOptions::new().write(true).create_new(true)
-            .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(home.join("ww739-inputs.json")).unwrap();
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(home.join("ww739-inputs.json"))
+            .unwrap();
         output.write_all(&bytes).unwrap();
         output.sync_all().unwrap();
-        eprintln!("captured native inputs: {}", hex::encode(inputs.capture_digest().unwrap()));
+        eprintln!(
+            "captured native inputs: {}",
+            hex::encode(inputs.capture_digest().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn native_reply_retains_endpoint_until_ack_and_rejects_eof() {
+        use tokio::io::AsyncWriteExt;
+        for acknowledgement in [Some(0x06), Some(0xff), None] {
+            let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
+            let response = serde_json::json!({"nonce":"fresh-response"});
+            let task = tokio::spawn(async move {
+                reply_until_ack(
+                    &mut server,
+                    &response,
+                    1024,
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .await
+            });
+            let response: serde_json::Value = read_frame(&mut client, 1024).await.unwrap();
+            assert_eq!(response["nonce"], "fresh-response");
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "reply closed before the verifier's acknowledgement"
+            );
+            let mut extra = [0; 1];
+            assert_eq!(
+                client.try_read(&mut extra).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            if let Some(byte) = acknowledgement {
+                client.write_u8(byte).await.unwrap();
+            }
+            drop(client);
+            assert_eq!(task.await.unwrap().is_ok(), acknowledgement == Some(0x06));
+        }
     }
 
     #[tokio::test]

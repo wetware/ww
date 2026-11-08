@@ -420,7 +420,8 @@ impl Engine {
             "pending native work must recover before selecting a release"
         );
         let request = select()?;
-        self.start_native(service, deadline, request, false)
+        let result = self.start_native(service, deadline, request, false);
+        self.contain_native_failure(service, deadline, result)
     }
     pub fn check_upgrade_until<R: Read>(
         &mut self,
@@ -476,7 +477,7 @@ impl Engine {
         let current = authenticate_retained(&self.paths, &retained, &state.native)?;
         let candidate = authenticate_retained(&self.paths, &retained, previous)?;
         let bytes = storage::open_read(&self.paths.artifact(candidate.artifact()))?;
-        self.start_native(
+        let result = self.start_native(
             service,
             deadline,
             UpgradeRequest {
@@ -486,7 +487,8 @@ impl Engine {
                 inputs: inputs.clone(),
             },
             true,
-        )
+        );
+        self.contain_native_failure(service, deadline, result)
     }
     pub fn preparation_contract(&self) -> Result<StartupContractV1> {
         if let Some((j, _)) = read_native(&self.paths)? {
@@ -898,6 +900,13 @@ impl Engine {
                 deadline,
             )?;
         }
+        if !rollback {
+            current_independent_generation(
+                &self.paths,
+                &j.after.generation,
+                &j.after.contract.trusted_release_keys,
+            )?;
+        }
         j.phase(&self.paths, rollback, NativePhase::Committed)?;
         lease.write_state(&j.steady(&j.after))?;
         self.finish_native(&j, true)?;
@@ -942,6 +951,49 @@ impl Engine {
         check_deadline(deadline)?;
         Ok(evidence)
     }
+    fn contain_native_failure(
+        &self,
+        service: &mut impl ServiceControl,
+        deadline: Instant,
+        result: Result<Outcome>,
+    ) -> Result<Outcome> {
+        let Err(error) = result else { return result };
+        let containment = (|| -> Result<bool> {
+            let Some((journal, _)) = read_native(&self.paths)? else {
+                return Ok(false);
+            };
+            if !matches!(
+                journal.phase,
+                NativePhase::Starting | NativePhase::Verified | NativePhase::Restoring
+            ) {
+                return Ok(false);
+            }
+            let Some(admission) = &journal.admission else {
+                return Ok(false);
+            };
+            {
+                let lease = StartupLease::exclusive(self._lock.home())?;
+                validate_owned_mixed(&self.paths, &lease, &journal)?;
+                lease.write_state(&journal.blocked())?;
+            }
+            check_deadline(deadline)?;
+            service.stop(&admission.service, deadline)?;
+            let stopped = service.snapshot(deadline)?;
+            validate_snapshot(&stopped, &self.paths.executable)?;
+            same_configuration(&journal.disposition.original, &stopped)?;
+            ensure!(
+                stopped.running == RunningState::Stopped,
+                "containment did not confirm a stopped owned service"
+            );
+            Ok(true)
+        })();
+        match containment {
+            Ok(true)=>Err(error).context("native operation failed; owned service is stopped and transaction remains blocked for recovery"),
+            Ok(false)=>Err(error),
+            Err(containment)=>Err(error).context(format!("native operation failed; transaction remains pending and service containment is unconfirmed ({containment:#})")),
+        }
+    }
+
     fn revalidate_native_evidence(
         &self,
         service: &mut impl ServiceControl,
@@ -1219,6 +1271,16 @@ impl Engine {
         self.recover_before(service, deadline)
     }
     pub fn recover_prepared_until(
+        &mut self,
+        service: &mut impl ServiceControl,
+        deadline: Instant,
+        inputs: &PreflightInputs,
+    ) -> Result<Outcome> {
+        let result = self.recover_prepared_inner(service, deadline, inputs);
+        self.contain_native_failure(service, deadline, result)
+    }
+
+    fn recover_prepared_inner(
         &mut self,
         service: &mut impl ServiceControl,
         deadline: Instant,
