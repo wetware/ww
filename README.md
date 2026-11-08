@@ -60,7 +60,9 @@ Set `RELEASE_CID` to the selected signed release and provision the independent
 release keyring first. The installer authenticates and installs the Host,
 baseline FHS, and identity. Automatic channel selection is not yet integrated.
 Installation does not register a daemon or configure name publication. Register
-separately with `ww daemon install`; use native platform tools for activation.
+separately with `ww daemon install`. Fresh guarded installations require explicit
+stopped `ww startup admit` before activation. Native adapter qualification gates
+apply to admission and replacement; see [native platform limits](doc/native-upgrades.md).
 `ww image update` changes only the baseline and never restarts the Host.
 `ww uninstall` preserves user state. `ww upgrade` uses authenticated native
 selection, but replacement remains gated on native operational admission.

@@ -472,20 +472,48 @@ trusted channel provisioning.
 Request explicit authenticated native Host replacement through #739:
 
 ```sh
-ww upgrade --release CID [--check] [--json]
-ww upgrade --rollback [--json]
+ww upgrade --release CID --timeout-secs N [--json]
+ww upgrade --rollback --timeout-secs N [--json]
+ww upgrade --release CID --check [--json]
 ```
 
-The command authenticates installed and selected native identities. It preserves
+Changed upgrades, rollback, and recovery require a positive explicit timeout.
+Exact-artifact no-ops do not need a restart budget. The command authenticates
+installed and selected native identities. It preserves
 FHS, namespace, identity, service configuration, and deployment authority.
 `--release` explicitly permits an authenticated historic selection; it does not
 lower freshness state. Recovery precedes new selection.
 
-Native replacement is still gated: the native adapter cannot yet certify
-candidate compatibility or live startup admission. Exact authenticated no-ops
+Native replacement remains gated pending complete native qualification. The
+engine now binds retained signed proof, startup contracts, and exact process
+evidence, but the production adapter remains disabled. Exact authenticated no-ops
 can succeed. Rollback preflight (`--rollback --check`) remains unavailable.
 Missing installed-release provenance causes refusal. Neither the
 installer nor any flag bypasses these gates. See [native upgrades](native-upgrades.md).
+
+## ww startup admit
+
+Bind exact startup inputs while the installation is stopped:
+
+```sh
+ww startup admit --timeout-secs N [--check] [--json] service
+ww startup admit --timeout-secs N [--check] [--json] run [RUN_OPTIONS]
+```
+
+A fresh guarded installation remains `RequiredUnbound` until admission completes.
+`service` observes the actual loaded definition and effective environment. `run`
+uses the same options as standalone startup. Admission never registers or starts
+services. A running manual Host must exit before re-admission.
+
+`--trusted-release-keys FILE` explicitly rebinds the independently provisioned
+public keyring path. Otherwise admission rereads the stored absolute path.
+Pending candidate launches use current keys at that path. Historical keys apply
+only to exact committed generations during rollback.
+
+`--check` leaves startup metadata unchanged; preparation can retain public Kubo
+content. Managed invocations currently need explicit executor and compiler worker
+counts. Native adapter qualification gates also apply to admission. See
+[startup and native recovery](native-upgrades.md).
 
 ## ww uninstall
 

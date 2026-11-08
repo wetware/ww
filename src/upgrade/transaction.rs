@@ -80,6 +80,7 @@ enum NativePhase {
 pub(super) struct NativeJournal {
     version: u32,
     transaction_id: [u8; 32],
+    cleanup_timeout_millis: u64,
     phase: NativePhase,
     before: NativeTuple,
     after: NativeTuple,
@@ -97,6 +98,10 @@ impl NativeJournal {
         ensure!(
             self.version == 2 && self.transaction_id != [0; 32],
             "invalid native transaction identity/version"
+        );
+        ensure!(
+            (1..=30_000).contains(&self.cleanup_timeout_millis),
+            "native failure cleanup timeout must be positive and at most 30 seconds"
         );
         self.before.validate()?;
         self.after.validate()?;
@@ -421,7 +426,7 @@ impl Engine {
         );
         let request = select()?;
         let result = self.start_native(service, deadline, request, false);
-        self.contain_native_failure(service, deadline, result)
+        self.contain_native_failure(service, result)
     }
     pub fn check_upgrade_until<R: Read>(
         &mut self,
@@ -488,7 +493,7 @@ impl Engine {
             },
             true,
         );
-        self.contain_native_failure(service, deadline, result)
+        self.contain_native_failure(service, result)
     }
     pub fn preparation_contract(&self) -> Result<StartupContractV1> {
         if let Some((j, _)) = read_native(&self.paths)? {
@@ -750,6 +755,7 @@ impl Engine {
         let mut j = NativeJournal {
             version: 2,
             transaction_id,
+            cleanup_timeout_millis: 30_000,
             phase: NativePhase::Staging,
             before,
             after,
@@ -954,7 +960,6 @@ impl Engine {
     fn contain_native_failure(
         &self,
         service: &mut impl ServiceControl,
-        deadline: Instant,
         result: Result<Outcome>,
     ) -> Result<Outcome> {
         let Err(error) = result else { return result };
@@ -971,6 +976,10 @@ impl Engine {
             let Some(admission) = &journal.admission else {
                 return Ok(false);
             };
+            // Failure cleanup has one separately bounded, recorded budget. An
+            // exhausted upgrade/recovery deadline cannot skip containment.
+            let deadline = deadline(Duration::from_millis(journal.cleanup_timeout_millis))?;
+            check_deadline(deadline)?;
             {
                 let lease = StartupLease::exclusive(self._lock.home())?;
                 validate_owned_mixed(&self.paths, &lease, &journal)?;
@@ -978,7 +987,9 @@ impl Engine {
             }
             check_deadline(deadline)?;
             service.stop(&admission.service, deadline)?;
+            check_deadline(deadline)?;
             let stopped = service.snapshot(deadline)?;
+            check_deadline(deadline)?;
             validate_snapshot(&stopped, &self.paths.executable)?;
             same_configuration(&journal.disposition.original, &stopped)?;
             ensure!(
@@ -1028,9 +1039,16 @@ impl Engine {
         } else {
             &j.retained_before
         })?;
-        let referenced = |record: &GenerationRecord| {
-            &retained.current == record || retained.previous.as_ref() == Some(record)
-        };
+        // Physical files can be shared by different authenticated records.
+        // Key rotation changes verification_keys without changing either file;
+        // distinct signed roots can also name the same artifact bytes.
+        let retained_records = std::iter::once(&retained.current)
+            .chain(retained.previous.as_ref())
+            .collect::<Vec<_>>();
+        let retained_proofs = retained_records
+            .iter()
+            .map(|record| self.paths.proof(&record.proof))
+            .collect::<Result<Vec<_>>>()?;
         let old = RetainedV2::decode(&j.retained_before)?;
         for record in [&j.after.generation, &j.before.generation]
             .into_iter()
@@ -1050,12 +1068,14 @@ impl Engine {
                 storage::read_proof(&pending)?;
                 storage::remove(&pending)?;
             }
-            if !referenced(record) {
-                let proof = self.paths.proof(&record.proof)?;
-                if storage::exists(&proof)? {
-                    record.proof.verify(&storage::read_proof(&proof)?)?;
-                    storage::remove(&proof)?;
-                }
+            if !retained_proofs.contains(&proof) && storage::exists(&proof)? {
+                record.proof.verify(&storage::read_proof(&proof)?)?;
+                storage::remove(&proof)?;
+            }
+            if !retained_records
+                .iter()
+                .any(|retained| retained.artifact == record.artifact)
+            {
                 let artifact = self.paths.artifact(&record.artifact);
                 if storage::exists(&artifact)? {
                     storage::verify(&artifact, &record.artifact)?;
@@ -1277,7 +1297,7 @@ impl Engine {
         inputs: &PreflightInputs,
     ) -> Result<Outcome> {
         let result = self.recover_prepared_inner(service, deadline, inputs);
-        self.contain_native_failure(service, deadline, result)
+        self.contain_native_failure(service, result)
     }
 
     fn recover_prepared_inner(

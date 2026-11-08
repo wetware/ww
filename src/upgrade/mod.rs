@@ -988,17 +988,24 @@ fn deadline(timeout: Duration) -> Result<Instant> {
         !timeout.is_zero(),
         "Host operation timeout must be positive"
     );
-    Instant::now()
+    monotonic_now()
         .checked_add(timeout)
         .context("Host operation timeout is out of range")
 }
 
 fn check_deadline(deadline: Instant) -> Result<()> {
+    ensure!(
+        monotonic_now() < deadline,
+        "Host operation/readiness deadline expired"
+    );
+    Ok(())
+}
+
+fn monotonic_now() -> Instant {
     let now = Instant::now();
     #[cfg(test)]
     let now = storage::faults::clock_now(now);
-    ensure!(now < deadline, "Host operation/readiness deadline expired");
-    Ok(())
+    now
 }
 
 #[cfg(test)]
@@ -1345,6 +1352,24 @@ impl InitializationGuard<'_> {
 }
 
 impl Engine {
+    /// Read the original receipt intent without acquiring or creating startup
+    /// leases. This is a retry hint, not installation authority: callers must
+    /// still pass the exact release, trust source and receipt to initialization.
+    pub fn initialization_receipt(&self) -> Result<Option<Receipt>> {
+        self._lock.reject_pending()?;
+        let Some(bytes) =
+            storage::read_private_record(&self.paths.store.join("startup-state.json"))?
+        else {
+            return Ok(None);
+        };
+        let state = startup::StartupStateV1::decode(&bytes)?;
+        state
+            .initializing_receipt
+            .as_deref()
+            .map(Receipt::decode)
+            .transpose()
+    }
+
     pub fn prepare_initialization<'a>(
         &'a mut self,
         generation: &'a provenance::AuthenticatedGeneration,
@@ -1385,6 +1410,10 @@ impl Engine {
                     Some(state) => {
                         ensure!(state.disposition == StartupDisposition::Uninstalled,
                             "guarded installation is already initialized; preserve admission and native provenance");
+                        ensure!(
+                            state.trusted_release_keys == trust.path(),
+                            "reinstall must preserve the bound release trust path; rebind through explicit startup admission"
+                        );
                         ensure!(
                             lease.marker()?.installation_id == state.installation_id,
                             "reinstall marker changed"

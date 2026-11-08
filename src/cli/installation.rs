@@ -542,26 +542,6 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
             .recursive(true)
             .mode(0o700)
             .create(&root)?;
-        let mut next = state.clone().unwrap_or(Receipt {
-            version: 2,
-            hashes: std::array::from_fn(|_| digest(b"")),
-            previous: None,
-            complete: true,
-        });
-        // A v1 incomplete receipt is only finalized after all five recorded
-        // identities have been established; no new package is selected.
-        if next.version == 1 && next.complete {
-            next = migrate(&root, &next)?;
-        }
-        // A guarded retry must reproduce the first intent byte-for-byte.
-        // Recomputing previous from an incomplete receipt changes that intent.
-        if next.complete {
-            next.previous = Some(next.hashes.clone());
-        }
-        for (index, payload) in bytes.iter().enumerate() {
-            next.hashes[index] = digest(payload);
-        }
-        next.complete = false;
         if guarded {
             for path in SOFTWARE {
                 std::fs::DirBuilder::new()
@@ -579,6 +559,13 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
             if repeated {
                 release = Some(engine.startup_state()?.native.transport_root);
             } else {
+                let recorded = engine.initialization_receipt()?;
+                let mut next = incomplete_installation_receipt(
+                    &root,
+                    state.as_ref(),
+                    &bytes,
+                    recorded.as_ref(),
+                )?;
                 let initialization =
                     engine.prepare_initialization(&selected.generation, &next, &selected.trust)?;
                 if key.is_none() {
@@ -608,6 +595,7 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
                 initialization.finish(&next)?;
             }
         } else {
+            let mut next = incomplete_installation_receipt(&root, state.as_ref(), &bytes, None)?;
             if key.is_none() {
                 persist_identity(&identity, &ww::keys::generate()?)?;
             }
@@ -658,6 +646,46 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         service: None,
     }
     .print(args.json)
+}
+
+fn incomplete_installation_receipt(
+    root: &Path,
+    state: Option<&Receipt>,
+    bytes: &[Vec<u8>; 3],
+    recorded: Option<&Receipt>,
+) -> Result<Receipt> {
+    if let Some(recorded) = recorded {
+        ensure!(
+            !recorded.complete
+                && bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(index, payload)| recorded.hashes[index] == digest(payload)),
+            "selected software differs from the recorded initialization intent"
+        );
+        // The complete receipt can precede removal of the initialization intent.
+        // Preserve the original previous hashes on either side of that boundary.
+        // Engine::prepare_initialization still validates the complete authority.
+        return Ok(recorded.clone());
+    }
+    let mut next = state.cloned().unwrap_or(Receipt {
+        version: 2,
+        hashes: std::array::from_fn(|_| digest(b"")),
+        previous: None,
+        complete: true,
+    });
+    // A v1 incomplete receipt retains all five original identities.
+    if next.version == 1 && next.complete {
+        next = migrate(root, &next)?;
+    }
+    if next.complete {
+        next.previous = Some(next.hashes.clone());
+    }
+    for (index, payload) in bytes.iter().enumerate() {
+        next.hashes[index] = digest(payload);
+    }
+    next.complete = false;
+    Ok(next)
 }
 
 fn service_path(home: &Path) -> PathBuf {
@@ -953,6 +981,35 @@ fn uninstall_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialization_retry_after_complete_receipt_reuses_original_intent() {
+        let home = tempfile::tempdir().unwrap();
+        let payloads = [b"host".to_vec(), b"kernel".to_vec(), b"status".to_vec()];
+        let recorded = incomplete_installation_receipt(home.path(), None, &payloads, None).unwrap();
+        let mut completed = recorded.clone();
+        completed.complete = true;
+        completed.previous = None;
+        // A crash can leave this complete receipt beside the original unfinished
+        // initialization intent. The CLI must reproduce that exact intent.
+        let retry = incomplete_installation_receipt(
+            home.path(),
+            Some(&completed),
+            &payloads,
+            Some(&recorded),
+        )
+        .unwrap();
+        assert_eq!(retry.encode().unwrap(), recorded.encode().unwrap());
+        let mut changed = payloads;
+        changed[1].push(1);
+        assert!(incomplete_installation_receipt(
+            home.path(),
+            Some(&completed),
+            &changed,
+            Some(&recorded)
+        )
+        .is_err());
+    }
 
     fn fixture() -> (tempfile::TempDir, Receipt, Receipt) {
         let home = tempfile::tempdir().unwrap();

@@ -155,8 +155,8 @@ delegates to the installed `ww uninstall`; it has no separate purge behavior.
 For a pending Host transaction whose installed executable cannot launch, use:
 
 ```sh
-sh scripts/install.sh --recover
-sh scripts/install.sh --recover --release <RECORDED_RELEASE_CID>
+sh scripts/install.sh --recover --timeout-secs N
+sh scripts/install.sh --recover --release <RECORDED_RELEASE_CID> --timeout-secs N
 ```
 
 Recovery requires an existing `host-upgrade.json`. The default locator is the
@@ -174,26 +174,31 @@ endpoints when using a nondefault Kubo. The recorded release must contain a Host
 with this recovery entry point. Missing, incompatible, or unrelated artifacts
 cause refusal. Recovery preserves the native operational gates below.
 
-## Native upgrade integration gates
+## Guarded startup and native upgrade gates
 
-`upgrade` now consumes authenticated descriptor selection and the #739 engine.
-A new `install --release` stores an untrusted release-CID locator; every upgrade
-reauthenticates that release and verifies the installed bytes. Legacy and local
-bootstrap installations without that locator cannot substitute ownership hashes
-for release authentication.
+A fresh signed native installation retains signed release proof, a stable
+installation identity, and the absolute independent public-keyring path. The
+installation remains `RequiredUnbound` until explicit stopped `ww startup admit`
+binds the service or standalone inputs. Exact-artifact reinstall preserves an
+existing admitted contract and accepted provenance.
 
-Native replacement remains unavailable: `NativeService` refuses candidate
-compatibility and live restart admission. No CLI flag bypasses those checks.
+Changed native upgrade requires a positive `--timeout-secs N`. Recovery and
+rollback use the same transaction owner and complete native tuple. An untrusted
+release locator or ownership hash cannot substitute for signed release evidence.
+Existing unguarded installations do not acquire native upgrade authority through
+an implicit migration.
+
+The production adapter remains disabled pending complete native qualification.
 Exact authenticated no-ops and permitted recorded recovery can complete without
-replacement. Automatic channel discovery also remains unavailable until an
-independently trusted raw IPNS channel identity is provisioned; explicit
-`--release CID` does not lower a channel freshness floor.
+replacement. Linux process/manager component checks do not establish the full
+installed-CLI acceptance path. macOS exact main-executable evidence remains
+unqualified. No CLI flag bypasses these restrictions.
 
-Retained signed evidence, atomic native-provenance transition, effective-deployment
-compatibility, child-side startup admission, exact running artifact/readiness,
-and measured restart deadlines remain integration gates. See
-[native Host replacement](native-upgrades.md). The installer is not an upgrade
-fallback, and CLI implementation does not authorize a production rollout.
+Automatic channel discovery separately requires an independently trusted raw
+IPNS channel identity. Explicit `--release CID` never lowers a channel freshness
+floor. See [native startup and recovery](native-upgrades.md) for contracts, trust,
+leases, process evidence, and qualification limits. Installation is not an upgrade
+fallback and does not authorize production activation.
 
 ## Build and container contract
 

@@ -1270,6 +1270,13 @@ pub(crate) fn restart(
         match observe_ready(home, permit.contract(), executable, None, deadline) {
             Ok(live) => break live,
             Err(error) => {
+                if let Ok(current) = observe(home, deadline) {
+                    ensure!(
+                        current.invocation.identity == admission.service,
+                        "service changed while awaiting guarded readiness"
+                    );
+                    check_restart_progress(&current.snapshot)?;
+                }
                 if deadline.saturating_duration_since(Instant::now()) <= Duration::from_millis(10) {
                     return Err(error)
                         .context("guarded service did not establish readiness before deadline");
@@ -1293,6 +1300,14 @@ pub(crate) fn restart(
     };
     evidence.verify(admission, permit, executable)?;
     Ok(evidence)
+}
+
+fn check_restart_progress(snapshot: &ServiceSnapshot) -> Result<()> {
+    ensure!(
+        !(snapshot.failed && snapshot.running == RunningState::Stopped),
+        "managed Host exited before serving readiness"
+    );
+    Ok(())
 }
 
 fn manager_action(
@@ -1869,6 +1884,22 @@ mod tests {
         .unwrap();
         let after = derived(&home, &capture).unwrap();
         assert_ne!(before.invocation.identity, after.invocation.identity);
+    }
+
+    #[test]
+    fn terminated_candidate_does_not_consume_the_readiness_deadline() {
+        let (_temp, home, mut capture) = fixture();
+        capture.unit.get_mut("ActiveState").unwrap().data = serde_json::json!("failed");
+        capture.unit.get_mut("SubState").unwrap().data = serde_json::json!("failed");
+        capture.service.get_mut("Result").unwrap().data = serde_json::json!("exit-code");
+        let failed = derived(&home, &capture).unwrap();
+        assert!(check_restart_progress(&failed.snapshot).is_err());
+        let mut uncertain = failed.snapshot.clone();
+        uncertain.running = RunningState::Unknown;
+        assert!(check_restart_progress(&uncertain).is_ok());
+        capture.unit.get_mut("ActiveState").unwrap().data = serde_json::json!("activating");
+        capture.unit.get_mut("SubState").unwrap().data = serde_json::json!("auto-restart");
+        assert!(derived(&home, &capture).is_err());
     }
 
     #[test]

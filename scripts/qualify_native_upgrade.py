@@ -36,6 +36,7 @@ TARGETS = {
 }
 MAX_RECORD = 64 * 1024
 MAX_COMMAND_OUTPUT = 4 * 1024 * 1024
+MAX_CONTAINMENT_SECONDS = 30
 
 
 def require(condition, message):
@@ -162,6 +163,7 @@ class Runner:
     def run(self, name, argv, expected=0):
         argv = [str(item) for item in argv]
         started = time.monotonic()
+        command_budget = self.timeout + MAX_CONTAINMENT_SECONDS + 10
         record_name = f"{len(self.commands):04d}-{name}"
         process = subprocess.Popen(argv, cwd=self.home, env=self.env, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -173,7 +175,7 @@ class Runner:
                     os.set_blocking(stream.fileno(), False)
                     selector.register(stream, selectors.EVENT_READ, label)
                 while selector.get_map():
-                    require(time.monotonic() - started < self.timeout + 10, f"command deadline: {name}")
+                    require(time.monotonic() - started < command_budget, f"command deadline: {name}")
                     for key, _ in selector.select(0.05):
                         data = os.read(key.fileobj.fileno(), 65536)
                         if not data:
@@ -181,7 +183,7 @@ class Runner:
                         else:
                             chunks[key.data].extend(data)
                             require(len(chunks[key.data]) <= MAX_COMMAND_OUTPUT, f"command output exceeds bound: {name}")
-            process.wait(timeout=max(0.01, self.timeout + 10 - (time.monotonic() - started)))
+            process.wait(timeout=max(0.01, command_budget - (time.monotonic() - started)))
         except BaseException:
             if process.poll() is None:
                 try:
@@ -300,7 +302,7 @@ def readiness(runner, state, name):
                     require(peer_pid == pid and peer_uid == os.geteuid(), "readiness peer differs from manager process")
                     nonce = list(os.urandom(32))
                     request = json.dumps({"version": 1, "nonce": nonce, "launch_nonce": None,
-                                          "timeout_millis": max(1, int((deadline - time.monotonic()) * 1000))}, separators=(",", ":")).encode()
+                                          "timeout_millis": min(300_000, max(1, int((deadline - time.monotonic()) * 1000)))}, separators=(",", ":")).encode()
                     stream.sendall(len(request).to_bytes(4, "big") + request)
                     length = int.from_bytes(recv_exact(stream, 4), "big")
                     require(0 < length <= MAX_RECORD, "readiness reply exceeds bound")
@@ -364,7 +366,8 @@ def main():
         preserved = [home / ".ww/identity", home / ".ww/fhs/boot/kernel.wasm", home / ".ww/fhs/bin/status.wasm", private]
         hashes = {str(path): sha256(path) for path in preserved}
         runner.run("daemon-register", [binary, "daemon", "install", "--executor-threads", "2", "--listen", "/ip4/127.0.0.1/tcp/0", "--with-http-admin", "off", "--ipfs-url", args.ipfs_url, "--json"])
-        original_unit = unit.read_text()
+        owned_unit = unit.read_bytes()
+        original_unit = owned_unit.decode("utf-8")
         require(original_unit.count("[Service]\n") == 1, "unexpected generated service definition")
         owned_unit = original_unit.replace("[Service]\n", "[Service]\nEnvironment=WW_COMPILE_WORKERS=2\nWorkingDirectory=" + str(home) + "\n").encode()
         unit.write_bytes(owned_unit)
@@ -408,6 +411,11 @@ def main():
                 unit.unlink()
                 runner.run("cleanup-reload", ["/usr/bin/systemctl", "--user", "daemon-reload"])
                 report["cleanup"] = "fixture service stopped and removed; installation evidence retained"
+        except BaseException as error:
+            report["status"] = "FAILED"
+            report["cleanup"] = "fixture cleanup failed; inspect retained service and command evidence"
+            report["cleanup_error"] = str(error)
+            raise
         finally:
             report["executed_checks"] = len(report["checks"])
             runner.save("report.json", report)

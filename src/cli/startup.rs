@@ -700,9 +700,27 @@ impl GuardedStartup {
         let state = startup
             .read_state()?
             .context("required startup state is missing; admit the installed Host")?;
-        let contract = startup
+        let persisted_contract = startup
             .read_contract()?
             .context("required startup contract is missing")?;
+        // The persisted contract stays at the previous generation until commit.
+        // Only a validated journal permit can supply a transaction child's
+        // effective contract while replacement is pending.
+        let (contract, permit) = if mutation.is_some()
+            && matches!(state.disposition, StartupDisposition::Committed { .. })
+            && ww::upgrade::validate_steady_start(&startup, &state, &persisted_contract).is_ok()
+        {
+            (persisted_contract, None)
+        } else {
+            // Busy mutation exclusion is not launch authority. The journal also
+            // requires the before/after invocation to remain identical.
+            let permit = ww::upgrade::validate_transaction_start(
+                &startup,
+                &persisted_contract.invocation,
+                Instant::now() + Duration::from_secs(30),
+            )?;
+            (permit.contract().clone(), Some(permit))
+        };
         #[cfg(target_os = "linux")]
         if matches!(contract.invocation, InvocationBinding::Standalone) {
             validate_standalone_cgroup()?;
@@ -723,25 +741,6 @@ impl GuardedStartup {
                 );
             }
         }
-        // Busy mutation exclusion is not launch authority. Only the complete
-        // durable owner journal can authorize the transaction child path.
-        let permit = if mutation.is_some()
-            && matches!(state.disposition, StartupDisposition::Committed { .. })
-            && ww::upgrade::validate_steady_start(&startup, &state, &contract).is_ok()
-        {
-            None
-        } else {
-            let permit = ww::upgrade::validate_transaction_start(
-                &startup,
-                &contract.invocation,
-                Instant::now() + Duration::from_secs(30),
-            )?;
-            ensure!(
-                permit.contract() == &contract,
-                "transaction launch contract changed"
-            );
-            Some(permit)
-        };
         let process = PinnedProcess::capture(
             std::process::id(),
             &contract.artifact,

@@ -37,6 +37,10 @@ struct FakeService {
     delay_final_compatibility: bool,
     #[serde(skip)]
     restart_deadline: Option<Instant>,
+    #[serde(skip)]
+    service_deadlines: Vec<(&'static str, Instant)>,
+    #[serde(skip)]
+    expire_after_guarded_restart: bool,
 }
 
 impl FakeService {
@@ -75,6 +79,8 @@ impl FakeService {
             running_artifact: None,
             delay_final_compatibility: false,
             restart_deadline: None,
+            service_deadlines: Vec::new(),
+            expire_after_guarded_restart: false,
         }
     }
 
@@ -112,7 +118,8 @@ impl FakeService {
 }
 
 impl ServiceControl for FakeService {
-    fn snapshot(&mut self, _: Instant) -> Result<ServiceSnapshot> {
+    fn snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot> {
+        self.service_deadlines.push(("snapshot", deadline));
         Ok(self.snapshot.clone())
     }
 
@@ -178,6 +185,7 @@ impl ServiceControl for FakeService {
         executable: &attestation::VerifiedExecutable,
         deadline: Instant,
     ) -> Result<service::RunningEvidence> {
+        self.service_deadlines.push(("restart", deadline));
         assert!(
             !self.interrupt_guarded_restart,
             "simulated interruption after runnable permit publication"
@@ -191,6 +199,11 @@ impl ServiceControl for FakeService {
         self.running_artifact = Some(executable.artifact().clone());
         self.effects += 1;
         self.save_state()?;
+        if self.expire_after_guarded_restart {
+            storage::faults::advance_clock_at(1);
+            checkpoint("fixture.restart.exhausted-deadline")?;
+            check_deadline(deadline)?;
+        }
         ensure!(
             !self.readiness_timeout && !self.not_ready,
             "readiness unavailable"
@@ -233,7 +246,9 @@ impl ServiceControl for FakeService {
         );
         Ok(())
     }
-    fn stop(&mut self, _: &startup::ServiceIdentity, _: Instant) -> Result<()> {
+    fn stop(&mut self, _: &startup::ServiceIdentity, deadline: Instant) -> Result<()> {
+        self.service_deadlines.push(("stop", deadline));
+        check_deadline(deadline)?;
         ensure!(!self.stop_failure, "stop failed");
         self.stops += 1;
         self.snapshot.running = RunningState::Stopped;
@@ -2670,7 +2685,7 @@ fn legacy_postreplacement_requires_exact_independent_evidence_and_stays_stopped_
 }
 
 #[test]
-fn native_v2_failed_readiness_and_wrong_binary_are_blocked_and_contained_within_caller_deadline() {
+fn native_v2_failed_readiness_and_wrong_binary_are_blocked_and_contained_with_bounded_cleanup() {
     for failure in ["unready", "wrong-binary", "timeout"] {
         storage::faults::configure(None);
         let (home, mut engine, current, inputs, mut service) = native_fixture(true);
@@ -2707,7 +2722,7 @@ fn native_v2_failed_readiness_and_wrong_binary_are_blocked_and_contained_within_
 }
 
 #[test]
-fn native_v2_expired_commit_budget_keeps_journal_and_does_not_claim_containment() {
+fn native_v2_expired_commit_budget_uses_fresh_recorded_containment_deadline() {
     storage::faults::configure(None);
     let (_baseline, mut owner, current, inputs, mut service) = native_fixture(true);
     storage::faults::configure(None);
@@ -2726,21 +2741,20 @@ fn native_v2_expired_commit_budget_keeps_journal_and_does_not_claim_containment(
     let (home, mut engine, current, inputs, mut service) = native_fixture(true);
     let receipt_before = std::fs::read(&engine.paths.receipt).unwrap();
     storage::faults::advance_clock_at(point);
+    let operation_deadline = Instant::now() + TIMEOUT;
     let error = engine
-        .operator_upgrade(&mut service, TIMEOUT, || {
+        .operator_upgrade_until(&mut service, operation_deadline, || {
             Ok(native_request(current, inputs.clone(), NEW, 2))
         })
         .unwrap_err();
-    assert!(format!("{error:#}").contains("containment is unconfirmed"));
+    assert!(format!("{error:#}").contains("owned service is stopped"));
     assert_eq!(
         std::fs::read(&engine.paths.receipt).unwrap(),
         receipt_before
     );
     assert!(engine.paths.journal.exists());
-    assert!(matches!(
-        service.snapshot.running,
-        RunningState::Running { .. }
-    ));
+    assert_eq!(service.snapshot.running, RunningState::Stopped);
+    assert_containment_deadline(&engine, &service, operation_deadline);
     storage::faults::configure(None);
     let lease = startup::StartupLease::shared(home.path()).unwrap();
     assert_eq!(
@@ -2784,4 +2798,344 @@ fn native_v2_manual_instance_blocks_replacement_until_explicit_exit() {
         (service.stops, service.restarts, service.effects),
         (0, 0, 0)
     );
+}
+
+#[test]
+fn native_v2_cleanup_preserves_files_shared_with_a_rotated_keyring_generation() {
+    storage::faults::configure(None);
+    let (home, mut engine, original, inputs, mut service) = native_fixture(false);
+    engine
+        .operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(native_request(
+                signed_generation(OLD, 1),
+                inputs.clone(),
+                NEW,
+                2,
+            ))
+        })
+        .unwrap();
+    let extra = signed_generation_with_key(THIRD, 3, [8; 32]);
+    let mut keys = original.record().verification_keys.clone();
+    keys.extend_from_slice(&extra.record().verification_keys);
+    std::fs::write(home.path().join("release-keys"), &keys).unwrap();
+    let rotated = provenance::AuthenticatedGeneration::from_proof(
+        crate::release::descriptor::SignedReleaseProof::decode(original.proof_bytes()).unwrap(),
+        &keys,
+        &original.record().target,
+    )
+    .unwrap();
+    assert_ne!(original.record(), rotated.record());
+    assert_eq!(original.record().proof, rotated.record().proof);
+    let current = engine.current_generation().unwrap();
+    let rotated_record = rotated.record().clone();
+    engine
+        .operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(UpgradeRequest {
+                installed: current,
+                candidate: rotated,
+                bytes: Cursor::new(OLD),
+                inputs: inputs.clone(),
+            })
+        })
+        .unwrap();
+    let proof = engine.paths.proof(&rotated_record.proof).unwrap();
+    assert!(
+        proof.is_file(),
+        "cleanup removed the current generation's shared proof"
+    );
+    assert!(
+        engine.paths.artifact(&rotated_record.artifact).is_file(),
+        "cleanup removed the current generation's shared artifact"
+    );
+    assert_eq!(
+        engine.current_generation().unwrap().record(),
+        &rotated_record
+    );
+    engine
+        .operator_rollback_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        .unwrap();
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), NEW);
+}
+
+#[test]
+fn native_v2_early_abort_preserves_previous_artifact_shared_with_another_signed_root() {
+    storage::faults::configure(None);
+    let (_home, mut engine, original, inputs, mut service) = native_fixture(false);
+    engine
+        .operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(native_request(
+                signed_generation(OLD, 1),
+                inputs.clone(),
+                NEW,
+                2,
+            ))
+        })
+        .unwrap();
+    let current = engine.current_generation().unwrap();
+    let other_root = signed_generation(OLD, 3);
+    let other_proof = other_root.record().proof.clone();
+    service.incompatible = Some(other_root.artifact().clone());
+    assert!(engine
+        .operator_upgrade(&mut service, TIMEOUT, || Ok(UpgradeRequest {
+            installed: current,
+            candidate: other_root,
+            bytes: Cursor::new(OLD),
+            inputs: inputs.clone(),
+        }))
+        .is_err());
+    service.incompatible = None;
+    engine
+        .recover_without_preparation_until(&mut service, Instant::now() + TIMEOUT)
+        .unwrap()
+        .unwrap();
+    assert!(
+        engine.paths.artifact(original.artifact()).is_file(),
+        "early abort removed the previous generation's shared artifact"
+    );
+    assert!(!engine.paths.proof(&other_proof).unwrap().exists());
+    assert!(engine
+        .paths
+        .proof(&original.record().proof)
+        .unwrap()
+        .is_file());
+    engine
+        .operator_rollback_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        .unwrap();
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+}
+
+fn assert_containment_deadline(
+    engine: &Engine,
+    service: &FakeService,
+    operation_deadline: Instant,
+) {
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&engine.paths.journal).unwrap()).unwrap();
+    let budget = journal["cleanup_timeout_millis"]
+        .as_u64()
+        .expect("journal must record a bounded cleanup budget");
+    assert!((1..=30_000).contains(&budget));
+    let calls = &service.service_deadlines;
+    let last = calls.len();
+    assert_eq!(calls[last - 2].0, "stop");
+    assert_eq!(calls[last - 1].0, "snapshot");
+    let cleanup_deadline = calls[last - 2].1;
+    assert_eq!(
+        cleanup_deadline,
+        calls[last - 1].1,
+        "containment must pass one deadline to stop and reobserve"
+    );
+    assert!(
+        cleanup_deadline > operation_deadline,
+        "containment reused the expired operation deadline"
+    );
+    let remaining =
+        cleanup_deadline.saturating_duration_since(storage::faults::clock_now(Instant::now()));
+    assert!(!remaining.is_zero() && remaining <= Duration::from_millis(budget));
+}
+
+#[test]
+fn native_v2_expired_recovery_budget_still_contains_the_restarted_service() {
+    storage::faults::configure(None);
+    let (home, mut engine, original, inputs, mut service) = native_fixture(true);
+    service.not_ready = true;
+    assert!(engine
+        .operator_upgrade(&mut service, TIMEOUT, || {
+            Ok(native_request(original, inputs.clone(), NEW, 2))
+        })
+        .is_err());
+    service.not_ready = false;
+    service.expire_after_guarded_restart = true;
+    let operation_deadline = Instant::now() + TIMEOUT;
+    let error = engine
+        .recover_prepared_until(&mut service, operation_deadline, &inputs)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("owned service is stopped"),
+        "{error:#}"
+    );
+    assert_eq!(service.snapshot.running, RunningState::Stopped);
+    assert_containment_deadline(&engine, &service, operation_deadline);
+    storage::faults::configure(None);
+    let lease = startup::StartupLease::shared(home.path()).unwrap();
+    assert_eq!(
+        lease.read_state().unwrap().unwrap().disposition,
+        startup::StartupDisposition::Blocked
+    );
+    drop(lease);
+    service.expire_after_guarded_restart = false;
+    engine
+        .recover_prepared_until(&mut service, Instant::now() + TIMEOUT, &inputs)
+        .unwrap();
+    assert_eq!(std::fs::read(&engine.paths.executable).unwrap(), OLD);
+}
+
+#[test]
+fn reinstall_refuses_trust_path_rebinding_before_writing_initialization_intent() {
+    storage::faults::configure(None);
+    let (home, mut engine, current) = completed_initialization();
+    drop(
+        removal::prepare(engine.mutation_lock(), false)
+            .unwrap()
+            .unwrap()
+            .quiesce()
+            .unwrap(),
+    );
+    let state = startup::StartupStateV1::decode(
+        &std::fs::read(engine.paths.store.join("startup-state.json")).unwrap(),
+    )
+    .unwrap();
+    let mut receipt = Receipt::load(&home.path().join(".ww")).unwrap();
+    receipt.complete = false;
+    storage::remove(&engine.paths.receipt).unwrap();
+    let alternate = home.path().join("alternate-release-keys");
+    std::fs::write(&alternate, &current.record().verification_keys).unwrap();
+    let trust = provenance::IndependentTrustSource::from_path(&alternate).unwrap();
+    let candidate = signed_generation(OLD, 2);
+    let result = engine.prepare_initialization(&candidate, &receipt, &trust);
+    assert!(
+        result.is_err(),
+        "reinstall changed the bound trust path without explicit admission"
+    );
+    drop(result);
+    assert_eq!(
+        startup::StartupStateV1::decode(
+            &std::fs::read(engine.paths.store.join("startup-state.json")).unwrap()
+        )
+        .unwrap(),
+        state
+    );
+    assert!(!engine.paths.receipt.exists());
+    assert!(!engine
+        .paths
+        .proof(&candidate.record().proof)
+        .unwrap()
+        .exists());
+}
+
+#[test]
+fn reinstall_allows_key_rotation_at_the_existing_bound_trust_path() {
+    storage::faults::configure(None);
+    let (home, mut engine, _) = completed_initialization();
+    drop(
+        removal::prepare(engine.mutation_lock(), false)
+            .unwrap()
+            .unwrap()
+            .quiesce()
+            .unwrap(),
+    );
+    let old_state = startup::StartupStateV1::decode(
+        &std::fs::read(engine.paths.store.join("startup-state.json")).unwrap(),
+    )
+    .unwrap();
+    let mut receipt = Receipt::load(&home.path().join(".ww")).unwrap();
+    receipt.complete = false;
+    receipt.hashes[0] = blake3::hash(NEW).to_hex().to_string();
+    storage::remove(&engine.paths.receipt).unwrap();
+    let candidate = signed_generation_with_key(NEW, 2, [8; 32]);
+    std::fs::write(
+        home.path().join("release-keys"),
+        &candidate.record().verification_keys,
+    )
+    .unwrap();
+    let trust =
+        provenance::IndependentTrustSource::from_path(&home.path().join("release-keys")).unwrap();
+    let guard = engine
+        .prepare_initialization(&candidate, &receipt, &trust)
+        .unwrap();
+    assert!(!guard.may_create_identity().unwrap());
+    drop(guard);
+    let new_state = startup::StartupStateV1::decode(
+        &std::fs::read(engine.paths.store.join("startup-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        new_state.trusted_release_keys,
+        old_state.trusted_release_keys
+    );
+    assert_eq!(new_state.installation_id, old_state.installation_id);
+    assert_eq!(new_state.native, *candidate.record());
+}
+
+#[test]
+fn initialization_receipt_recalls_original_intent_after_terminal_receipt_write() {
+    storage::faults::configure(None);
+    let (home, generation, trust, mut intended) = initialization_fixture();
+    intended.previous = Some([
+        "old-0".into(),
+        "old-1".into(),
+        "old-2".into(),
+        "old-3".into(),
+        "old-4".into(),
+    ]);
+    let mut engine = open(home.path());
+    assert!(engine.initialization_receipt().unwrap().is_none());
+    drop(
+        engine
+            .prepare_initialization(&generation, &intended, &trust)
+            .unwrap(),
+    );
+    let mut terminal = intended.clone();
+    terminal.complete = true;
+    terminal.previous = None;
+    storage::write_record(&engine.paths.receipt, &terminal.encode().unwrap()).unwrap();
+    // The read-only hint remains available before marker publication and does
+    // not recreate the marker. The initializer still owns full validation.
+    storage::remove(&home.path().join(".ww-startup.lock")).unwrap();
+    assert_eq!(
+        engine
+            .initialization_receipt()
+            .unwrap()
+            .unwrap()
+            .encode()
+            .unwrap(),
+        intended.encode().unwrap()
+    );
+    assert!(!home.path().join(".ww-startup.lock").exists());
+    storage::write_record(&engine.paths.journal, b"{}").unwrap();
+    assert!(engine.initialization_receipt().is_err());
+}
+
+#[test]
+fn native_v2_recovery_refuses_missing_zero_or_unbounded_cleanup_budgets_before_effects() {
+    for budget in [None, Some(0), Some(30_001)] {
+        storage::faults::configure(None);
+        let (_home, mut engine, original, inputs, mut service) = native_fixture(false);
+        service.incompatible = Some(signed_generation(NEW, 2).artifact().clone());
+        assert!(engine
+            .operator_upgrade(&mut service, TIMEOUT, || {
+                Ok(native_request(original, inputs, NEW, 2))
+            })
+            .is_err());
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&engine.paths.journal).unwrap()).unwrap();
+        match budget {
+            Some(value) => journal["cleanup_timeout_millis"] = value.into(),
+            None => {
+                journal
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cleanup_timeout_millis");
+            }
+        }
+        let journal = serde_json::to_vec(&journal).unwrap();
+        storage::write_record(&engine.paths.journal, &journal).unwrap();
+        let state_before = std::fs::read(engine.paths.store.join("startup-state.json")).unwrap();
+        service.service_deadlines.clear();
+        assert!(
+            engine
+                .recover_without_preparation_until(&mut service, Instant::now() + TIMEOUT)
+                .is_err(),
+            "accepted cleanup budget {budget:?}"
+        );
+        assert!(
+            service.service_deadlines.is_empty(),
+            "invalid journal reached manager observation"
+        );
+        assert_eq!(std::fs::read(&engine.paths.journal).unwrap(), journal);
+        assert_eq!(
+            std::fs::read(engine.paths.store.join("startup-state.json")).unwrap(),
+            state_before
+        );
+    }
 }
