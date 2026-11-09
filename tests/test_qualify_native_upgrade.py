@@ -14,6 +14,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+import zipfile
 from unittest.mock import patch
 
 
@@ -26,9 +27,53 @@ SPEC.loader.exec_module(MODULE)
 class Inputs(unittest.TestCase):
     def receipt(self):
         return {"path": "/fixture/original/ww", "sha256": "a" * 64,
+                "archive_path": "/fixture/original.zip",
                 "revision": "b" * 40, "run_id": 123, "attempt": 2,
                 "archive_sha256": "c" * 64,
                 "builder": "github-actions:123:2:aarch64-unknown-linux-gnu"}
+
+    def test_original_archive_and_receipts_must_match_the_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "ww"
+            revision = "b" * 40
+            header = bytearray(64)
+            header[:6] = b"\x7fELF\x02\x01"
+            header[18:20] = (183).to_bytes(2, "little")
+            binary.write_bytes(bytes(header) + revision.encode())
+            receipt = dict(self.receipt(), path=str(binary), archive_path=str(root / "original.zip"),
+                           sha256=MODULE.sha256(binary))
+            files = {"ww": binary.read_bytes(), "REVISION": (revision + "\n").encode(),
+                     "SHA256SUMS": (receipt["sha256"] + "  ww\n").encode(),
+                     "PROVENANCE.json": json.dumps({"repository": "https://github.com/wetware/ww",
+                         "revision": revision, "builder": receipt["builder"]}).encode()}
+            for name, value in files.items():
+                (root / name).write_bytes(value)
+
+            def archive(values):
+                with zipfile.ZipFile(receipt["archive_path"], "w") as output:
+                    for name, value in values.items():
+                        output.writestr(name, value)
+                receipt["archive_sha256"] = MODULE.sha256(Path(receipt["archive_path"]))
+
+            archive(files)
+            evidence = MODULE.verify_producer_files(receipt, "aarch64-unknown-linux-gnu", os.geteuid())
+            self.assertEqual(evidence["size"], 104)
+            self.assertEqual(evidence["embedded_revision_bytes"], revision)
+            for name, changed in (("ww", b"another binary"), ("REVISION", b"c" * 40 + b"\n"),
+                                  ("SHA256SUMS", b"0" * 64 + b"  ww\n")):
+                with self.subTest(name=name):
+                    archive(dict(files, **{name: changed}))
+                    with self.assertRaises(RuntimeError):
+                        MODULE.verify_producer_files(receipt, "aarch64-unknown-linux-gnu", os.geteuid())
+            archive(dict(files, **{"../escaped": b"unsafe"}))
+            with self.assertRaisesRegex(RuntimeError, "archive member"):
+                MODULE.verify_producer_files(receipt, "aarch64-unknown-linux-gnu", os.geteuid())
+            archive(files)
+            (root / "PROVENANCE.json").write_text(json.dumps({"repository": "https://github.com/other/repo",
+                "revision": revision, "builder": receipt["builder"]}))
+            with self.assertRaisesRegex(RuntimeError, "producer provenance"):
+                MODULE.verify_producer_files(receipt, "aarch64-unknown-linux-gnu", os.geteuid())
 
     def arguments(self):
         return SimpleNamespace(timeout_secs=60, release_a="bafya", release_b="bafyb",
@@ -96,6 +141,7 @@ class Inputs(unittest.TestCase):
             os.link(original, alias)
             with self.assertRaises(RuntimeError):
                 MODULE.record(original, os.geteuid())
+
             alias.unlink()
             original.chmod(0o666)
             with self.assertRaises(RuntimeError):
@@ -104,6 +150,23 @@ class Inputs(unittest.TestCase):
             original.write_bytes(b" " * (MODULE.MAX_RECORD + 1))
             with self.assertRaisesRegex(RuntimeError, "exceeds limit"):
                 MODULE.record(original, os.geteuid())
+
+    def test_durable_snapshot_detects_same_bytes_rewrite_and_new_journal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            root = home / ".ww"
+            root.mkdir()
+            state = root / "installed-release.json"
+            state.write_text('{"version":1,"release":"bafya"}')
+            before = MODULE.durable_snapshot(home)
+            self.assertEqual(before, MODULE.durable_snapshot(home))
+            replacement = root / "replacement"
+            replacement.write_bytes(state.read_bytes())
+            replacement.replace(state)
+            self.assertNotEqual(before, MODULE.durable_snapshot(home))
+            before = MODULE.durable_snapshot(home)
+            (root / "host-upgrade.json").write_text('{}')
+            self.assertNotEqual(before, MODULE.durable_snapshot(home))
 
 
 class Commands(unittest.TestCase):
@@ -200,6 +263,16 @@ class Commands(unittest.TestCase):
                 watcher.require_injected()
             self.assertFalse(json.loads((root / "readiness-timeout-watcher/result.json").read_text())["injected"])
 
+    def test_candidate_fault_allows_only_scoped_stop_and_exit_signals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = MODULE.Runner(root, root, 0.1)
+            with self.assertRaisesRegex(RuntimeError, "candidate fault kind"):
+                MODULE.CandidatePauseWatcher(runner, "a" * 64, (123, "b" * 32), fault="SIGTERM")
+            watcher = MODULE.CandidatePauseWatcher(runner, "a" * 64, (123, "b" * 32), fault="failed-start")
+            self.assertEqual(watcher.fault_signal, signal.SIGKILL)
+            self.assertTrue((root / "failed-start-watcher").is_dir())
+
     @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open")
                          and hasattr(signal, "pidfd_send_signal"), "Linux pidfd signal support required")
     def test_pidfd_fault_refuses_wrong_bytes_changed_context_and_exited_child(self):
@@ -233,6 +306,21 @@ class Commands(unittest.TestCase):
                 signal.pidfd_send_signal(descriptor, signal.SIGKILL)
             child.wait(timeout=2)
             os.close(descriptor)
+
+    @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pidfd signal support required")
+    def test_candidate_exit_signal_kills_only_the_verified_process(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            expected = MODULE.sha256(Path(f"/proc/{child.pid}/exe"))
+            receipt = MODULE.pause_verified_process(child.pid, expected, lambda *_: None,
+                time.monotonic() + 5, fault_signal=signal.SIGKILL)
+            self.assertEqual(child.wait(timeout=2), -signal.SIGKILL)
+            self.assertEqual(receipt["signal"], "SIGKILL")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=2)
 
     def test_reply_acknowledgement_requires_live_peer_without_extra_bytes(self):
         for state in ("live", "closed", "extra"):

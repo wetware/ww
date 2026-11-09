@@ -1,8 +1,7 @@
 //! Service evidence for native Host replacement.
 //!
-//! Native adapters are observation-only until candidate compatibility and
-//! child-side startup admission are implemented and qualified. Successful
-//! service-manager calls alone never establish live-upgrade readiness.
+//! Native mutation is restricted to the Linux GNU ARM64 qualification candidate.
+//! Successful service-manager calls alone never establish live-upgrade readiness.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -754,11 +753,14 @@ fn launchd_snapshot(print: &str, enabled: &str, definition: &[u8]) -> Result<Ser
     })
 }
 
-/// Read-only native adapter. Candidate compatibility, exact process identity,
-/// and startup admission remain production integration gates.
-// Remains false until the full disposable native upgrade acceptance passes.
-// No environment variable or command-line option can bypass this gate.
-const NATIVE_LINUX_QUALIFIED: bool = false;
+// Owner-authorized Linux GNU ARM64 candidate for disposable qualification.
+// Every admission, process, compatibility and recovery check remains required.
+// Other targets remain refused; there is no runtime override.
+const NATIVE_LINUX_QUALIFIED: bool = cfg!(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_env = "gnu"
+));
 
 pub struct NativeService {
     home: PathBuf,

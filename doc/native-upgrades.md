@@ -5,9 +5,9 @@ the existing `Engine`. The installer, FHS updater, and daemon registration retai
 their separate responsibilities. Native replacement does not change the FHS,
 identity, namespaces, service arguments, or publication authority.
 
-The production `NativeService` adapter remains disabled until native acceptance
-passes. Current component tests do not authorize an installed-CLI upgrade.
-macOS also lacks qualified exact running-executable evidence.
+The `NativeService` adapter is enabled as a Linux GNU ARM64 qualification
+candidate. Disposable installed-CLI qualification is in progress. Other targets
+remain refused. macOS also lacks qualified exact running-executable evidence.
 
 ## Startup admission
 
@@ -21,7 +21,7 @@ ww startup admit --timeout-secs 300 service
 ww startup admit --timeout-secs 300 run --executor-threads 2
 ```
 
-These commands require a qualified native adapter. The number above is an
+These commands require a supported native adapter. The number above is an
 explicit example budget, not a measured or automatic timeout recommendation.
 `--check` prepares the inputs and reports the proposed admission without changing
 the contract. Preparation can fetch and retain public content in Kubo.
@@ -140,6 +140,35 @@ ww upgrade --release CID --timeout-secs 300
 ww upgrade --rollback --timeout-secs 300
 ww upgrade --release CID --check
 ```
+
+These forms read the admitted managed service's actual configuration. For a
+standalone contract, append the original `run` options to recapture its inputs:
+
+```sh
+ww upgrade --release CID --timeout-secs 300 run --executor-threads 2 /srv/workload
+ww upgrade --release CID --check run --executor-threads 2 /srv/workload
+ww upgrade --rollback --timeout-secs 300 run --executor-threads 2 /srv/workload
+ww upgrade --recover-only --release CID --timeout-secs 300 run --executor-threads 2 /srv/workload
+```
+
+Use the admitted working directory, HOME, environment, identity, sources, and run
+options. Options before `run` control release selection; options after `run`
+describe the Host invocation. For example, each position has its own `--ipfs-url`.
+The CLI compares the complete captured identity with the persisted contract
+before publishing captured sources or replacing native bytes. Changed inputs
+refuse; the command does not implicitly re-admit them.
+
+Omitting `run` never reconstructs standalone inputs from defaults. Changed
+standalone operations require the explicit subcommand. An exact-artifact
+standalone no-op skips recapture. A managed contract rejects the `run` subcommand
+and continues to use the manager's existing configuration.
+
+Rollback preserves the current admitted inputs while selecting retained native
+bytes. Interrupted recovery compares against the transaction's recorded
+before-contract. For `--recover-only`, the selected CID must authenticate the
+executable running recovery; the journal determines the restored generation.
+Standalone replacement requires the admitted manual process to be stopped and
+does not grant automatic restart authority.
 
 Changed upgrades, rollback, and recovery require a positive explicit timeout.
 Exact-artifact no-ops and read-only checks do not need a restart budget.

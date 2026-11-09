@@ -5,7 +5,7 @@
 //! and, for running services, child-side restart admission are qualified.
 
 use anyhow::{bail, ensure, Context, Result};
-use clap::Args;
+use clap::{Args, Subcommand};
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::Read;
@@ -69,6 +69,36 @@ pub(super) struct UpgradeArgs {
     /// Emit one versioned result object on stdout.
     #[arg(long)]
     pub json: bool,
+    #[command(subcommand)]
+    pub invocation: Option<UpgradeInvocation>,
+}
+
+#[derive(Subcommand, Debug)]
+pub(super) enum UpgradeInvocation {
+    /// Recapture these exact already-admitted standalone run options.
+    Run(Box<super::RunArgs>),
+}
+
+impl UpgradeArgs {
+    fn standalone_run(&self) -> Option<super::RunArgs> {
+        self.invocation.as_ref().map(|invocation| match invocation {
+            UpgradeInvocation::Run(run) => run.as_ref().clone(),
+        })
+    }
+
+    fn validate_supplied_run(&self, engine: &Engine) -> Result<()> {
+        if self.invocation.is_some() {
+            let contract = engine.preparation_contract()?;
+            ensure!(
+                matches!(
+                    contract.invocation,
+                    ww::upgrade::startup::InvocationBinding::Standalone
+                ),
+                "managed upgrade uses the manager's exact invocation; omit the run subcommand"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -446,6 +476,7 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
         let deadline = require_deadline(deadline)?;
         let mut engine = Engine::from_lock(lock)?;
         engine.require_pending_recovery()?;
+        args.validate_supplied_run(&engine)?;
         let before = observe_artifact(&target)?;
         let executable = read_bounded(&std::env::current_exe()?, MAX_HOST_BYTES)?;
         let authenticated = within_budget(
@@ -470,7 +501,16 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
             &authenticated,
         )? {
             Some(outcome) => outcome,
-            None => recover_prepared(&mut engine, &mut service, home, deadline).await?,
+            None => {
+                recover_prepared(
+                    &mut engine,
+                    &mut service,
+                    home,
+                    deadline,
+                    args.standalone_run(),
+                )
+                .await?
+            }
         };
         return completed(outcome, selected_artifact, target, before);
     }
@@ -483,8 +523,16 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
     } else if pending {
         let deadline = require_deadline(deadline)?;
         let mut engine = Engine::from_lock(lock)?;
+        args.validate_supplied_run(&engine)?;
         let before = observe_artifact(&target)?;
-        let outcome = recover_prepared(&mut engine, &mut service, home, deadline).await?;
+        let outcome = recover_prepared(
+            &mut engine,
+            &mut service,
+            home,
+            deadline,
+            args.standalone_run(),
+        )
+        .await?;
         return completed(outcome, None, target, before);
     }
     let before = observe_artifact(&target)?;
@@ -519,10 +567,13 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
     let installed = engine.current_generation()?;
     // Validate retained contract metadata even for an exact-artifact no-op.
     engine.startup_contract()?;
+    args.validate_supplied_run(&engine)?;
     if args.rollback {
         let deadline = require_deadline(deadline)?;
         let contract = engine.preparation_contract()?;
-        let inputs = super::startup::capture_for_upgrade(home, &contract, deadline, None).await?;
+        let inputs =
+            super::startup::capture_for_upgrade(home, &contract, deadline, args.standalone_run())
+                .await?;
         let outcome = engine.operator_rollback_prepared_until(&mut service, deadline, &inputs)?;
         return completed(outcome, None, target, before);
     }
@@ -543,7 +594,9 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
         require_deadline(deadline)?
     };
     let contract = engine.preparation_contract()?;
-    let inputs = super::startup::capture_for_upgrade(home, &contract, deadline, None).await?;
+    let inputs =
+        super::startup::capture_for_upgrade(home, &contract, deadline, args.standalone_run())
+            .await?;
     let candidate =
         within_budget(Some(deadline), select_release(&args.release, Scope::Host)).await?;
     let selected_artifact = Some(candidate.generation.artifact().clone());
@@ -566,12 +619,13 @@ async fn recover_prepared(
     service: &mut impl ServiceControl,
     home: &Path,
     deadline: Instant,
+    standalone: Option<super::RunArgs>,
 ) -> Result<Outcome> {
     if let Some(outcome) = engine.recover_without_preparation_until(service, deadline)? {
         return Ok(outcome);
     }
     let contract = engine.preparation_contract()?;
-    let inputs = super::startup::capture_for_upgrade(home, &contract, deadline, None).await?;
+    let inputs = super::startup::capture_for_upgrade(home, &contract, deadline, standalone).await?;
     engine.recover_prepared_until(service, deadline, &inputs)
 }
 
@@ -835,6 +889,64 @@ mod tests {
     }
 
     #[test]
+    fn standalone_run_grammar_forwards_exact_options_for_each_operation() {
+        for operation in [
+            vec!["--release", "CID", "--timeout-secs", "17"],
+            vec!["--release", "CID", "--check"],
+            vec!["--rollback", "--timeout-secs", "17"],
+            vec!["--recover-only", "--release", "CID", "--timeout-secs", "17"],
+        ] {
+            let mut arguments = vec!["ww", "upgrade", "--ipfs-url", "http://127.0.0.1:5002"];
+            arguments.extend(operation);
+            arguments.extend([
+                "run",
+                "--ipfs-url",
+                "http://127.0.0.1:5003",
+                "--identity",
+                "/fixture/identity",
+                "--fhs-root",
+                "/fixture/fhs",
+                "--executor-threads",
+                "7",
+                "--with-http-admin",
+                "off",
+                "--listen",
+                "/ip4/127.0.0.1/tcp/4321",
+                "--wasm-debug",
+                "--runtime-cache-policy",
+                "isolated",
+                "/fixture/source:/app",
+            ]);
+            let parsed = super::super::Cli::try_parse_from(arguments).unwrap();
+            let super::super::Commands::Upgrade(args) = parsed.command else {
+                panic!("upgrade expected")
+            };
+            assert_eq!(args.release.ipfs_url, "http://127.0.0.1:5002");
+            let forwarded = args
+                .standalone_run()
+                .expect("explicit run must be forwarded");
+            assert_eq!(forwarded.ipfs_url, "http://127.0.0.1:5003");
+            assert_eq!(forwarded.identity.as_deref(), Some("/fixture/identity"));
+            assert_eq!(forwarded.fhs_root, Some(PathBuf::from("/fixture/fhs")));
+            assert_eq!(forwarded.executor_threads, 7);
+            assert_eq!(forwarded.with_http_admin, "off");
+            assert_eq!(forwarded.listen[0].to_string(), "/ip4/127.0.0.1/tcp/4321");
+            assert!(forwarded.wasm_debug);
+            assert_eq!(forwarded.runtime_cache_policy, "isolated");
+            assert_eq!(forwarded.mounts, ["/fixture/source:/app"]);
+        }
+        let parsed =
+            super::super::Cli::try_parse_from(["ww", "upgrade", "--release", "CID"]).unwrap();
+        let super::super::Commands::Upgrade(args) = parsed.command else {
+            panic!("upgrade expected")
+        };
+        assert!(
+            args.standalone_run().is_none(),
+            "missing run must not reconstruct default inputs"
+        );
+    }
+
+    #[test]
     fn recovery_only_grammar_requires_explicit_release_and_rejects_other_operations() {
         for arguments in [
             vec!["ww", "upgrade", "--recover-only"],
@@ -950,6 +1062,7 @@ mod tests {
                 timeout_secs: Some(15),
                 check: false,
                 json: false,
+                invocation: None,
             };
             let error = execute_at(&args, home.path()).await.err().unwrap();
             assert!(
@@ -1219,6 +1332,7 @@ mod tests {
             timeout_secs: None,
             check: false,
             json: false,
+            invocation: None,
         };
         let report = execute_at(&args, home.path()).await.unwrap();
         assert_eq!(report.outcome, Outcome::AlreadyInstalled);
@@ -1248,6 +1362,7 @@ mod tests {
             timeout_secs: None,
             check: false,
             json: false,
+            invocation: None,
         };
         let error = execute_at(&args, home.path()).await.err().unwrap();
         assert!(error.to_string().contains("--timeout-secs"), "{error:#}");
@@ -1275,6 +1390,7 @@ mod tests {
                 timeout_secs: None,
                 check: false,
                 json: false,
+                invocation: None,
             };
             let error = execute_at(&args, home.path()).await.err().unwrap();
             assert!(error.to_string().contains("--timeout-secs"));

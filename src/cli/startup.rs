@@ -1669,7 +1669,7 @@ mod tests {
                 ("WW_COMPILE_WORKERS".into(), "1".into()),
                 (
                     "HTTPS_PROXY".into(),
-                    "http://private:credential@proxy.invalid".into(),
+                    "http://fixture:PASSWORD@proxy.invalid".into(),
                 ),
             ]),
         )
@@ -1781,12 +1781,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upgrade_capture_refuses_missing_standalone_options_and_managed_overrides() {
+        use clap::Parser;
+        use ww::upgrade::{
+            service::{EnabledState, StartupIdentity},
+            startup::{ServiceIdentity, ServiceManager},
+            ArtifactIdentity, DigestAlgorithm,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let contract = |invocation| {
+            StartupContractV1::new(
+                [1; 32],
+                1,
+                ArtifactIdentity {
+                    algorithm: DigestAlgorithm::Sha256,
+                    digest: "a".repeat(64),
+                    size: 42,
+                },
+                StartupIdentity {
+                    configuration: "configuration".into(),
+                    fhs_baseline: None,
+                    frozen_sources: "sources".into(),
+                    publisher_target: None,
+                },
+                invocation,
+                PathBuf::from("/etc/wetware/release-keys"),
+            )
+            .unwrap()
+        };
+        let error = capture_for_upgrade(
+            root.path(),
+            &contract(InvocationBinding::Standalone),
+            Instant::now() + Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exact admitted run options"));
+        let parsed =
+            super::super::Cli::try_parse_from(["ww", "run", "--fhs-root", "/missing-fhs"]).unwrap();
+        let Commands::Run(run) = parsed.command else {
+            panic!("run expected")
+        };
+        let managed = contract(InvocationBinding::Managed {
+            service: ServiceIdentity {
+                manager: ServiceManager::Systemd,
+                domain: "user:1000".into(),
+                name: "ww.service".into(),
+                definition: [1; 32],
+                drop_ins: [2; 32],
+                environment_files: [3; 32],
+                effective_argv: [4; 32],
+                effective_environment: [5; 32],
+                registered: true,
+                enabled: EnabledState::Disabled,
+            },
+        });
+        let error = capture_for_upgrade(
+            root.path(),
+            &managed,
+            Instant::now() + Duration::from_secs(2),
+            Some(run),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("manager's exact invocation"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn local_capture_needs_no_kubo_effects_and_binds_bytes_and_runtime() {
         let root = tempfile::tempdir().unwrap();
-        let run = service_run(root.path(), BTreeMap::new(), &[]);
+        let mut run = service_run(root.path(), BTreeMap::new(), &[]);
+        run.config.ipfs_url = "http://127.0.0.1:1".into();
         let payload = root.path().join("sources/payload");
         std::fs::write(&payload, b"first capture").unwrap();
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        ww::keys::save(&key, run.config.identity_path.as_ref().unwrap()).unwrap();
         let (owner, resources) = cache::HostFsOwner::start(
             tokio::runtime::Handle::current(),
             cache::HostLimits::default(),
@@ -1806,6 +1880,11 @@ mod tests {
             .await
             .unwrap();
         let first_identity = first.inputs.startup_identity().unwrap();
+        let unchanged = capture_startup(&run, &[], &[], &key, &client, &transaction, &mut cancel)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.inputs.startup_identity().unwrap(), first_identity);
+        drop(unchanged);
         let mut changed_config = first.inputs.clone();
         changed_config.config.runtime.compile_workers += 1;
         let changed_identity = changed_config.startup_identity().unwrap();
@@ -1829,6 +1908,21 @@ mod tests {
         );
         assert!(first.inputs.sources.is_empty());
         assert!(first.inputs.validate().is_err());
+        let error = capture_for_contract(
+            run,
+            Some(&first_identity),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("captured upgrade inputs differ"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&payload).unwrap(),
+            b"replacement after capture"
+        );
         drop(first);
         drop(second);
         drop(transaction);
@@ -1843,8 +1937,8 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let root = tempfile::tempdir().unwrap();
         let mut run = service_run(root.path(), BTreeMap::new(), &[]);
-        run.config.rpc_url = "https://token:secret@example.invalid".into();
-        assert!(!format!("{:?}", run.config).contains("secret"));
+        run.config.rpc_url = "https://fixture:PASSWORD@example.invalid".into();
+        assert!(!format!("{:?}", run.config).contains("PASSWORD"));
         let mut inputs = PreflightInputs {
             version: 1,
             config: run.config,
