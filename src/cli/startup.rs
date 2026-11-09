@@ -1676,7 +1676,7 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.to_string().contains("proxy"));
-        assert!(!error.to_string().contains("credential"));
+        assert!(!error.to_string().contains("PASSWORD"));
         let error = InvocationContext::service(
             PathBuf::from("/home/operator"),
             PathBuf::from("/home/operator"),
@@ -1949,7 +1949,7 @@ mod tests {
             sources: vec![],
             publisher: None,
         };
-        assert!(!format!("{inputs:?}").contains("secret"));
+        assert!(!format!("{inputs:?}").contains("PASSWORD"));
         inputs.config.cwd = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
         assert!(inputs.capture_digest().is_err());
     }
