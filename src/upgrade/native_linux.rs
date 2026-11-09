@@ -893,7 +893,7 @@ fn directory_custody(path: &Path, uid: u32) -> Result<()> {
         let metadata =
             std::fs::symlink_metadata(&prefix).context("inspect systemd input directory")?;
         ensure!(metadata.is_dir() && (metadata.uid()==0 || metadata.uid()==uid)
-            && (metadata.mode() & 0o022 == 0 || (metadata.uid()==0 && metadata.mode() & libc::S_ISVTX as u32 != 0)),
+            && (metadata.mode() & 0o022 == 0 || (metadata.uid()==0 && u64::from(metadata.mode()) & u64::from(libc::S_ISVTX) != 0)),
             "systemd input directory {} must be owned without symlinks or unprotected other-user writes", prefix.display());
     }
     Ok(())
@@ -1755,11 +1755,11 @@ fn launch_preflight(
             command.pre_exec(move || {
                 // ELF execve resolves /proc/self/fd/N before closing CLOEXEC
                 // descriptors. The executable descriptor remains CLOEXEC.
-                for fd in [control_fd] {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                let flags = libc::fcntl(control_fd, libc::F_GETFD);
+                if flags < 0
+                    || libc::fcntl(control_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });

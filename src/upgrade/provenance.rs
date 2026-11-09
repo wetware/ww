@@ -98,7 +98,7 @@ fn trust_directory(path: &Path, uid: u32) -> Result<()> {
     // Root-owned sticky temporary ancestors protect the following owned entry.
     // Every descendant is checked independently.
     let protected = metadata.mode() & 0o022 == 0
-        || (metadata.uid() == 0 && metadata.mode() & libc::S_ISVTX as u32 != 0);
+        || (metadata.uid() == 0 && u64::from(metadata.mode()) & u64::from(libc::S_ISVTX) != 0);
     ensure!(metadata.is_dir() && (metadata.uid() == 0 || metadata.uid() == uid) && protected,
         "release trust directory must be owned by root or this user without symlinks or unprotected other-user writes");
     Ok(())
