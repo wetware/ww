@@ -29,7 +29,7 @@ Run `ww --version` to see if the binary is installed.
 
 Tell them how to get started:
 
-**Linux or macOS (authenticated release):**
+**Linux GNU ARM64 qualification candidate (authenticated release):**
 Provision the release keyring independently. Set `RELEASE_CID` to the selected
 signed release and use an independently obtained installer:
 
@@ -41,19 +41,26 @@ The installer requires Kubo and OpenSSL 3.x or 4.x. It validates the Host and
 kernel/status FHS, preserves existing identity, and creates no daemon or namespace.
 Automatic channel selection remains gated. Source builds can run with explicit
 FHS and identity; they do not bypass authenticated installation.
-See `doc/installation.md` for prerequisites and current release activation gates.
+Native acceptance remains pending. Other targets refuse guarded admission;
+fresh guarded installation is unavailable on macOS. See `doc/installation.md`
+for prerequisites and current release activation gates.
 
-Register a service only when requested, using `ww daemon install` and the same
-startup options as `ww run`. Fresh registration is disabled. Activation uses
-native systemd or launchd commands and requires separate operator intent.
+A fresh guarded installation requires stopped `ww startup admit` with the exact
+intended inputs before its first run. Register a service only when requested.
+Follow the guarded service recipe in `doc/installation.md`: persist explicit
+executor and compiler worker counts, choose enablement while stopped, admit the
+actual configuration, then start. Admission does not enable or start a service.
+Existing unguarded installations keep their separate native activation path.
 
 ### If installed
 
 Check if setup is complete: `ww doctor`
 
 Look at the "Install state" section. Missing daemon registration is valid for a
-foreground installation. `ww install` repairs only the exact recorded package;
-it cannot upgrade the Host or FHS. A missing recorded identity requires restoring
+foreground installation. Guarded repair requires
+`ww install --release <RECORDED_ROOT>` with the exact authenticated package.
+Bare `ww install` retains only the separate legacy exact-artifact repair path.
+Neither repair upgrades the Host or FHS. A missing recorded identity requires restoring
 the original identity from backup. Do not regenerate identity during repair.
 
 If everything is OK, hand off to the quickstart.

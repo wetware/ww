@@ -37,24 +37,38 @@ installation. Existing valid identity remains unchanged; malformed identity or
 missing identity in a recorded installation causes refusal.
 
 Installation does not register a daemon, create `etc/ns/ww`, import a standard
-namespace, publish a name, or contact Kubo after the package is staged. Existing
-namespace and service configuration remains unchanged. Private identity, keys,
+namespace, or publish a name. Existing namespace and service configuration
+remains unchanged. Private identity, keys,
 IPNS records, watermarks, caches, logs, and application data stay outside the FHS.
 
 The native bootstrap handoff reauthenticates the staged manifest with the
-independent keyring before parsing or installing component payloads.
+independent keyring before parsing or installing component payloads. It also
+fetches the immutable release descriptor metadata through the shared native
+HTTP release selector after shell staging; staged payloads alone do not supply
+the complete retained proof.
 `ww install --release <CID>` authenticates an immutable release through the
 shared release descriptor and installs its selected platform Host and FHS.
 `--trusted-release-keys` defaults to `/etc/wetware/release-keys`.
 `--check` validates without installing; `--json` prints one versioned result.
 
+The shell stages bytes with the configured `ipfs` CLI. Native installation and
+recovery use the Kubo HTTP endpoint selected by `--ipfs-url`, then `IPFS_API`,
+then `http://localhost:5001`. The shell's `--ipfs-url` is forwarded to those
+native calls; it does not reconfigure the shell's `ipfs` CLI. Configure both
+paths when using a nondefault Kubo, for example:
+
+```sh
+# First configure the ipfs CLI to reach the intended Kubo daemon.
+sh scripts/install.sh --release <CID> --ipfs-url http://127.0.0.1:55001
+```
+
 ## Separate software and service operations
 
 | Command | Effect |
 |---|---|
-| `ww install` | Create or repair the same recorded Host/FHS package and identity. No service registration or publication. |
+| `ww install --release <CID>` | Create the authenticated Host/FHS package and identity, or repair the exact recorded guarded package. No service registration or publication. |
 | `ww image update --release <CID>` | Authenticate and update only the owned baseline FHS. No Host replacement or restart. |
-| `ww upgrade --release <CID>` | Authenticate native selection and enter the #739 engine. Native replacement remains blocked by the operational gates below. |
+| `ww upgrade --release <CID>` | Authenticate native selection and enter the #739 engine. Changed operations require an explicit timeout and the operational admission below. |
 | `ww upgrade --rollback` | Request retained native recovery through the same engine and admission gates. |
 | `ww uninstall` | Remove owned software and daemon registration; preserve user state and recovery evidence. |
 | `ww daemon install [RUN OPTIONS] [MOUNT...]` | Register a disabled service using existing identity and startup paths. No image import or identity generation. |
@@ -64,10 +78,13 @@ shared release descriptor and installs its selected platform Host and FHS.
 no top-level `update`. Deployment following remains `run --stem` or
 `run --ipns-stem`; publishers retain authority to advance those sources.
 
-Register a service separately, with the same options as `run`:
+The guarded first-start recipe below applies to the Linux GNU ARM64
+qualification candidate. Native acceptance remains pending; other targets
+refuse guarded admission. Register a service separately with explicit executor
+threads and the intended `run` options:
 
 ```sh
-ww daemon install --http-listen 127.0.0.1:2080
+ww daemon install --executor-threads 2 --http-listen 127.0.0.1:2080
 ```
 
 A fresh registration is disabled and stopped. An identical owned registration
@@ -77,15 +94,41 @@ exist. Generate a new key at an unused path with `ww keygen --output PATH`.
 The service stores absolute local paths and explicit environment-derived options.
 There is no daemon-only default HTTP listener.
 
-On Linux, activate explicitly:
+For this fresh Linux registration, persist a positive compiler worker count in
+the actual service environment. The example creates a new drop-in without
+overwriting an existing file; preserve and review any existing custom settings.
+
+```sh
+mkdir -p "$HOME/.config/systemd/user/ww.service.d"
+(
+  umask 077
+  set -C
+  cat > "$HOME/.config/systemd/user/ww.service.d/worker-counts.conf" <<'EOF'
+[Service]
+Environment=WW_COMPILE_WORKERS=2
+EOF
+)
+```
+
+Reload the definition and choose the desired enablement while the service is
+still stopped. Then admit that exact configuration and start it:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now ww
+systemctl --user enable ww.service       # omit to keep login activation disabled
+ww startup admit --timeout-secs 300 service
+systemctl --user start ww.service
 ww healthcheck --ready
 ```
 
-On macOS, use the logged-in GUI domain:
+The worker counts and 300-second budget are explicit example choices. Admission
+does not enable or start the service. Generated units require the user manager's
+resolved home as their working directory. Custom settings are not rewritten by
+upgrades; changes to admitted inputs require stopped re-admission. The drop-in
+is operator-owned: daemon removal refuses external drop-ins, so preserve it and
+remove that custom configuration explicitly before removing registration.
+
+For existing unguarded macOS installations, use the logged-in GUI domain:
 
 ```sh
 launchctl enable "gui/$(id -u)/io.wetware.ww"
@@ -95,7 +138,8 @@ ww healthcheck --ready
 
 Registration requires that GUI domain; there is no implicit headless fallback.
 The plist and persistent launchd override both disable fresh registration.
-Service-manager acceptance does not prove Host readiness.
+macOS guarded admission remains unavailable; these manager commands do not
+bypass that refusal. Service-manager acceptance does not prove Host readiness.
 
 ## Existing files and recovery
 
@@ -104,6 +148,10 @@ to `upgrade`. It refuses a different FHS package and directs the operator to
 `image update`. Re-running a newer shell installer cannot bypass these checks.
 Same-artifact repair can restore missing owned software; unknown collisions,
 symlinks, and altered owned files cause refusal. Unknown FHS files remain intact.
+For guarded installations, select the exact authenticated recorded package with
+`ww install --release <RECORDED_ROOT>` or rerun its signed shell bootstrap.
+Bare `ww install` supports only the separate legacy repair path; guarded
+metadata requires authenticated release selection even for identical bytes.
 
 Version-2 `installation.json` names executable and FHS ownership separately.
 It retains legacy namespace/service hashes as provenance. Complete version-1
@@ -168,9 +216,25 @@ holds the installation lock, reauthenticates the typed release, verifies its own
 executable bytes, and matches the recorded generation before calling `Engine::recover`.
 It never falls through to fresh installation or new-release selection.
 
-The shell uses the configured Kubo CLI for staging. Native reauthentication uses
-`--ipfs-url`, `IPFS_API`, or `http://localhost:5001`, in that order. Configure both
-endpoints when using a nondefault Kubo. The recorded release must contain a Host
+The shell wrapper cannot forward standalone `run` arguments. It can recover a
+managed transaction from the manager's actual configuration, and it can finish
+recorded recovery that needs no input preparation. Standalone recovery that
+does require preparation must invoke an authenticated native recovery executable
+directly with the exact original arguments:
+
+```sh
+/path/to/authenticated/ww upgrade --recover-only --release <RECOVERY_EXECUTABLE_CID> \
+  --timeout-secs N run [RUN_OPTIONS] [MOUNT...]
+```
+
+Use the recorded before-contract's working directory, HOME, environment, identity,
+and sources. The CID authenticates the executable running recovery; the journal
+selects the restored generation. See the
+[explicit native recovery form](native-upgrades.md#replacement-and-recovery).
+There is no default standalone invocation reconstructed by the shell wrapper.
+
+Shell staging and native HTTP reauthentication use the separate endpoint scopes
+described above. The recorded release must contain a Host
 with this recovery entry point. Missing, incompatible, or unrelated artifacts
 cause refusal. Recovery preserves the native operational gates below.
 
@@ -188,7 +252,9 @@ release locator or ownership hash cannot substitute for signed release evidence.
 Existing unguarded installations do not acquire native upgrade authority through
 an implicit migration.
 
-The production adapter remains disabled pending complete native qualification.
+The native adapter is enabled as a Linux GNU ARM64 qualification candidate;
+disposable installed-CLI acceptance remains pending. Other targets refuse
+native admission and replacement.
 Exact authenticated no-ops and permitted recorded recovery can complete without
 replacement. Linux process/manager component checks do not establish the full
 installed-CLI acceptance path. macOS exact main-executable evidence remains

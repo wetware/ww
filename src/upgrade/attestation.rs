@@ -4,8 +4,9 @@
 //! authorization, startup admission, service membership, or readiness. A Linux
 //! pidfd and start ticks survive exec, including exec of the same file. Consumers
 //! must separately bind a fresh challenge, launch nonce, close-on-exec socket,
-//! startup contract, and manager observations. No native adapter uses these
-//! primitives until the complete platform contract is qualified.
+//! startup contract, and manager observations. The Linux GNU ARM64 adapter uses
+//! these primitives as a disposable qualification candidate. Complete native
+//! platform acceptance remains pending; other targets refuse native admission.
 //!
 //! Deadlines are checked around bounded reads and observations. They cannot
 //! cancel a filesystem syscall already in progress.

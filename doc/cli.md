@@ -62,6 +62,13 @@ Boot a wetware node.
 ww run [OPTIONS] [MOUNT...]
 ```
 
+A fresh guarded installation must first complete stopped `ww startup admit`
+with the same run options, working directory, environment, identity, and sources.
+Changed inputs require re-admission. Guarded admission is currently available
+only to the Linux GNU ARM64 qualification candidate; native acceptance remains
+pending and other targets refuse. The examples below describe invocation forms,
+not permission to bypass that contract. See [startup admission](#ww-startup-admit).
+
 Every positional argument is a mount: `source[:target]`.
 Without `:target`, the source is mounted at `/` (image layer).
 With `:target`, the source is overlaid at that guest path.
@@ -178,6 +185,7 @@ RPC listener and does not serve this path. Wetware does not fall back to Kubo's
 | `IPFS_API` | user | Default IPFS HTTP API endpoint |
 | `IPFS_ROUTING_API` | user | Kubo Gateway listener for HTTP Routing V1. Default: `http://localhost:8080`. |
 | `WW_HTTP_ADMIN` | user | Admin listener address, or `off` to disable it |
+| `WW_COMPILE_WORKERS` | operator | Compiler worker count. Guarded managed admission requires an explicit positive value in the service environment, together with positive executor threads. |
 | `WW_CWASM_DIR` | operator | Optional directory for Wasmtime's native compilation cache. Wasmtime owns artifact compatibility; an unavailable directory falls back to uncached compilation. |
 | `WW_CWASM_CACHE_MAX_BYTES` | operator | Wasmtime cache cleanup threshold in bytes (default: `335544320`). This is a soft limit, so leave filesystem headroom. |
 | `WW_OCI_IMAGE_ID` | operator | Optional immutable OCI image identity reported by `/version`. Deployment verification uses Kubernetes `pod.status.imageID` as the authority. |
@@ -445,8 +453,11 @@ Different native bytes require `upgrade`; different FHS bytes require `image upd
 ww install [--release CID] [--check] [--json]
 ```
 
-Without `--release`, an existing installation permits exact-artifact repair.
-Fresh installation requires an authenticated release or signed bootstrap handoff;
+Guarded repair requires `ww install --release <RECORDED_ROOT>` with the exact
+authenticated recorded package. Bare `install` retains its separate legacy
+exact-artifact repair behavior; it cannot repair an installation with guarded
+metadata. Fresh installation requires an authenticated release or signed
+bootstrap handoff;
 automatic channel discovery awaits provisioning. `--trusted-release-keys` supplies
 the independent keyring. See [installation](installation.md).
 
@@ -475,7 +486,28 @@ Request explicit authenticated native Host replacement through #739:
 ww upgrade --release CID --timeout-secs N [--json]
 ww upgrade --rollback --timeout-secs N [--json]
 ww upgrade --release CID --check [--json]
+
+# Standalone contracts: supply the original admitted invocation.
+ww upgrade --release CID --timeout-secs N [--json] run [RUN_OPTIONS] [MOUNT...]
+ww upgrade --release CID --check [--json] run [RUN_OPTIONS] [MOUNT...]
+ww upgrade --rollback --timeout-secs N [--json] run [RUN_OPTIONS] [MOUNT...]
+ww upgrade --recover-only --release CID --timeout-secs N [--json] run [RUN_OPTIONS] [MOUNT...]
 ```
+
+`RUN_OPTIONS` and mounts use the `ww run` grammar. Options before `run` control
+release selection; options after it describe the admitted Host. Each position
+has its own `--ipfs-url`. Use the admitted working directory, HOME, environment,
+identity, and sources. Changed standalone operations require this explicit
+recapture; omitted options are not reconstructed from the stored contract.
+An exact-artifact no-op skips recapture. Recovery that needs no preparation can
+also finish without `run`; other standalone recovery requires it. Managed
+contracts reject `run` and use the actual service configuration.
+
+Rollback preserves current admitted inputs while selecting retained native bytes.
+Interrupted recovery uses the journal's recorded before-contract. With
+`--recover-only`, the CID authenticates the executable running recovery; the
+journal determines the restored generation. Stop a standalone Host before
+replacement or rollback. These commands do not grant it automatic restart.
 
 Changed upgrades, rollback, and recovery require a positive explicit timeout.
 Exact-artifact no-ops do not need a restart budget. The command authenticates
@@ -484,10 +516,12 @@ FHS, namespace, identity, service configuration, and deployment authority.
 `--release` explicitly permits an authenticated historic selection; it does not
 lower freshness state. Recovery precedes new selection.
 
-Native replacement remains gated pending complete native qualification. The
-engine now binds retained signed proof, startup contracts, and exact process
-evidence, but the production adapter remains disabled. Exact authenticated no-ops
-can succeed. Rollback preflight (`--rollback --check`) remains unavailable.
+The native adapter is enabled as a Linux GNU ARM64 qualification candidate.
+Disposable installed-CLI acceptance remains pending; other targets refuse
+native admission and replacement. The engine requires retained signed proof,
+startup contracts, and exact process evidence. Exact authenticated no-ops can
+succeed without replacement. Rollback preflight (`--rollback --check`) remains
+unavailable.
 Missing installed-release provenance causes refusal. Neither the
 installer nor any flag bypasses these gates. See [native upgrades](native-upgrades.md).
 
@@ -507,12 +541,16 @@ services. A running manual Host must exit before re-admission.
 
 `--trusted-release-keys FILE` explicitly rebinds the independently provisioned
 public keyring path. Otherwise admission rereads the stored absolute path.
-Pending candidate launches use current keys at that path. Historical keys apply
-only to exact committed generations during rollback.
+Pending new-candidate launches use current keys at that path. Retained
+historical public-key evidence can authenticate only the exact committed current
+and previous generations, including steady startup and retained rollback. It
+cannot authorize a different candidate signed by a removed key.
 
 `--check` leaves startup metadata unchanged; preparation can retain public Kubo
 content. Managed invocations currently need explicit executor and compiler worker
-counts. Native adapter qualification gates also apply to admission. See
+counts in their actual configuration. Choose the intended enablement state while
+the service is stopped, then admit that configuration before starting it. Native
+adapter qualification gates also apply to admission. See
 [startup and native recovery](native-upgrades.md).
 
 ## ww uninstall

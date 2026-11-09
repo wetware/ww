@@ -19,12 +19,24 @@ model running inside the cell.
 
 ## Try it in 60 seconds
 
+This signed-install example applies to the Linux GNU ARM64 qualification
+candidate. Native acceptance is still pending; other native targets refuse
+guarded admission. Provision the independent release keyring and select
+`RELEASE_CID` first; see [installation](doc/installation.md).
+
 ```sh
 curl -fsSL https://wetware.run/install | sh -s -- --release "$RELEASE_CID"
+export WW_COMPILE_WORKERS=2
+# Admit these exact inputs while the installed Host is stopped.
+ww startup admit --timeout-secs 300 run --executor-threads 2 --http-listen 127.0.0.1:2080
 # Start in the foreground; query /status from another terminal.
-ww run --http-listen 127.0.0.1:2080
+ww run --executor-threads 2 --http-listen 127.0.0.1:2080
 # In another terminal: curl http://localhost:2080/status
 ```
+
+Keep the admitted working directory, environment, identity, and sources for
+the run command. Changed inputs require stopped re-admission. The 300-second
+budget is an explicit example, not a qualification result.
 
 ```json
 {
@@ -62,7 +74,8 @@ baseline FHS, and identity. Automatic channel selection is not yet integrated.
 Installation does not register a daemon or configure name publication. Register
 separately with `ww daemon install`. Fresh guarded installations require explicit
 stopped `ww startup admit` before activation. Native adapter qualification gates
-apply to admission and replacement; see [native platform limits](doc/native-upgrades.md).
+apply to admission and replacement: Linux GNU ARM64 is a qualification candidate,
+and other targets remain refused. See [native platform limits](doc/native-upgrades.md).
 `ww image update` changes only the baseline and never restarts the Host.
 `ww uninstall` preserves user state. `ww upgrade` uses authenticated native
 selection, but replacement remains gated on native operational admission.
@@ -90,10 +103,17 @@ Repository builds use committed Cargo lockfiles. See the
 
 ### Run a node
 
+For a guarded installation on the candidate platform, admit the exact invocation
+before starting it. Stop the Host before changing and re-admitting its inputs:
+
 ```bash
-ww run                                  # boot the installed FHS
+export WW_COMPILE_WORKERS=2
+ww startup admit --timeout-secs 300 run --executor-threads 2
+ww run --executor-threads 2              # boot the admitted installed FHS
+# After stopping the Host:
 ww image check                          # validate static PID0 compatibility
-ww run .                                # explicitly overlay the current directory
+ww startup admit --timeout-secs 300 run --executor-threads 2 .
+ww run --executor-threads 2 .            # explicitly overlay the current directory
 ```
 
 ### Build the example cells
