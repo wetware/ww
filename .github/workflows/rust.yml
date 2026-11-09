@@ -414,10 +414,10 @@ jobs:
     - name: Check integration harness contracts
       run: |
         mkdir -p "$WW739_LANE"
-        python3 -m unittest discover -s tests -p 'test_verify_native_release_inputs.py' -v
-        python3 -m unittest discover -s tests -p 'test_guarded_boot_fixture.py' -v
-        python3 -m unittest discover -s tests -p 'test_native_release_integration.py' -v
-        python3 -m unittest discover -s tests -p 'test_native_release_provisioner.py' -v
+        python3 tests/test_verify_native_release_inputs.py -v
+        python3 tests/test_guarded_boot_fixture.py -v
+        python3 tests/test_native_release_integration.py -v
+        python3 tests/test_native_release_provisioner.py -v
         python3 tests/test_qualify_native_upgrade.py Inputs.test_fault_stop_policy_requires_terminal_failure_configuration Inputs.test_fault_stop_policy_refuses_automatic_restart_or_missing_evidence -v
         git rev-parse HEAD > "$WW739_LANE/checkout-sha"
         printf '%s\n' "$PR_HEAD_SHA" > "$WW739_LANE/pr-head-sha"
