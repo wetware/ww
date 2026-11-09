@@ -32,19 +32,38 @@ impl Recorder {
             while !done.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_millis(100)))
-                            .unwrap();
+                        // Accepted sockets can inherit the listener's nonblocking mode.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_write_timeout(Some(Duration::from_millis(100)))
                             .unwrap();
-                        let mut bytes = [0; 8192];
-                        let count = stream.read(&mut bytes).unwrap_or(0);
+                        // TCP reads can split the request line. Retain one
+                        // bounded prefix per connection, not its first packet.
+                        let deadline = Instant::now() + Duration::from_millis(100);
+                        let mut bytes = Vec::with_capacity(8192);
+                        let mut chunk = [0; 1024];
+                        while bytes.len() < 8192 && !bytes.windows(2).any(|pair| pair == b"\r\n") {
+                            let Some(remaining) = deadline.checked_duration_since(Instant::now())
+                            else {
+                                break;
+                            };
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            stream.set_read_timeout(Some(remaining)).unwrap();
+                            let limit = (8192 - bytes.len()).min(chunk.len());
+                            match stream.read(&mut chunk[..limit]) {
+                                Ok(0) => break,
+                                Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(_) => break,
+                            }
+                        }
                         let mut recorded = received.lock().unwrap();
                         // The first 64 connections suffice to disprove zero
                         // effects; retain at most 512 KiB even on regression.
                         if recorded.len() < 64 {
-                            recorded.push(bytes[..count].to_vec());
+                            recorded.push(bytes);
                         }
                         drop(recorded);
                         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
@@ -132,4 +151,53 @@ pub fn bounded_output(command: &mut Command, directory: &Path) -> (ExitStatus, S
         std::fs::read_to_string(stdout_path).unwrap(),
         std::fs::read_to_string(stderr_path).unwrap(),
     )
+}
+
+#[test]
+fn recorder_preserves_a_request_line_split_across_tcp_writes() {
+    let recorder = Recorder::start();
+    let mut client = std::net::TcpStream::connect(recorder.address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    client.write_all(b"P").unwrap();
+    // Give the recorder its first byte separately from the request-line suffix.
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = client
+        .write_all(b"OST /v1/traces HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    recorder.wait_for_request();
+    let requests = recorder.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|bytes| bytes.starts_with(b"POST /v1/traces HTTP/1.1\r\n")),
+        "recorder truncated a fragmented request line: {requests:?}"
+    );
+}
+
+#[test]
+fn recorder_counts_an_empty_connection_and_bounds_its_wait() {
+    let recorder = Recorder::start();
+    let _client = std::net::TcpStream::connect(recorder.address).unwrap();
+    let started = Instant::now();
+    recorder.wait_for_request();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(recorder.requests(), vec![Vec::<u8>::new()]);
+}
+
+#[test]
+fn recorder_bounds_an_unterminated_request_prefix() {
+    let recorder = Recorder::start();
+    let mut client = std::net::TcpStream::connect(recorder.address).unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    client.write_all(&[b'A'; 8192]).unwrap();
+    recorder.wait_for_request();
+    assert_eq!(recorder.requests(), vec![vec![b'A'; 8192]]);
 }
