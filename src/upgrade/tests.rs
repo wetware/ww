@@ -1221,6 +1221,16 @@ fn prepare_action(home: &Path, action: &str) {
 
 #[test]
 fn abrupt_process_exit_at_every_upgrade_rollback_and_recovery_transition() {
+    run_isolated_crash_matrix(
+        "upgrade::tests::legacy_crash_matrix_worker",
+        &["legacy crash matrix complete"],
+        Duration::from_secs(300),
+    );
+}
+
+#[test]
+#[ignore = "isolated subprocess worker; invoked by crash matrix"]
+fn legacy_crash_matrix_worker() {
     for action in [
         "upgrade",
         "second-upgrade",
@@ -1312,6 +1322,7 @@ fn abrupt_process_exit_at_every_upgrade_rollback_and_recovery_transition() {
             }
         }
     }
+    eprintln!("legacy crash matrix complete");
 }
 
 #[test]
@@ -2059,6 +2070,84 @@ fn admission_crash_worker() {
 
 #[test]
 fn admission_process_exit_at_every_durable_boundary_restores_or_commits_exact_contract() {
+    run_isolated_crash_matrix(
+        "upgrade::tests::admission_crash_matrix_worker",
+        &[
+            "admission readmission=false:",
+            "admission readmission=true:",
+        ],
+        Duration::from_secs(300),
+    );
+}
+
+pub(super) fn run_isolated_crash_matrix(
+    worker_test: &str,
+    completion_markers: &[&str],
+    timeout: Duration,
+) {
+    // A parallel test can fork while a fixture owns a lease, retaining that
+    // descriptor until exec after the fixture drops its guard. Isolate each
+    // bulk crash matrix; the outer test suite still runs concurrently.
+    let directory = tempfile::tempdir().unwrap();
+    let worker = directory.path().join("crash-matrix-worker");
+    std::fs::copy(std::env::current_exe().unwrap(), &worker).unwrap();
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    let stderr_path = directory.path().join("stderr");
+    let mut child = Command::new(worker)
+        .args([
+            "--exact",
+            worker_test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .process_group(0)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline || std::fs::metadata(&stderr_path).unwrap().len() > 64 * 1024
+        {
+            // SAFETY: this unreaped child leads the process group created above.
+            // Its PID cannot be reused while the Child still owns the process.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            child.wait().unwrap();
+            panic!("crash matrix exceeded its process or output bound");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    std::fs::File::open(stderr_path)
+        .unwrap()
+        .take(64 * 1024 + 1)
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.len() <= 64 * 1024,
+        "crash matrix exceeded its output bound"
+    );
+    assert!(
+        status.success(),
+        "crash matrix {worker_test} failed: {stderr}"
+    );
+    for &marker in completion_markers {
+        assert!(
+            stderr.contains(marker),
+            "crash matrix {worker_test} did not complete {marker}: {stderr}"
+        );
+    }
+    eprint!("{stderr}");
+}
+
+#[test]
+#[ignore = "isolated subprocess worker; invoked by admission crash matrix"]
+fn admission_crash_matrix_worker() {
     for readmission in [false, true] {
         let prepare = || {
             storage::faults::configure(None);
@@ -2369,6 +2458,16 @@ fn prepare_native_crash(running: bool, action: &str) -> tempfile::TempDir {
 
 #[test]
 fn native_v2_process_exit_at_every_upgrade_rollback_and_recovery_boundary() {
+    run_isolated_crash_matrix(
+        "upgrade::tests::native_v2_matrix_worker",
+        &["native v2 crash matrix complete"],
+        Duration::from_secs(1800),
+    );
+}
+
+#[test]
+#[ignore = "isolated subprocess worker; invoked by crash matrix"]
+fn native_v2_matrix_worker() {
     // Cargo can replace the shared test binary while another focused test builds.
     // Every crash worker must execute this matrix's immutable binary snapshot.
     let worker_directory = tempfile::tempdir().unwrap();
@@ -2442,6 +2541,7 @@ fn native_v2_process_exit_at_every_upgrade_rollback_and_recovery_boundary() {
             );
         }
     }
+    eprintln!("native v2 crash matrix complete");
 }
 
 #[test]
@@ -2591,6 +2691,16 @@ fn initialization_owner_crash_worker() {
 
 #[test]
 fn initialization_process_exit_at_every_owner_boundary_resumes_exact_unbound_generation() {
+    run_isolated_crash_matrix(
+        "upgrade::tests::initialization_owner_matrix_worker",
+        &["initialization owner matrix complete"],
+        Duration::from_secs(300),
+    );
+}
+
+#[test]
+#[ignore = "isolated subprocess worker; invoked by crash matrix"]
+fn initialization_owner_matrix_worker() {
     storage::faults::configure(None);
     let (baseline, _, _, _) = initialization_fixture();
     run_initialization_fixture(baseline.path()).unwrap();
@@ -2636,6 +2746,7 @@ fn initialization_process_exit_at_every_owner_boundary_resumes_exact_unbound_gen
         "initialization owner: {} real process-exit checkpoints",
         trace.len()
     );
+    eprintln!("initialization owner matrix complete");
 }
 
 #[test]

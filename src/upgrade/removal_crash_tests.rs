@@ -28,6 +28,16 @@ fn removal_crash_worker() {
 
 #[test]
 fn guarded_removal_process_exit_at_every_state_boundary_releases_leases_and_retries() {
+    crate::upgrade::tests::run_isolated_crash_matrix(
+        "upgrade::removal::crash_tests::removal_matrix_worker",
+        &["guarded removal matrix complete"],
+        Duration::from_secs(300),
+    );
+}
+
+#[test]
+#[ignore = "isolated subprocess worker; invoked by crash matrix"]
+fn removal_matrix_worker() {
     // Removing either durable Blocked/Uninstalled transition, replacing a stable
     // lease inode, or deleting retained authority/private state breaks this test.
     storage::faults::configure(None);
@@ -158,4 +168,5 @@ fn guarded_removal_process_exit_at_every_state_boundary_releases_leases_and_retr
         "guarded removal: {} real process-exit state checkpoints",
         trace.len()
     );
+    eprintln!("guarded removal matrix complete");
 }

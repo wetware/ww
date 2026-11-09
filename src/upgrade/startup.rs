@@ -1386,6 +1386,16 @@ mod tests {
 
     #[test]
     fn process_exit_at_every_initialization_record_boundary_recovers_same_intent() {
+        crate::upgrade::tests::run_isolated_crash_matrix(
+            "upgrade::startup::tests::initialization_records_matrix_worker",
+            &["startup initialization matrix complete"],
+            std::time::Duration::from_secs(300),
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated subprocess worker; invoked by crash matrix"]
+    fn initialization_records_matrix_worker() {
         let baseline = initialization_home();
         storage::faults::configure(None);
         run_initialization_records(baseline.path()).unwrap();
@@ -1436,5 +1446,6 @@ mod tests {
             );
             assert!(Receipt::load(&home.path().join(".ww")).is_ok());
         }
+        eprintln!("startup initialization matrix complete");
     }
 }
