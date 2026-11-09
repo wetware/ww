@@ -92,6 +92,10 @@ fn validate(mutation: &MutationLock, lease: &StartupLease) -> Result<(StartupSta
 }
 
 #[cfg(test)]
+#[path = "removal_crash_tests.rs"]
+mod crash_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::upgrade::tests::completed_initialization;
