@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Native Host startup admission and recovery (#739).** Bind authenticated
+  executable provenance and exact startup inputs before Host effects. Journal
+  native replacement, readiness, rollback, and interrupted recovery while
+  preserving private state and service configuration. Standalone upgrades and
+  rollback accept explicit `run` arguments and verify the admitted contract.
+  Pending starts reread independently provisioned release keys; exact committed
+  rollback retains historical-key verification. Linux GNU ARM64 is a disposable
+  qualification candidate; native acceptance remains pending. Other platforms
+  retain their admission restriction, and production activation remains gated.
 - **Disposable genuine release rehearsal (#742).** Verify original five-platform
   producer receipts, reconstruct signed releases, exercise bounded CAR transfer
   and rejection controls, and retain command-level evidence. A separate consumer

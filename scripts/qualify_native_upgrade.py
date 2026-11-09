@@ -596,8 +596,10 @@ def main():
         owned_unit = unit.read_bytes()
         original_unit = owned_unit.decode("utf-8")
         require(original_unit.count("[Service]\n") == 1, "unexpected generated service definition")
+        require(original_unit.count("\nWorkingDirectory=%h\n") == 1,
+                "generated service must require the account home directory")
         require("TimeoutStopSec=" not in original_unit, "generated service already specifies a stop budget")
-        owned_unit = original_unit.replace("[Service]\n", "[Service]\nTimeoutStopSec=5\nEnvironment=WW_COMPILE_WORKERS=2\nWorkingDirectory=" + str(home) + "\n").encode()
+        owned_unit = original_unit.replace("[Service]\n", "[Service]\nTimeoutStopSec=5\nEnvironment=WW_COMPILE_WORKERS=2\n").encode()
         unit.write_bytes(owned_unit)
         runner.run("daemon-reload", ["/usr/bin/systemctl", "--user", "daemon-reload"])
         require_fault_stop_policy(runner)

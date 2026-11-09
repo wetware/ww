@@ -610,7 +610,7 @@ fn derive(
         passwd_home(uid)?
     } else {
         ensure!(
-            !working.starts_with('-'),
+            !working.starts_with(['-', '!']),
             "optional systemd working directories are unsupported"
         );
         PathBuf::from(working)
@@ -1906,6 +1906,19 @@ mod tests {
     #[test]
     fn refuse_loaded_hooks_pending_jobs_and_expanded_argv() {
         let (_temp, home, capture) = fixture();
+        for working in [format!("!{}", home.display()), "!~".into()] {
+            let mut changed = capture.clone();
+            changed.service.get_mut("WorkingDirectory").unwrap().data = serde_json::json!(working);
+            let error = derived(&home, &changed)
+                .err()
+                .expect("optional cwd must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("optional systemd working directories"),
+                "{error:#}"
+            );
+        }
         let mut changed = capture.clone();
         changed.service.get_mut("ExecStartPre").unwrap().data = serde_json::json!([["/bin/true"]]);
         assert!(derived(&home, &changed).is_err());

@@ -33,6 +33,10 @@ executor and compiler worker counts (`--executor-threads` or
 `WW_EXECUTOR_THREADS`, and `WW_COMPILE_WORKERS`). The adapter does not infer
 service CPU defaults from the admission command's process.
 
+Generated Linux units use `WorkingDirectory=%h` to require the account home
+resolved by the user manager. Custom units with optional working-directory fallback are
+unsupported and remain unchanged.
+
 Standalone admission binds the supplied `run` arguments and environment. A
 standalone contract cannot authorize a process in the owned `ww.service` cgroup.
 An admitted manual process holds a shared instance lease until exit. The operator
