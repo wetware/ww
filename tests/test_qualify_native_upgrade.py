@@ -25,6 +25,22 @@ SPEC.loader.exec_module(MODULE)
 
 
 class Inputs(unittest.TestCase):
+    def test_fault_stop_policy_requires_terminal_failure_configuration(self):
+        observed = []
+        def run(name, argv):
+            observed.append((name, argv))
+            return "TimeoutStopUSec=5s\nKillMode=control-group\nSendSIGKILL=yes\nRestart=no\n"
+        MODULE.require_fault_stop_policy(SimpleNamespace(run=run))
+        self.assertEqual(observed[0][0], "fault-stop-policy")
+        self.assertIn("--property=Restart", observed[0][1])
+
+    def test_fault_stop_policy_refuses_automatic_restart_or_missing_evidence(self):
+        for value in ("Restart=on-failure\n", "Restart=always\n", ""):
+            with self.subTest(value=value):
+                runner = SimpleNamespace(run=lambda *_: "TimeoutStopUSec=5s\nKillMode=control-group\nSendSIGKILL=yes\n" + value)
+                with self.assertRaisesRegex(RuntimeError, "no automatic restart"):
+                    MODULE.require_fault_stop_policy(runner)
+
     def receipt(self):
         return {"path": "/fixture/original/ww", "sha256": "a" * 64,
                 "archive_path": "/fixture/original.zip",

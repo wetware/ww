@@ -378,6 +378,122 @@ jobs:
           target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
         retention-days: 1
 
+  # Temporary PR808 consumer of the reviewed original A/B pair. No new Host
+  # producer, dispatch, publication, or change to the required Test aggregate.
+  test-original-native-arm64:
+    name: Original release GNU ARM64 integration subset
+    if: >-
+      github.event_name == 'pull_request'
+      && github.repository == 'wetware/ww'
+      && github.event.pull_request.head.repo.full_name == 'wetware/ww'
+      && github.event.pull_request.head.ref == 'lthibault/pasted-text-v38'
+    needs: lockfiles
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUSTUP_TOOLCHAIN: 1.99.1
+      PYTHONDONTWRITEBYTECODE: 1
+    steps:
+    - name: Record bounded lane start
+      run: |
+        WW739_LANE="$RUNNER_TEMP/ww739-release-integration"
+        printf 'WW739_LANE=%s\n' "$WW739_LANE" >> "$GITHUB_ENV"
+        mkdir -p "$WW739_LANE"
+        date +%s > "$WW739_LANE/start-epoch"
+
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Check integration harness contracts
+      run: |
+        mkdir -p "$WW739_LANE"
+        python3 -m unittest discover -s tests -p 'test_verify_native_release_inputs.py' -v
+        python3 -m unittest discover -s tests -p 'test_guarded_boot_fixture.py' -v
+        python3 -m unittest discover -s tests -p 'test_native_release_integration.py' -v
+        python3 -m unittest discover -s tests -p 'test_native_release_provisioner.py' -v
+        python3 tests/test_qualify_native_upgrade.py Inputs.test_fault_stop_policy_requires_terminal_failure_configuration Inputs.test_fault_stop_policy_refuses_automatic_restart_or_missing_evidence -v
+        git rev-parse HEAD > "$WW739_LANE/checkout-sha"
+        printf '%s\n' "$PR_HEAD_SHA" > "$WW739_LANE/pr-head-sha"
+      env:
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+    - name: Fetch and verify original producer inputs
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        python3 scripts/fetch_native_release_inputs.py \
+          --pins .github/native-release-integration.json --output "$WW739_LANE/downloads"
+        python3 scripts/verify_native_release_inputs.py --checkout "$PWD" \
+          --inputs "$WW739_LANE/downloads" --output "$WW739_LANE/verified" \
+          --pins "$PWD/.github/native-release-integration.json"
+
+    - name: Install package utility toolchain
+      uses: dtolnay/rust-toolchain@1.99.1
+
+    - uses: ./.github/actions/setup-capnp
+      with:
+        cache-key-suffix: original-native-arm64-package
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: original-native-arm64-package
+
+    - name: Build release-profile fixture package utility
+      timeout-minutes: 20
+      run: |
+        cargo build --release --locked -p ww-release --features package \
+          --bin ww-release-package --message-format=json > "$WW739_LANE/package-build.jsonl"
+        rustc -Vv > "$WW739_LANE/rustc.txt"
+        cargo -Vv > "$WW739_LANE/cargo.txt"
+        sha256sum target/release/ww-release-package > "$WW739_LANE/package-tool.sha256"
+
+    - name: Provision pinned ARM64 Kubo and user-service dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends dbus-user-session openssl
+        curl --fail --location --max-time 180 \
+          https://github.com/ipfs/kubo/releases/download/v0.33.0/kubo_v0.33.0_linux-arm64.tar.gz \
+          --output "$WW739_LANE/kubo.tar.gz"
+        printf '%s  %s\n' \
+          5bb7773c3399a7a9001fcb579f267ce01e7f6ea3eb1b80661a4093a9514d9ef06fac13bc1150c82c58740d220246ac5f337796fbdf1396a1d82475f4b6fa7929 \
+          "$WW739_LANE/kubo.tar.gz" | sha512sum --check --strict
+        tar -xzf "$WW739_LANE/kubo.tar.gz" -C "$WW739_LANE" kubo/ipfs
+        sha256sum "$WW739_LANE/kubo/ipfs" > "$WW739_LANE/kubo.sha256"
+
+    - name: Run real installer, admitted boot, upgrade and recovery subset
+      timeout-minutes: 60
+      run: |
+        python3 -c 'import os,pathlib,time; p=pathlib.Path(os.environ["WW739_LANE"]); assert time.time()-int((p/"start-epoch").read_text()) < 25*60, "insufficient cleanup/upload time; no fixture started"'
+        sudo python3 -B scripts/run_native_release_integration.py --disposable-runner \
+          --inputs "$WW739_LANE/verified" \
+          --package-tool "$PWD/target/release/ww-release-package" \
+          --ipfs "$WW739_LANE/kubo/ipfs" --timeout-secs 120 \
+          --output "$WW739_LANE/result"
+
+    - name: Retain diagnostic evidence with native acceptance still partial
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: original-native-arm64-integration-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ env.WW739_LANE }}/result/
+          ${{ env.WW739_LANE }}/verified/verified-inputs.json
+          ${{ env.WW739_LANE }}/downloads/*.json
+          ${{ env.WW739_LANE }}/downloads/*.log
+          ${{ env.WW739_LANE }}/*.txt
+          ${{ env.WW739_LANE }}/*.sha256
+          ${{ env.WW739_LANE }}/*.jsonl
+          ${{ env.WW739_LANE }}/*-sha
+        retention-days: 7
+        if-no-files-found: error
+
   test-host:
     name: Test host
     needs: [build, build-wasm]

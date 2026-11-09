@@ -499,10 +499,12 @@ def require_enablement(runner, name, expected, unit, owned_unit):
 
 def require_fault_stop_policy(runner):
     output = runner.run("fault-stop-policy", ["/usr/bin/systemctl", "--user", "show", "ww.service",
-                        "--property=TimeoutStopUSec", "--property=KillMode", "--property=SendSIGKILL"])
+                        "--property=TimeoutStopUSec", "--property=KillMode", "--property=SendSIGKILL",
+                        "--property=Restart"])
     values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
-    require(values == {"TimeoutStopUSec": "5s", "KillMode": "control-group", "SendSIGKILL": "yes"},
-            "fault injection requires effective five-second stop and control-group SIGKILL policy")
+    require(values == {"TimeoutStopUSec": "5s", "KillMode": "control-group", "SendSIGKILL": "yes",
+                       "Restart": "no"},
+            "fault injection requires effective five-second stop, control-group SIGKILL and no automatic restart")
 
 
 def readiness(runner, state, name):
@@ -599,6 +601,12 @@ def main():
         require(original_unit.count("\nWorkingDirectory=%h\n") == 1,
                 "generated service must require the account home directory")
         require("TimeoutStopSec=" not in original_unit, "generated service already specifies a stop budget")
+        require(original_unit.count("\nRestart=") == 1
+                and "\nRestart=on-failure\n" in original_unit, "generated restart policy differs")
+        # Select the disposable unit's policy before admission. A single killed
+        # candidate must be a terminal start failure for this control; the
+        # production on-failure policy can legitimately restart and reach ready.
+        original_unit = original_unit.replace("\nRestart=on-failure\n", "\nRestart=no\n")
         owned_unit = original_unit.replace("[Service]\n", "[Service]\nTimeoutStopSec=5\nEnvironment=WW_COMPILE_WORKERS=2\n").encode()
         unit.write_bytes(owned_unit)
         runner.run("daemon-reload", ["/usr/bin/systemctl", "--user", "daemon-reload"])

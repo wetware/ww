@@ -1,12 +1,15 @@
 """Ephemeral Ed25519 fixtures. Never use these temporary keys for publication."""
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
 import platform
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -46,10 +49,12 @@ def manifest_root(manifest, descriptor=None):
     return links + pb_field(10, b'\x08\x01')
 
 
-def package_release(tool, tree, spool, private, trusted_keys, targets):
-    """Use the real packager with synthetic authority and exact fixture bytes."""
-    provenance = {'repository': 'https://github.com/wetware/ww',
-                  'revision': 'a' * 40, 'builder': 'installer-test-fixture'}
+def package_release(tool, tree, spool, private, trusted_keys, targets, *, provenance=None,
+                    command_runner=None):
+    """Package exact fixture bytes; producer provenance must be supplied explicitly."""
+    if provenance is None:
+        provenance = {'repository': 'https://github.com/wetware/ww',
+                      'revision': 'a' * 40, 'builder': 'installer-test-fixture'}
     value = int.from_bytes(bytes.fromhex('0172002408011220') + bytes([1]) * 32, 'big')
     channel = ''
     while value:
@@ -63,14 +68,76 @@ def package_release(tool, tree, spool, private, trusted_keys, targets):
     metadata_path = tree.parent / 'metadata.json'
     metadata_path.write_text(json.dumps(metadata))
     (tree / 'CHECKSUMS.txt.sig').unlink(missing_ok=True)
-    subprocess.run([str(tool), 'prepare', '--tree', str(tree), '--spool', str(spool),
-                    '--metadata', str(metadata_path)], check=True,
-                   capture_output=True, timeout=90)
+    prepare = [str(tool), 'prepare', '--tree', str(tree), '--spool', str(spool),
+               '--metadata', str(metadata_path)]
+    if command_runner is None:
+        subprocess.run(prepare, check=True, capture_output=True, timeout=90)
+    else:
+        command_runner('package-prepare', prepare)
     sign_manifest(private, tree / 'CHECKSUMS.txt')
-    result = subprocess.run([str(tool), 'finalize', '--tree', str(tree),
-                             '--spool', str(spool), '--trusted-keys', str(trusted_keys)],
-                            check=True, capture_output=True, text=True, timeout=90)
-    return json.loads(result.stdout)
+    finalize = [str(tool), 'finalize', '--tree', str(tree),
+                '--spool', str(spool), '--trusted-keys', str(trusted_keys)]
+    if command_runner is None:
+        result = subprocess.run(finalize, check=True, capture_output=True, text=True, timeout=90)
+        output = result.stdout
+    else:
+        output = command_runner('package-finalize', finalize)
+    return json.loads(output)
+
+
+@contextmanager
+def packaged_bootstrap(directory, binary, payload, tool, producer_provenance, *, command_runner=None):
+    """Complete GNU ARM64 bootstrap using owned copies and independent test trust.
+
+    The lane verifies the original producer receipt before invoking this helper.
+    This fixture preserves that sidecar verbatim; its fresh signature is test
+    authority only, never evidence of an officially published release.
+    """
+    directory = Path(directory).resolve()
+    directory.mkdir(mode=0o700)
+    provenance = json.loads(Path(producer_provenance).read_text())
+    assert set(provenance) == {'repository', 'revision', 'builder'}, provenance
+    assert provenance['repository'] == 'https://github.com/wetware/ww', provenance
+    assert re.fullmatch(r'[0-9a-f]{40}', provenance['revision']), provenance
+    assert re.fullmatch(r'github-actions:[1-9][0-9]*:[1-9][0-9]*:aarch64-unknown-linux-gnu',
+                        provenance['builder']), provenance
+    tree, spool = directory / 'release', directory / 'spool'
+    owned_binary = tree / 'bin/ww/linux/aarch64/ww'
+    owned_binary.parent.mkdir(parents=True)
+    shutil.copyfile(binary, owned_binary)
+    owned_binary.chmod(0o700)
+    shutil.copytree(payload, tree / 'fhs', copy_function=shutil.copyfile)
+    owned_tool = directory / 'ww-release-package'
+    shutil.copyfile(tool, owned_tool)
+    owned_tool.chmod(0o700)
+    private, trusted_keys = generate_key(directory / 'keys')
+    try:
+        package = package_release(owned_tool, tree, spool, private, trusted_keys,
+                                  ['aarch64-unknown-linux-gnu'], provenance=provenance,
+                                  command_runner=command_runner)
+    finally:
+        # No later boot/admission operation needs access to signing authority.
+        private.unlink(missing_ok=True)
+    root = package['root']
+    descriptor = (tree / 'RELEASE-DESCRIPTOR').read_text().strip()
+    metadata = ReleaseMetadataServer()
+    try:
+        metadata.routes = {
+            ('/api/v0/cat', f'/ipfs/{root}/{name}'): (tree / name).read_bytes()
+            for name in ('CHECKSUMS.txt', 'CHECKSUMS.txt.sig', 'RELEASE-DESCRIPTOR')}
+        metadata.routes.update({
+            ('/api/v0/block/get', descriptor): (tree / 'RELEASE-DESCRIPTOR.cbor').read_bytes(),
+            ('/api/v0/block/get', root): (spool / 'blocks' / root).read_bytes()})
+        yield {'binary': owned_binary, 'payload': tree / 'fhs', 'tree': tree,
+               'root': root, 'descriptor': descriptor, 'trusted_keys': trusted_keys,
+               'provenance': provenance, 'metadata': metadata,
+               'arguments': ['--payload', str(tree / 'fhs'),
+                             '--manifest', str(tree / 'CHECKSUMS.txt'),
+                             '--signature', str(tree / 'CHECKSUMS.txt.sig'),
+                             '--trusted-release-keys', str(trusted_keys),
+                             '--bootstrap-release', root]}
+    finally:
+        metadata.close()
 
 
 class ReleaseMetadataServer:
