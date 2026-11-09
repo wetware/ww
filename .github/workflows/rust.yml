@@ -489,7 +489,7 @@ jobs:
       run: |
         cargo build --locked
         WW_TEST_BINARY=target/debug/ww WW_TEST_FHS=target/fhs python3 tests/test_host_install.py
-        python3 tests/test_install.py --binary target/debug/ww --fhs target/fhs
+        python3 tests/test_install.py --binary target/debug/ww --fhs target/fhs --package-tool target/debug/ww-release-package
         bash tests/test_installed_boot.sh target/debug/ww target/fhs
 
     - name: Smoke-test Chess authority proof command
@@ -764,7 +764,7 @@ jobs:
         bash tests/test_release_descriptor_package.sh ./ww-release-package artifacts release-tree
         chmod +x artifacts/ww-linux-musl-x86_64/ww
         WW_TEST_BINARY=artifacts/ww-linux-musl-x86_64/ww WW_TEST_FHS=release-tree/fhs python3 tests/test_host_install.py
-        python3 tests/test_install.py --binary artifacts/ww-linux-musl-x86_64/ww --fhs release-tree/fhs
+        python3 tests/test_install.py --binary artifacts/ww-linux-musl-x86_64/ww --fhs release-tree/fhs --package-tool ./ww-release-package
     - name: Build and boot artifact containers
       run: |
         mkdir deploy-context

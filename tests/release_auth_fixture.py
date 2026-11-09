@@ -2,10 +2,15 @@
 import argparse
 import base64
 import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
 import os
 from pathlib import Path
 import platform
 import subprocess
+import sys
+import threading
+from urllib.parse import parse_qs, urlsplit
 
 
 def varint(value):
@@ -28,11 +33,108 @@ def pb_field(tag, data):
     return bytes([tag]) + varint(len(data)) + data
 
 
-def manifest_root(manifest):
+def manifest_root(manifest, descriptor=None):
     """Minimal producer-profile directory, with a raw signed-manifest link."""
     link = (pb_field(10, cid_bytes(manifest)) + pb_field(18, b'CHECKSUMS.txt')
             + b'\x18' + varint(len(manifest)))
-    return pb_field(18, link) + pb_field(10, b'\x08\x01')
+    links = pb_field(18, link)
+    if descriptor is not None:
+        link = (pb_field(10, cid_bytes(descriptor, 0x71))
+                + pb_field(18, b'release-descriptor')
+                + b'\x18' + varint(len(descriptor)))
+        links += pb_field(18, link)
+    return links + pb_field(10, b'\x08\x01')
+
+
+def package_release(tool, tree, spool, private, trusted_keys, targets):
+    """Use the real packager with synthetic authority and exact fixture bytes."""
+    provenance = {'repository': 'https://github.com/wetware/ww',
+                  'revision': 'a' * 40, 'builder': 'installer-test-fixture'}
+    value = int.from_bytes(bytes.fromhex('0172002408011220') + bytes([1]) * 32, 'big')
+    channel = ''
+    while value:
+        value, digit = divmod(value, 36)
+        channel = '0123456789abcdefghijklmnopqrstuvwxyz'[digit] + channel
+    metadata = {'channel': 'k' + channel, 'sequence': 1,
+                'version': '0.0.0-fixture', 'source': provenance,
+                'hosts': {target: provenance for target in targets}}
+    (tree / 'VERSION').write_text(metadata['version'] + '\n')
+    (tree / 'REVISION').write_text(provenance['revision'] + '\n')
+    metadata_path = tree.parent / 'metadata.json'
+    metadata_path.write_text(json.dumps(metadata))
+    (tree / 'CHECKSUMS.txt.sig').unlink(missing_ok=True)
+    subprocess.run([str(tool), 'prepare', '--tree', str(tree), '--spool', str(spool),
+                    '--metadata', str(metadata_path)], check=True,
+                   capture_output=True, timeout=90)
+    sign_manifest(private, tree / 'CHECKSUMS.txt')
+    result = subprocess.run([str(tool), 'finalize', '--tree', str(tree),
+                             '--spool', str(spool), '--trusted-keys', str(trusted_keys)],
+                            check=True, capture_output=True, text=True, timeout=90)
+    return json.loads(result.stdout)
+
+
+class ReleaseMetadataServer:
+    """Bounded loopback transport for exact native release-metadata requests."""
+
+    def __init__(self):
+        self.routes = {}
+        self.requests = []
+        self.errors = []
+        fixture = self
+
+        def record_error(message):
+            if len(fixture.errors) < 8:
+                fixture.errors.append(str(message)[:256])
+
+        class Server(HTTPServer):
+            def handle_error(self, *_):
+                record_error(sys.exc_info()[1])
+
+        class Handler(BaseHTTPRequestHandler):
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(2)
+
+            def do_POST(self):
+                parsed = urlsplit(self.path)
+                try:
+                    query = parse_qs(parsed.query, strict_parsing=True)
+                    assert set(query) == {'arg'} and len(query['arg']) == 1
+                    assert len(parsed.path) <= 64 and len(query['arg'][0]) <= 256
+                    assert not parsed.fragment and not parsed.netloc
+                    assert self.headers.get('Content-Length', '0') == '0'
+                    assert 'Transfer-Encoding' not in self.headers
+                    assert len(fixture.requests) < 128
+                    key = (parsed.path, query['arg'][0])
+                    fixture.requests.append(key)
+                    body = fixture.routes[key]
+                    assert len(body) <= 2 * 1024 * 1024
+                except (AssertionError, KeyError, ValueError):
+                    self.send_error(404, 'unexpected fixture request')
+                    return
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+
+            def log_error(self, message, *args):
+                record_error(message % args)
+
+        self.server = Server(('127.0.0.1', 0), Handler)
+        self.endpoint = f'http://127.0.0.1:{self.server.server_port}'
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={'poll_interval': 0.05})
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        assert not self.thread.is_alive(), 'metadata fixture did not stop'
+        assert not self.errors, f'unexpected metadata requests: {self.errors}'
 
 
 def generate_key(directory):
