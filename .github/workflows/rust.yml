@@ -601,11 +601,25 @@ jobs:
         cargo test -p rpc --lib outbound::tests::default_budget_bounds_work_across_registry_recreation --locked -- --ignored --exact
         cargo test -p rpc --lib outbound::tests::explicit_host_budgets_cannot_bypass_process_limit --locked -- --ignored --exact
 
+    - name: Build and verify installer fixture package utility
+      # Package large development Hosts with the repository release profile.
+      # Keep the development Host and package tests, and the producer's debug
+      # package artifact, unchanged. Compare canonical output and refusals first.
+      run: |
+        cargo build --locked --release -p ww-release --features package --bin ww-release-package
+        stat --printf='%n %s bytes\n' target/debug/ww-release-package target/release/ww-release-package
+        sha256sum target/debug/ww-release-package target/release/ww-release-package
+        python3 tests/test_release_package_profiles.py \
+          --development-tool target/debug/ww-release-package \
+          --release-tool target/release/ww-release-package --fhs target/fhs
+
     - name: Validate actual packaged installation and startup
       run: |
         cargo build --locked
+        stat --printf='%n %s bytes\n' target/debug/ww
+        sha256sum target/debug/ww
         WW_TEST_BINARY=target/debug/ww WW_TEST_FHS=target/fhs python3 tests/test_host_install.py
-        python3 tests/test_install.py --binary target/debug/ww --fhs target/fhs --package-tool target/debug/ww-release-package
+        python3 tests/test_install.py --binary target/debug/ww --fhs target/fhs --package-tool target/release/ww-release-package
         bash tests/test_installed_boot.sh target/debug/ww target/fhs
 
     - name: Smoke-test Chess authority proof command
