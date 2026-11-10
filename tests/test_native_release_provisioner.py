@@ -109,8 +109,16 @@ class CopiedFhs(unittest.TestCase):
         kernel = self.root / 'a/fhs/boot/kernel.wasm'
         kernel.unlink()
         kernel.symlink_to(target)
-        with self.assertRaisesRegex(RuntimeError, 'symlink'):
+        # Linux symlink mode 0777 can fail custody before the type check.
+        with self.assertRaises(RuntimeError) as refused:
             self.verify()
+        self.assertIn(str(refused.exception), (
+            f'path has another owner or permits other-user writes: {kernel}',
+            f'path has the wrong type or is a symlink: {kernel}',
+        ))
+        self.assertTrue(kernel.is_symlink())
+        self.assertEqual(kernel.readlink(), target)
+        self.assertEqual(target.read_bytes(), b'KERNEL_PAYLOAD')
 
 
 class EvidenceCopy(unittest.TestCase):

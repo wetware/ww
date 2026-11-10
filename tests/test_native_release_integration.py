@@ -173,10 +173,20 @@ class NativeContract(unittest.TestCase):
 
     def test_nonexistent_or_symlinked_output_receipt_is_refused(self):
         path = self.output / self.commands[0]['stdout']
+        target = self.output / self.commands[1]['stdout']
+        target.write_bytes(b'outside receipt')
         path.unlink()
-        path.symlink_to(self.output / self.commands[1]['stdout'])
-        with self.assertRaisesRegex(RuntimeError, 'symlink'):
+        path.symlink_to(target)
+        # Linux symlink mode 0777 can fail custody before the type check.
+        with self.assertRaises(RuntimeError) as refused:
             self.validate()
+        self.assertIn(str(refused.exception), (
+            f'path has another owner or permits other-user writes: {path}',
+            f'path has the wrong type or is a symlink: {path}',
+        ))
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(path.readlink(), target)
+        self.assertEqual(target.read_bytes(), b'outside receipt')
 
 
 class SuiteContract(unittest.TestCase):
@@ -348,9 +358,14 @@ class TemporaryRootCleanup(unittest.TestCase):
             sentinel.write_bytes(b'outside fixture')
             private = root / 't'
             private.symlink_to(target, target_is_directory=True)
-            with self.assertRaisesRegex(RuntimeError, 'symlink'):
+            with self.assertRaises(RuntimeError) as refused:
                 lane.clear_temporary_root(private)
+            self.assertIn(str(refused.exception), (
+                f'path has another owner or permits other-user writes: {private}',
+                f'path has the wrong type or is a symlink: {private}',
+            ))
             self.assertTrue(private.is_symlink())
+            self.assertEqual(private.readlink(), target)
             self.assertEqual(sentinel.read_bytes(), b'outside fixture')
 
     def test_cleanup_refuses_changed_permissions_without_deleting_contents(self):
