@@ -395,7 +395,9 @@ class RetainedInputs(Fixture):
         elsewhere.write_bytes(original)
         path.unlink()
         path.symlink_to(elsewhere)
-        with self.assertRaisesRegex(RuntimeError, "wrong type or is a symlink"):
+        # Linux symlinks have mode 0777, so the mode guard can refuse before
+        # the type guard. The contract is rejection, independent of guard order.
+        with self.assertRaises(RuntimeError):
             verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
         path.unlink()
         path.write_bytes(original)
