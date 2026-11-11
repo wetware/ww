@@ -940,14 +940,18 @@ fn default_compile_workers() -> usize {
     (cpu_count / 2).clamp(1, 4)
 }
 
-fn compile_worker_count() -> usize {
-    match std::env::var("WW_COMPILE_WORKERS") {
-        Ok(raw) => raw
+pub fn capture_compile_worker_count() -> usize {
+    normalize_compile_worker_count(std::env::var("WW_COMPILE_WORKERS").ok().as_deref())
+}
+
+fn normalize_compile_worker_count(value: Option<&str>) -> usize {
+    match value {
+        Some(raw) => raw
             .parse::<usize>()
             .ok()
             .filter(|n| *n > 0)
             .unwrap_or_else(default_compile_workers),
-        Err(_) => default_compile_workers(),
+        None => default_compile_workers(),
     }
 }
 
@@ -961,7 +965,18 @@ pub struct CompilationService {
 }
 
 impl Service for CompilationService {
-    fn run(self, mut shutdown: watch::Receiver<()>) -> Result<()> {
+    fn run(self, shutdown: watch::Receiver<()>) -> Result<()> {
+        self.run_with_workers(shutdown, capture_compile_worker_count())
+    }
+}
+
+impl CompilationService {
+    pub fn run_with_workers(
+        self,
+        mut shutdown: watch::Receiver<()>,
+        worker_count: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(worker_count > 0, "compile worker count must be positive");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -975,7 +990,6 @@ impl Service for CompilationService {
                 Vec<tokio::sync::oneshot::Sender<Result<wasmtime::component::Component>>>,
             > = HashMap::new();
 
-            let worker_count = compile_worker_count();
             tracing::info!(workers = worker_count, "starting compile worker pool");
 
             let (job_tx, job_rx) = std::sync::mpsc::channel::<CompileJob>();
@@ -1130,6 +1144,24 @@ impl Service for CompilationService {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn worker_settings_normalize_and_reject_zero_at_consumption() {
+        assert_eq!(normalize_compile_worker_count(Some("3")), 3);
+        assert_eq!(
+            normalize_compile_worker_count(Some("0")),
+            default_compile_workers()
+        );
+        assert_eq!(
+            normalize_compile_worker_count(Some("invalid")),
+            default_compile_workers()
+        );
+        let (_tx, request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = watch::channel(());
+        assert!(CompilationService { request_rx }
+            .run_with_workers(shutdown, 0)
+            .is_err());
+    }
 
     fn test_host() -> Host {
         let runtime = tokio::runtime::Builder::new_multi_thread()

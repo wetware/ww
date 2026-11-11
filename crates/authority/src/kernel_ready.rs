@@ -61,6 +61,22 @@ impl KernelReadyGate {
             .unwrap_or(false)
     }
 
+    /// Observe another Host record under this gate's epoch read fence. Refuse
+    /// a record bound to a different channel. The callback must not borrow this
+    /// watch channel again or publish an epoch while the read fence is held.
+    pub fn observe_ready<R>(
+        &self,
+        epoch_rx: &watch::Receiver<Epoch>,
+        observe: impl FnOnce(&Epoch, bool) -> R,
+    ) -> Option<R> {
+        if !self.epoch_rx.same_channel(epoch_rx) {
+            return None;
+        }
+        let epoch = self.epoch_rx.borrow();
+        let ready = self.state.lock().ok()?.committed_seq == Some(epoch.seq);
+        Some(observe(&epoch, ready))
+    }
+
     /// Commit the locally bound generation if it is still authoritative.
     ///
     /// The watch borrow remains live through the comparison and state commit,

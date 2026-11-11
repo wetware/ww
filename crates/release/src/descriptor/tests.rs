@@ -5,6 +5,178 @@ use ipld_dagpb::PbLink;
 use libp2p_identity::Keypair;
 use rust_ipns::Record;
 
+#[test]
+fn signed_proof_round_trip_reauthenticates_without_changing_consumer_floors() {
+    let fixture = Fixture::new();
+    let release = fixture.release(7);
+    let (root, root_block) = envelope(release.descriptor_cid());
+    let mut consumer = fixture.consumer().unwrap();
+    fixture.accept(&mut consumer, 8, 9).unwrap();
+    let floor_before = std::fs::read(consumer.watermark_path()).unwrap();
+
+    let proof = SignedReleaseProof::capture(root, &root_block, &release).unwrap();
+    let encoded = proof.encode().unwrap();
+    let decoded = SignedReleaseProof::decode(&encoded).unwrap();
+    let keys = TrustedKeys::from_bytes(&keyring(&fixture.release_key)).unwrap();
+    let restored = decoded.authenticate(&keys).unwrap();
+    assert_eq!(decoded.transport_root(), root);
+    assert_eq!(decoded.encode().unwrap(), encoded);
+    assert_eq!(restored.descriptor_cid(), release.descriptor_cid());
+    restored
+        .select(TARGET, COMPATIBILITY_PROFILE)
+        .unwrap()
+        .verify_host(HOST)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(consumer.watermark_path()).unwrap(),
+        floor_before
+    );
+    assert_eq!(consumer.accepted_release_sequence(), Some(8));
+    assert_eq!(consumer.accepted_ipns_sequence(), Some(9));
+
+    let unknown = TrustedKeys::from_bytes(&keyring(&SigningKey::from_bytes(&[9; 32]))).unwrap();
+    assert!(decoded.authenticate(&unknown).is_err());
+}
+
+#[test]
+fn signed_proof_capture_rejects_root_and_descriptor_substitution() {
+    let fixture = Fixture::new();
+    let release = fixture.release(1);
+    let other = fixture.release(2);
+    let (root, root_block) = envelope(release.descriptor_cid());
+    let (other_root, other_block) = envelope(other.descriptor_cid());
+
+    assert!(SignedReleaseProof::capture(root, &other_block, &release).is_err());
+    assert!(SignedReleaseProof::capture(other_root, &other_block, &release).is_err());
+    assert!(SignedReleaseProof::capture(release.descriptor_cid(), &root_block, &release).is_err());
+}
+
+#[test]
+fn signed_proof_reauthentication_rejects_modified_envelope_evidence() {
+    let fixture = Fixture::new();
+    let release = fixture.release(1);
+    let (root, root_block) = envelope(release.descriptor_cid());
+    let proof = SignedReleaseProof::capture(root, &root_block, &release).unwrap();
+    let original = proof.encode().unwrap();
+    let keys = TrustedKeys::from_bytes(&keyring(&fixture.release_key)).unwrap();
+
+    // Losing any signed or root-binding component must remove authority.
+    for field in [
+        "manifest",
+        "signature",
+        "binding",
+        "descriptor",
+        "root_block",
+    ] {
+        let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let mut bytes = STANDARD.decode(value[field].as_str().unwrap()).unwrap();
+        bytes[0] ^= 1;
+        value[field] = serde_json::Value::String(STANDARD.encode(bytes));
+        let changed = canonical_proof_json(&value);
+        let decoded = SignedReleaseProof::decode(&changed).unwrap();
+        assert!(
+            decoded.authenticate(&keys).is_err(),
+            "accepted modified {field}"
+        );
+    }
+
+    // A different validly signed release cannot occupy this transport root.
+    let other = fixture.release(2);
+    let (other_root, other_block) = envelope(other.descriptor_cid());
+    let other = SignedReleaseProof::capture(other_root, &other_block, &other).unwrap();
+    let mut substituted: serde_json::Value =
+        serde_json::from_slice(&other.encode().unwrap()).unwrap();
+    substituted["root"] = serde_json::Value::String(root.to_string());
+    substituted["root_block"] = serde_json::Value::String(STANDARD.encode(root_block));
+    let decoded = SignedReleaseProof::decode(&canonical_proof_json(&substituted)).unwrap();
+    assert!(decoded.authenticate(&keys).is_err());
+}
+
+// The wire order is part of v1 canonical encoding. The helper writes attack
+// inputs without asking the production proof encoder to normalize them.
+fn canonical_proof_json(value: &serde_json::Value) -> Vec<u8> {
+    let names = [
+        "version",
+        "root",
+        "root_block",
+        "manifest",
+        "signature",
+        "binding",
+        "descriptor",
+    ];
+    format!(
+        "{{{}}}",
+        names
+            .iter()
+            .map(|name| format!("{}:{}", serde_json::to_string(name).unwrap(), value[name]))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+    .into_bytes()
+}
+
+#[test]
+fn signed_proof_rejects_noncanonical_unknown_and_oversized_records() {
+    let fixture = Fixture::new();
+    let release = fixture.release(1);
+    let (root, root_block) = envelope(release.descriptor_cid());
+    let original = SignedReleaseProof::capture(root, &root_block, &release)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+
+    for bytes in [
+        [original.as_slice(), b"\n"].concat(),
+        serde_json::to_vec_pretty(&value).unwrap(),
+        format!(
+            "{{\"unknown\":true,{}",
+            std::str::from_utf8(&original[1..]).unwrap()
+        )
+        .into_bytes(),
+        format!(
+            "{{\"version\":1,{}",
+            std::str::from_utf8(&original[1..]).unwrap()
+        )
+        .into_bytes(),
+        vec![b' '; 8 * 1024 * 1024 + 1],
+    ] {
+        assert!(SignedReleaseProof::decode(&bytes).is_err());
+    }
+    let mut changed = value.clone();
+    changed["version"] = serde_json::json!(2);
+    assert!(SignedReleaseProof::decode(&canonical_proof_json(&changed)).is_err());
+    changed = value.clone();
+    changed["root"] = serde_json::json!(root
+        .to_string_of_base(cid::multibase::Base::Base32Upper)
+        .unwrap());
+    assert!(SignedReleaseProof::decode(&canonical_proof_json(&changed)).is_err());
+
+    for (field, maximum) in [
+        ("manifest", 1024 * 1024),
+        ("descriptor", 1024 * 1024),
+        ("root_block", 2 * 1024 * 1024),
+        ("binding", 128),
+        ("signature", 64),
+    ] {
+        let mut changed = value.clone();
+        changed[field] = serde_json::json!(STANDARD.encode(vec![0; maximum + 1]));
+        assert!(
+            SignedReleaseProof::decode(&canonical_proof_json(&changed)).is_err(),
+            "{field}"
+        );
+    }
+    for length in [0, 63] {
+        let mut changed = value.clone();
+        changed["signature"] = serde_json::json!(STANDARD.encode(vec![0; length]));
+        assert!(SignedReleaseProof::decode(&canonical_proof_json(&changed)).is_err());
+    }
+    let mut changed = value;
+    changed["signature"] =
+        serde_json::json!(STANDARD.encode([0; 64]).trim_end_matches('=').to_owned());
+    assert!(SignedReleaseProof::decode(&canonical_proof_json(&changed)).is_err());
+}
+
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const OTHER_TARGET: &str = "aarch64-apple-darwin";
 const HOST: &[u8] = b"native Host executable";
