@@ -1,8 +1,7 @@
 //! Service evidence for native Host replacement.
 //!
-//! Native adapters are observation-only until candidate compatibility and
-//! child-side startup admission are implemented and qualified. Successful
-//! service-manager calls alone never establish live-upgrade readiness.
+//! Native mutation is restricted to the Linux GNU ARM64 qualification candidate.
+//! Successful service-manager calls alone never establish live-upgrade readiness.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -61,13 +60,13 @@ pub struct StartupIdentity {
 /// The native adapter cannot currently construct this admission.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RestartAdmission {
+pub struct LegacyRestartAdmission {
     pub(crate) startup: StartupIdentity,
     pub(crate) configuration_identity: String,
     pub(crate) prior_pid: u32,
 }
 
-impl RestartAdmission {
+impl LegacyRestartAdmission {
     pub fn validate(&self, before: &ServiceSnapshot) -> Result<()> {
         self.startup.validate()?;
         ensure!(
@@ -101,15 +100,21 @@ impl RestartAdmission {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RunningEvidence {
+#[cfg(test)]
+pub struct LegacyRunningEvidence {
     pub pid: u32,
     pub artifact: ArtifactIdentity,
     pub startup: StartupIdentity,
     pub serving_ready: bool,
 }
 
-impl RunningEvidence {
-    pub fn verify(&self, admission: &RestartAdmission, artifact: &ArtifactIdentity) -> Result<()> {
+#[cfg(test)]
+impl LegacyRunningEvidence {
+    pub fn verify(
+        &self,
+        admission: &LegacyRestartAdmission,
+        artifact: &ArtifactIdentity,
+    ) -> Result<()> {
         admission.startup.validate()?;
         self.startup.validate()?;
         ensure!(
@@ -132,32 +137,317 @@ impl RunningEvidence {
     }
 }
 
+/// Verified preparation from an attested protocol child. Wire responses alone
+/// cannot construct this evidence outside the crate's trusted native adapter.
+#[derive(Clone, Debug)]
+pub struct CompatibilityEvidence {
+    pub(crate) artifact: ArtifactIdentity,
+    pub(crate) capture_digest: [u8; 32],
+    pub(crate) protocol_version: u32,
+    pub(crate) prepared: super::inputs::PreparedHead,
+}
+
+impl CompatibilityEvidence {
+    pub fn verify(
+        &self,
+        executable: &super::attestation::VerifiedExecutable,
+        inputs: &super::inputs::PreflightInputs,
+    ) -> Result<()> {
+        ensure!(
+            self.protocol_version == super::inputs::NATIVE_PROTOCOL_VERSION,
+            "preflight protocol version changed"
+        );
+        ensure!(
+            &self.artifact == executable.artifact()
+                && self.capture_digest == inputs.capture_digest()?,
+            "preflight evidence identifies another executable or captured inputs"
+        );
+        ensure!(
+            !self.prepared.effective_root.is_empty()
+                && !self.prepared.kernel_source.is_empty()
+                && !self.prepared.kernel_runtime.is_empty(),
+            "preflight did not prepare an effective root and kernel"
+        );
+        Ok(())
+    }
+}
+
+/// A process birth plus its fresh admitted execution nonce. The nonce is
+/// independently challenged through the process-owned CLOEXEC evidence socket.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessInstance {
+    pub pid: u32,
+    pub start: super::attestation::ProcessStartToken,
+    pub launch_nonce: [u8; 32],
+    pub manager_invocation_id: String,
+}
+
+impl ProcessInstance {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.pid != 0 && self.launch_nonce != [0; 32],
+            "missing process birth or execution nonce"
+        );
+        ensure!(
+            self.manager_invocation_id.len() == 32
+                && self
+                    .manager_invocation_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && self.manager_invocation_id.bytes().any(|byte| byte != b'0'),
+            "invalid systemd manager invocation identity"
+        );
+        match &self.start {
+            super::attestation::ProcessStartToken::Linux {
+                boot_id,
+                start_ticks,
+            } => {
+                ensure!(
+                    boot_id.len() == 36 && *start_ticks != 0,
+                    "invalid Linux process birth token"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartAdmission {
+    pub(crate) contract: super::startup::StartupContractV1,
+    pub(crate) original_process: ProcessInstance,
+    pub(crate) service: super::startup::ServiceIdentity,
+    pub(crate) transaction_id: [u8; 32],
+}
+
+impl RestartAdmission {
+    pub fn contract(&self) -> &super::startup::StartupContractV1 {
+        &self.contract
+    }
+    pub fn original_process(&self) -> &ProcessInstance {
+        &self.original_process
+    }
+    pub fn service(&self) -> &super::startup::ServiceIdentity {
+        &self.service
+    }
+    pub fn validate(&self, before: &ServiceSnapshot) -> Result<()> {
+        self.contract.validate()?;
+        self.original_process.validate()?;
+        ensure!(
+            self.transaction_id != [0; 32],
+            "restart admission has no transaction identity"
+        );
+        ensure!(
+            before.running
+                == RunningState::Running {
+                    pid: self.original_process.pid
+                }
+                && before.registered
+                && before.enabled == self.service.enabled
+                && !before.failed,
+            "restart admission differs from original service disposition"
+        );
+        ensure!(
+            self.contract.invocation
+                == super::startup::InvocationBinding::Managed {
+                    service: self.service.clone()
+                },
+            "restart admission differs from the committed managed invocation"
+        );
+        Ok(())
+    }
+}
+
+/// Durable stop intent is separate from observed completion. A command timeout
+/// leaves stop_intent set and quiesced absent; recovery must reobserve the manager.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceDisposition {
+    pub original: ServiceSnapshot,
+    pub identity: Option<super::startup::ServiceIdentity>,
+    pub original_process: Option<ProcessInstance>,
+    pub original_contract: Option<super::startup::StartupContractV1>,
+    pub quiescence_contract: Option<super::startup::StartupContractV1>,
+    pub quiescence_permit: Option<super::startup::StartupPermitPayload>,
+    pub stop_intent: bool,
+    pub quiesced: Option<ServiceSnapshot>,
+}
+
+impl ServiceDisposition {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(process) = &self.original_process {
+            process.validate()?;
+        }
+        ensure!(
+            self.quiesced.is_none() || self.stop_intent,
+            "quiescence has no durable stop intent"
+        );
+        if let Some(quiesced) = &self.quiesced {
+            ensure!(
+                quiesced.running == RunningState::Stopped
+                    && quiesced.enabled == self.original.enabled,
+                "quiescence changed automatic-start disposition"
+            );
+        }
+        if let RunningState::Running { pid } = self.original.running {
+            ensure!(
+                self.original.registered
+                    && self.identity.is_some()
+                    && self.original_process.as_ref().is_some_and(|p| p.pid == pid),
+                "running disposition lacks exact managed process identity"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RunningEvidence {
+    pub(crate) process: ProcessInstance,
+    pub(crate) artifact: ArtifactIdentity,
+    pub(crate) startup: StartupIdentity,
+    pub(crate) service: super::startup::ServiceIdentity,
+    pub(crate) contract: super::startup::ContractIdentity,
+    pub(crate) epoch_seq: u64,
+    pub(crate) transaction_id: Option<[u8; 32]>,
+    pub(crate) permit_digest: Option<[u8; 32]>,
+    pub(crate) effective_root: String,
+    pub(crate) kernel_source: String,
+    pub(crate) kernel_runtime: String,
+}
+
+impl RunningEvidence {
+    pub fn process(&self) -> &ProcessInstance {
+        &self.process
+    }
+    pub fn verify(
+        &self,
+        admission: &RestartAdmission,
+        permit: &super::StartupPermit,
+        executable: &super::attestation::VerifiedExecutable,
+    ) -> Result<()> {
+        self.process.validate()?;
+        ensure!(
+            self.process != admission.original_process
+                && self.process.launch_nonce != admission.original_process.launch_nonce
+                && self.process.manager_invocation_id
+                    != admission.original_process.manager_invocation_id,
+            "restart did not establish a fresh admitted execution"
+        );
+        ensure!(
+            &self.artifact == executable.artifact()
+                && self.artifact == permit.contract().artifact
+                && self.contract == permit.contract().identity
+                && self.startup == permit.contract().startup
+                && self.service == admission.service,
+            "running evidence differs from permitted executable, contract or managed invocation"
+        );
+        ensure!(
+            self.transaction_id == Some(permit.payload().transaction_id)
+                && self.permit_digest == Some(permit.payload().digest()?),
+            "running process did not consume this transaction permit"
+        );
+        ensure!(
+            !self.effective_root.is_empty()
+                && !self.kernel_source.is_empty()
+                && !self.kernel_runtime.is_empty(),
+            "running evidence has no coherent serving deployment"
+        );
+        let _ = self.epoch_seq; // An initial coherent epoch may be zero.
+        Ok(())
+    }
+}
+
 /// Operations must preserve definitions, keys, user data, and authority heads.
 /// `compatible` checks the current effective deployment, including rollback.
 /// `restart` must enforce admission in the child before publication or guests.
 pub trait ServiceControl {
-    fn snapshot(&mut self) -> Result<ServiceSnapshot>;
-    fn admit_restart(&mut self, before: &ServiceSnapshot) -> Result<RestartAdmission>;
+    fn admit_restart(
+        &mut self,
+        _before: &ServiceSnapshot,
+        _contract: &super::startup::StartupContractV1,
+        _expected: &super::attestation::VerifiedExecutable,
+        _deadline: Instant,
+    ) -> Result<RestartAdmission> {
+        bail!("native live admission is not qualified")
+    }
+    fn revalidate_restart(
+        &mut self,
+        _admission: &RestartAdmission,
+        _deadline: Instant,
+    ) -> Result<()> {
+        bail!("native live admission revalidation is not qualified")
+    }
+    fn quiesce(
+        &mut self,
+        _intent: &ServiceDisposition,
+        _deadline: Instant,
+    ) -> Result<ServiceDisposition> {
+        bail!("native service quiescence is not qualified")
+    }
+    fn restart(
+        &mut self,
+        _admission: &RestartAdmission,
+        _permit: &super::StartupPermit,
+        _expected: &super::attestation::VerifiedExecutable,
+        _deadline: Instant,
+    ) -> Result<RunningEvidence> {
+        bail!("native guarded restart is not qualified")
+    }
+    fn revalidate_running(
+        &mut self,
+        _evidence: &RunningEvidence,
+        _permit: &super::StartupPermit,
+        _expected: &super::attestation::VerifiedExecutable,
+        _deadline: Instant,
+    ) -> Result<()> {
+        bail!("native live evidence revalidation is not qualified")
+    }
+    fn stop(
+        &mut self,
+        _expected: &super::startup::ServiceIdentity,
+        _deadline: Instant,
+    ) -> Result<()> {
+        bail!("native service containment is not qualified")
+    }
+    fn snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot>;
+    #[cfg(test)]
+    fn legacy_admit_restart(&mut self, before: &ServiceSnapshot) -> Result<LegacyRestartAdmission>;
     /// Recheck prepared next-start inputs against the durable admission during
     /// recovery. The original process may already have stopped. Child-side
     /// enforcement remains required before publication or guest execution.
-    fn revalidate_restart(&mut self, admission: &RestartAdmission) -> Result<()>;
-    fn restart(
+    #[cfg(test)]
+    fn legacy_revalidate_restart(&mut self, admission: &LegacyRestartAdmission) -> Result<()>;
+    #[cfg(test)]
+    fn legacy_restart(
         &mut self,
-        admission: &RestartAdmission,
+        admission: &LegacyRestartAdmission,
         expected: &ArtifactIdentity,
         deadline: Instant,
-    ) -> Result<RunningEvidence>;
-    fn stop(&mut self, deadline: Instant) -> Result<()>;
-    fn compatible(&mut self, artifact: &ArtifactIdentity, executable: &Path) -> Result<()>;
+    ) -> Result<LegacyRunningEvidence>;
+    #[cfg(test)]
+    fn legacy_stop(&mut self, deadline: Instant) -> Result<()>;
+    /// Execute the descriptor-bound preparation protocol with these exact captures.
+    fn compatible(
+        &mut self,
+        executable: &super::attestation::VerifiedExecutable,
+        inputs: &super::inputs::PreflightInputs,
+        deadline: Instant,
+    ) -> Result<CompatibilityEvidence>;
+    /// Version-one recovery only. Never grants guarded startup authority.
+    #[cfg(test)]
+    fn legacy_compatible(&mut self, artifact: &ArtifactIdentity, executable: &Path) -> Result<()>;
 }
 
 const MAX_OBSERVATION_BYTES: usize = 64 * 1024;
 const MAX_IDENTITY_BYTES: usize = 4096;
+#[cfg(test)]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl StartupIdentity {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         for value in [
             Some(self.configuration.as_str()),
             self.fhs_baseline.as_deref(),
@@ -463,8 +753,15 @@ fn launchd_snapshot(print: &str, enabled: &str, definition: &[u8]) -> Result<Ser
     })
 }
 
-/// Read-only native adapter. Candidate compatibility, exact process identity,
-/// and startup admission remain production integration gates.
+// Owner-authorized Linux GNU ARM64 candidate for disposable qualification.
+// Every admission, process, compatibility and recovery check remains required.
+// Other targets remain refused; there is no runtime override.
+const NATIVE_LINUX_QUALIFIED: bool = cfg!(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_env = "gnu"
+));
+
 pub struct NativeService {
     home: PathBuf,
 }
@@ -478,12 +775,87 @@ impl NativeService {
 }
 
 impl ServiceControl for NativeService {
-    fn snapshot(&mut self) -> Result<ServiceSnapshot> {
+    fn admit_restart(
+        &mut self,
+        before: &ServiceSnapshot,
+        contract: &super::startup::StartupContractV1,
+        expected: &super::attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<RestartAdmission> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native live admission is not qualified"
+        );
+        super::native_linux::admit_restart(&self.home, before, contract, expected, deadline)
+    }
+    fn revalidate_restart(
+        &mut self,
+        admission: &RestartAdmission,
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native live admission revalidation is not qualified"
+        );
+        super::native_linux::revalidate_restart(&self.home, admission, deadline)
+    }
+    fn quiesce(
+        &mut self,
+        intent: &ServiceDisposition,
+        deadline: Instant,
+    ) -> Result<ServiceDisposition> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native quiescence is not qualified"
+        );
+        super::native_linux::quiesce(&self.home, intent, deadline)
+    }
+    fn restart(
+        &mut self,
+        admission: &RestartAdmission,
+        permit: &super::StartupPermit,
+        expected: &super::attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<RunningEvidence> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native guarded restart is not qualified"
+        );
+        super::native_linux::restart(&self.home, admission, permit, expected, deadline)
+    }
+    fn revalidate_running(
+        &mut self,
+        evidence: &RunningEvidence,
+        permit: &super::StartupPermit,
+        expected: &super::attestation::VerifiedExecutable,
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native live evidence revalidation is not qualified"
+        );
+        super::native_linux::revalidate_running(&self.home, evidence, permit, expected, deadline)
+    }
+    fn stop(
+        &mut self,
+        expected: &super::startup::ServiceIdentity,
+        deadline: Instant,
+    ) -> Result<()> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "native service containment is not qualified"
+        );
+        super::native_linux::stop(&self.home, expected, deadline)
+    }
+    fn snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot> {
+        if NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux") {
+            return super::native_linux::snapshot(&self.home, deadline);
+        }
         if cfg!(target_os = "linux") {
-            let show = observe("/usr/bin/systemctl", &[
+            let show = observe_until("/usr/bin/systemctl", &[
                 "--user", "show", "ww.service", "--no-pager",
                 "--property=LoadState,UnitFileState,ActiveState,SubState,MainPID,Result,ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths,NeedDaemonReload",
-            ], COMMAND_TIMEOUT)?;
+            ], deadline)?;
             ensure!(
                 show.status.success(),
                 "systemd query failed: {}",
@@ -493,10 +865,10 @@ impl ServiceControl for NativeService {
             if !initial.registered {
                 return Ok(initial);
             }
-            let configuration = observe(
+            let configuration = observe_until(
                 "/usr/bin/systemctl",
                 &["--user", "cat", "ww.service", "--no-pager"],
-                COMMAND_TIMEOUT,
+                deadline,
             )?;
             ensure!(
                 configuration.status.success(),
@@ -508,12 +880,8 @@ impl ServiceControl for NativeService {
             // SAFETY: geteuid has no pointer arguments or preconditions.
             let domain = format!("gui/{}", unsafe { libc::geteuid() });
             let target = format!("{domain}/io.wetware.ww");
-            let print = observe("/bin/launchctl", &["print", &target], COMMAND_TIMEOUT)?;
-            let disabled = observe(
-                "/bin/launchctl",
-                &["print-disabled", &domain],
-                COMMAND_TIMEOUT,
-            )?;
+            let print = observe_until("/bin/launchctl", &["print", &target], deadline)?;
+            let disabled = observe_until("/bin/launchctl", &["print-disabled", &domain], deadline)?;
             ensure!(
                 disabled.status.success(),
                 "launchd domain state is unavailable: {}",
@@ -537,7 +905,7 @@ impl ServiceControl for NativeService {
                 let Some(definition) = definition else {
                     return Ok(absent(disabled.stdout.as_bytes()));
                 };
-                let (executable, default_enabled) = plist_settings(&definition_path)?;
+                let (executable, default_enabled) = plist_settings(&definition_path, deadline)?;
                 return Ok(ServiceSnapshot {
                     registered: false,
                     enabled: if enabled == EnabledState::Unknown {
@@ -559,7 +927,7 @@ impl ServiceControl for NativeService {
                 fields.get("path").map(Path::new) == Some(definition_path.as_path()),
                 "loaded launchd service uses a different definition path"
             );
-            let (executable, default_enabled) = plist_settings(&definition_path)?;
+            let (executable, default_enabled) = plist_settings(&definition_path, deadline)?;
             let mut snapshot = launchd_snapshot(&print.stdout, &disabled.stdout, &definition)?;
             ensure!(
                 snapshot.executable.as_ref() == Some(&executable),
@@ -574,41 +942,67 @@ impl ServiceControl for NativeService {
         }
     }
 
-    fn admit_restart(&mut self, _before: &ServiceSnapshot) -> Result<RestartAdmission> {
+    #[cfg(test)]
+    fn legacy_admit_restart(
+        &mut self,
+        _before: &ServiceSnapshot,
+    ) -> Result<LegacyRestartAdmission> {
         bail!("live Host upgrade requires reliable captured startup inputs and child-side admission; explicitly stop the managed service before upgrading")
     }
 
-    fn revalidate_restart(&mut self, _admission: &RestartAdmission) -> Result<()> {
+    #[cfg(test)]
+    fn legacy_revalidate_restart(&mut self, _admission: &LegacyRestartAdmission) -> Result<()> {
         bail!("native restart recovery requires reliable captured startup inputs and child-side admission; explicitly stop the managed service and resolve the pending transaction")
     }
 
-    fn restart(
+    #[cfg(test)]
+    fn legacy_restart(
         &mut self,
-        _admission: &RestartAdmission,
+        _admission: &LegacyRestartAdmission,
         _expected: &ArtifactIdentity,
         _deadline: Instant,
-    ) -> Result<RunningEvidence> {
+    ) -> Result<LegacyRunningEvidence> {
         bail!(
             "native restart is gated on startup admission and exact running-artifact qualification"
         )
     }
 
-    fn stop(&mut self, _deadline: Instant) -> Result<()> {
+    #[cfg(test)]
+    fn legacy_stop(&mut self, _deadline: Instant) -> Result<()> {
         bail!("native service mutation is not qualified; explicitly stop the managed service and verify its state")
     }
 
-    fn compatible(&mut self, _artifact: &ArtifactIdentity, _executable: &Path) -> Result<()> {
+    fn compatible(
+        &mut self,
+        executable: &super::attestation::VerifiedExecutable,
+        inputs: &super::inputs::PreflightInputs,
+        deadline: Instant,
+    ) -> Result<CompatibilityEvidence> {
+        ensure!(
+            NATIVE_LINUX_QUALIFIED && cfg!(target_os = "linux"),
+            "descriptor-bound native compatibility is not qualified"
+        );
+        super::native_linux::compatible(executable, inputs, deadline)
+    }
+
+    #[cfg(test)]
+    fn legacy_compatible(
+        &mut self,
+        _artifact: &ArtifactIdentity,
+        _executable: &Path,
+    ) -> Result<()> {
         bail!("native Host upgrade requires the selected candidate's compatibility check against the current effective deployment; production integration is unavailable")
     }
 }
 
 #[derive(Debug)]
-struct Observation {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
+pub(super) struct Observation {
+    pub(super) status: ExitStatus,
+    pub(super) stdout: String,
+    pub(super) stderr: String,
 }
 
+#[cfg(test)]
 fn observe(program: &str, args: &[&str], timeout: Duration) -> Result<Observation> {
     ensure!(
         !timeout.is_zero(),
@@ -617,6 +1011,18 @@ fn observe(program: &str, args: &[&str], timeout: Duration) -> Result<Observatio
     let deadline = Instant::now()
         .checked_add(timeout)
         .context("native observation deadline overflow")?;
+    observe_until(program, args, deadline)
+}
+
+pub(super) fn observe_until(
+    program: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> Result<Observation> {
+    ensure!(
+        Instant::now() < deadline,
+        "native service query exceeded deadline before spawn"
+    );
     let mut child = Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
@@ -724,14 +1130,14 @@ fn read_definition(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-fn plist_settings(path: &Path) -> Result<(PathBuf, EnabledState)> {
+fn plist_settings(path: &Path, deadline: Instant) -> Result<(PathBuf, EnabledState)> {
     let path = path
         .to_str()
         .context("launchd definition path is not UTF-8")?;
-    let output = observe(
+    let output = observe_until(
         "/usr/bin/plutil",
         &["-convert", "json", "-o", "-", "--", path],
-        COMMAND_TIMEOUT,
+        deadline,
     )?;
     ensure!(
         output.status.success(),
@@ -913,8 +1319,8 @@ mod tests {
         }
     }
 
-    fn admission() -> RestartAdmission {
-        RestartAdmission {
+    fn admission() -> LegacyRestartAdmission {
+        LegacyRestartAdmission {
             prior_pid: 321,
             configuration_identity: "captured-service".into(),
             startup: StartupIdentity {
@@ -952,7 +1358,7 @@ mod tests {
     fn running_evidence_requires_exact_artifact_startup_and_readiness() {
         let admitted = admission();
         let expected = artifact();
-        let good = RunningEvidence {
+        let good = LegacyRunningEvidence {
             pid: 322,
             artifact: expected.clone(),
             startup: admitted.startup.clone(),
@@ -989,15 +1395,15 @@ mod tests {
     fn native_adapter_cannot_claim_compatibility_or_live_admission() {
         let home = tempfile::tempdir().unwrap();
         let mut service = NativeService::new(home.path()).unwrap();
-        assert!(service.admit_restart(&before()).is_err());
-        assert!(service.revalidate_restart(&admission()).is_err());
+        assert!(service.legacy_admit_restart(&before()).is_err());
+        assert!(service.legacy_revalidate_restart(&admission()).is_err());
         assert!(service
-            .compatible(&artifact(), &home.path().join("candidate"))
+            .legacy_compatible(&artifact(), &home.path().join("candidate"))
             .is_err());
         assert!(service
-            .restart(&admission(), &artifact(), Instant::now())
+            .legacy_restart(&admission(), &artifact(), Instant::now())
             .is_err());
-        assert!(service.stop(Instant::now()).is_err());
+        assert!(service.legacy_stop(Instant::now()).is_err());
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
 
@@ -1063,7 +1469,7 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let mut service = NativeService::new(home).unwrap();
         let observed = service
-            .snapshot()
+            .snapshot(Instant::now() + COMMAND_TIMEOUT)
             .expect("native manager read-only observation");
         eprintln!(
             "registered={} enabled={:?} running={:?} failed={} executable={:?}",

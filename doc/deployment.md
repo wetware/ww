@@ -495,8 +495,16 @@ than a readiness interval.
 invocation fails clearly when Kubo is absent. A production deployment that
 must survive a sustained Kubo outage must set `WW_KUBO_WAIT_MAX_SECS=0`; the
 reviewed `ww-master` manifest does so. This keeps `/healthz` available while
-`/readyz` remains closed until trusted PID0 commits the current generation
-after composition. The commit uses a private Wasm host import installed only
+`/readyz` remains closed during unguarded/container startup after the enabled
+admin listener has bound. A guarded installed Host first performs bounded,
+one-attempt source capture and checks its startup contract before binding admin
+or initializing exporters. If that capture cannot reach its required content,
+startup can fail without a `/healthz` endpoint; `WW_KUBO_WAIT_MAX_SECS=0` does not
+remove this prerequisite. See [guarded startup](native-upgrades.md#startup-admission).
+
+Once startup reaches the admin plane, `/readyz` stays closed until trusted PID0
+commits the current generation after composition. The commit uses a private
+Wasm host import installed only
 for PID0; it is not a Cap'n Proto capability and cannot be delegated over the
 network. HTTP route liveness is checked by dispatch and the public `/status`
 endpoint, not folded into kernel readiness. Readiness is not a continuous Kubo
@@ -514,9 +522,10 @@ its development default is 120 seconds and `0` retries indefinitely. A bad
 local mount directory and Kubo 4xx response other than 429 fail immediately rather than
 becoming a retry loop. The watchdog is deliberately scoped to individual API
 calls, not an entire image merge, so a slow valid multi-layer merge can make
-progress. `/healthz` remains available and `/readyz` remains closed while a
-mandatory mount call retries. Namespace fallback to its bootstrap CID marks
-the runtime degraded. This is not a global HTTP timeout: content reads and
+progress. After the enabled admin listener has bound, `/healthz` remains available
+and `/readyz` remains closed while a mandatory mount call retries. This does not
+cover guarded capture before admin startup. Namespace fallback to its bootstrap
+CID marks the runtime degraded. This is not a global HTTP timeout: content reads and
 DHT activity after startup remain unbounded by it. Configured-layer,
 Stem-head, and effective-root pins gate deployment activation. A transient pin
 failure keeps readiness closed and enters the deployment retry policy.

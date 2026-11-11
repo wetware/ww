@@ -212,12 +212,21 @@ expected_admission="$({
     needs: lockfiles
   build-wasm:
     needs: lockfiles
+  test-original-native-arm64:
+    if: >-
+      github.event_name == 'pull_request'
+      && github.repository == 'wetware/ww'
+      && github.event.pull_request.head.repo.full_name == 'wetware/ww'
+      && github.event.pull_request.head.ref == 'lthibault/pasted-text-v38'
+    needs: lockfiles
+  test-current-native-arm64:
+    needs: [lockfiles, build-wasm]
   test-host:
     needs: [build, build-wasm]
   test-stdlib:
     needs: lockfiles
   test:
-    needs: [test-host, test-stdlib]
+    needs: [test-host, test-stdlib, test-current-native-arm64, test-original-native-arm64]
     if: ${{ always() }}
   build-architecture-map:
     if: >-

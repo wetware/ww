@@ -90,6 +90,24 @@ impl IdentityState {
         })
     }
 
+    /// Sample readiness and identity under the same authoritative epoch fence.
+    /// Startup supplies the gate created from this identity's epoch channel.
+    pub fn ready_snapshot(
+        &self,
+        gate: &authority::KernelReadyGate,
+        routes: Option<&rpc::dispatch::RouteRegistry>,
+    ) -> Option<RunningIdentity> {
+        gate.observe_ready(&self.epoch_rx, |epoch, ready| {
+            let current = self.current.lock().ok()?;
+            let identity = &current.as_ref()?.identity;
+            (epoch.seq == identity.epoch_seq
+                && epoch.root == Some(identity.effective_root)
+                && crate::metrics::serving_readiness_for(ready, routes).ready())
+            .then(|| identity.clone())
+        })
+        .flatten()
+    }
+
     /// Confirm the epoch/root approved by Deployment's source admission.
     /// A later revocation can race admitted execution; epoch-bound authority
     /// still rejects that execution's capabilities and readiness commit.
@@ -210,6 +228,7 @@ pub struct Bootstrap {
     stream_control: libp2p_stream::Control,
     route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     http_dial: Vec<String>,
+    interactive: bool,
 }
 
 impl Bootstrap {
@@ -220,6 +239,24 @@ impl Bootstrap {
         stream_control: libp2p_stream::Control,
         http_dial: Vec<String>,
     ) -> Self {
+        Self::new_with_interactive(
+            network_state,
+            swarm_cmd_tx,
+            signing_key,
+            stream_control,
+            http_dial,
+            is_interactive(),
+        )
+    }
+
+    pub fn new_with_interactive(
+        network_state: rpc::NetworkState,
+        swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
+        signing_key: Arc<SigningKey>,
+        stream_control: libp2p_stream::Control,
+        http_dial: Vec<String>,
+        interactive: bool,
+    ) -> Self {
         Self {
             network_state,
             swarm_cmd_tx,
@@ -227,6 +264,7 @@ impl Bootstrap {
             stream_control,
             route_registry: None,
             http_dial,
+            interactive,
         }
     }
 
@@ -498,7 +536,8 @@ impl Generation {
             bytes = identity.size,
             "Loaded selected kernel artifact"
         );
-        let guest_env = prepare_guest_env(&root.path, &prepared.runtime_cid());
+        let guest_env =
+            prepare_guest_env(&root.path, &prepared.runtime_cid(), bootstrap.interactive);
         let stdin = kernel_stdin(stdio);
         let (mut builder, mut handles) = Builder::kernel(
             Program::ValidatedKernel(prepared.validated()),
@@ -734,9 +773,9 @@ fn kernel_stdin(policy: Stdio) -> Box<dyn tokio::io::AsyncRead + Send + Sync + U
     }
 }
 
-fn prepare_guest_env(root: &str, artifact_cid: &Cid) -> Vec<String> {
+fn prepare_guest_env(root: &str, artifact_cid: &Cid, interactive: bool) -> Vec<String> {
     let mut env = vec!["PATH=/bin".to_string(), format!("WW_ROOT={root}")];
-    if is_interactive() {
+    if interactive {
         env.push("WW_TTY=1".to_string());
     }
     env.push(format!("WW_CELL_CID={artifact_cid}"));
@@ -1209,6 +1248,34 @@ mod tests {
                 assert!(identity.get().is_none());
             })
             .await;
+    }
+
+    #[test]
+    fn private_readiness_requires_same_epoch_channel_identity_and_live_routes() {
+        let root = runtime_cid(b"readiness root");
+        let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
+        let state = IdentityState::pending(epoch_rx.clone());
+        let gate = authority::KernelReadyGate::new(epoch_rx);
+        gate.bind_generation(1);
+        gate.kernel_ready().unwrap();
+        assert!(state.ready_snapshot(&gate, None).is_none());
+        let (_terminate_tx, terminate_rx) = watch::channel(());
+        let _identity = state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .unwrap();
+        assert_eq!(
+            state.ready_snapshot(&gate, None).unwrap().effective_root,
+            root
+        );
+        let routes = crate::dispatcher::server::new_registry();
+        assert!(state.ready_snapshot(&gate, Some(&routes)).is_none());
+        let (_other_tx, other_rx) = watch::channel(test_epoch(1, Some(root)));
+        let other_gate = authority::KernelReadyGate::new(other_rx);
+        other_gate.bind_generation(1);
+        other_gate.kernel_ready().unwrap();
+        assert!(state.ready_snapshot(&other_gate, None).is_none());
+        epoch_tx.send_replace(test_epoch(2, Some(root)));
+        assert!(state.ready_snapshot(&gate, None).is_none());
     }
 
     #[test]

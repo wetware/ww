@@ -343,13 +343,9 @@ async fn healthz_handler() -> impl IntoResponse {
 /// `GET /readyz` — reports the current PID0 commit and a live HTTP route.
 async fn readyz_handler(State(state): State<AdminState>) -> impl IntoResponse {
     let status = state.runtime_status.snapshot();
-    let kernel_ready = state.kernel_ready_gate.is_ready();
-    let routes_ready = state
-        .route_registry
-        .as_ref()
-        .map(|registry| matches!(rpc::dispatch::live_route_count(registry), Ok(count) if count > 0))
-        .unwrap_or(true);
-    let ready = kernel_ready && routes_ready;
+    let readiness = serving_readiness(&state.kernel_ready_gate, state.route_registry.as_ref());
+    let kernel_ready = readiness.kernel_ready;
+    let ready = readiness.ready();
     let phase = if ready {
         "ready".to_string()
     } else if kernel_ready {
@@ -379,6 +375,36 @@ async fn readyz_handler(State(state): State<AdminState>) -> impl IntoResponse {
         )],
         payload,
     )
+}
+
+/// Shared predicate for HTTP diagnostics and authenticated private evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServingReadiness {
+    pub kernel_ready: bool,
+    pub routes_ready: bool,
+}
+
+impl ServingReadiness {
+    pub fn ready(self) -> bool {
+        self.kernel_ready && self.routes_ready
+    }
+}
+
+pub fn serving_readiness(
+    gate: &authority::KernelReadyGate,
+    routes: Option<&rpc::dispatch::RouteRegistry>,
+) -> ServingReadiness {
+    serving_readiness_for(gate.is_ready(), routes)
+}
+
+pub(crate) fn serving_readiness_for(
+    kernel_ready: bool,
+    routes: Option<&rpc::dispatch::RouteRegistry>,
+) -> ServingReadiness {
+    ServingReadiness {
+        kernel_ready,
+        routes_ready: routes.map(|registry| matches!(rpc::dispatch::live_route_count(registry), Ok(count) if count > 0)).unwrap_or(true),
+    }
 }
 
 /// `GET /version` — returns source, image, and embedded artifact provenance.

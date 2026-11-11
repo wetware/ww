@@ -6,7 +6,8 @@ export LC_ALL=C
 
 RELEASE_CID=""
 RECOVER=false
-RECOVERY_IPFS_URL=${IPFS_API:-http://localhost:5001}
+RECOVERY_TIMEOUT_SECS=""
+BOOTSTRAP_IPFS_URL=${IPFS_API:-http://localhost:5001}
 TRUSTED_RELEASE_KEYS=/etc/wetware/release-keys
 VERIFY_MANIFEST=""
 VERIFY_SIGNATURE=""
@@ -123,24 +124,27 @@ while [ $# -gt 0 ]; do
       fi
       RELEASE_CID="$2"; shift 2 ;;
     --recover) RECOVER=true; shift ;;
-    --trusted-release-keys|--verify-manifest|--signature|--ipfs-url)
+    --trusted-release-keys|--verify-manifest|--signature|--ipfs-url|--timeout-secs)
       [ $# -ge 2 ] && [ -n "$2" ] || die "$1 requires an argument"
+      case "$2" in --*) die "$1 requires an argument" ;; esac
       case "$1" in
         --trusted-release-keys) TRUSTED_RELEASE_KEYS=$2 ;;
         --verify-manifest) VERIFY_MANIFEST=$2 ;;
         --signature) VERIFY_SIGNATURE=$2 ;;
-        --ipfs-url) RECOVERY_IPFS_URL=$2 ;;
+        --ipfs-url) BOOTSTRAP_IPFS_URL=$2 ;;
+        --timeout-secs) RECOVERY_TIMEOUT_SECS=$2 ;;
       esac
       shift 2 ;;
     --help)
-      echo "Usage: install.sh --release CID [--trusted-release-keys FILE]"
-      echo "       install.sh --recover [--release CID] [--ipfs-url URL] [--trusted-release-keys FILE]"
+      echo "Usage: install.sh --release CID [--ipfs-url URL] [--trusted-release-keys FILE]"
+      echo "       install.sh --recover --timeout-secs N [--release CID] [--ipfs-url URL] [--trusted-release-keys FILE]"
       echo "       install.sh --verify-manifest FILE --signature FILE [--trusted-release-keys FILE]"
       echo "  Trust keys: independently provisioned /etc/wetware/release-keys by default"
       echo "  --release  Install a specific release by immutable CID"
       echo "  Automatic channel selection requires a provisioned freshness contract."
       echo "  --recover  Recover only the pending native Host transaction"
-      echo "  --ipfs-url Native recovery Kubo HTTP endpoint (default: IPFS_API or http://localhost:5001)"
+      echo "  --ipfs-url Native installation/recovery Kubo HTTP endpoint (default: IPFS_API or http://localhost:5001)"
+      echo "  --timeout-secs Positive native recovery operation budget; required with --recover"
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -339,9 +343,24 @@ verify_release_binding() {
   ' "$WW_TMPDIR/root-bytes" || die "Invalid release root or manifest binding"
 }
 
+if ! "$RECOVER" && [ -n "$RECOVERY_TIMEOUT_SECS" ]; then
+  die "--timeout-secs requires --recover"
+fi
+
 if "$RECOVER"; then
   [ -z "$VERIFY_MANIFEST" ] && [ -z "$VERIFY_SIGNATURE" ] \
     || die "cannot combine --recover with manifest verification"
+  [ -n "$RECOVERY_TIMEOUT_SECS" ] \
+    || die "--recover requires a positive --timeout-secs N before recovery transport or mutation"
+  # Compare decimal text without shell overflow or floating-point rounding.
+  printf '%s\n' "$RECOVERY_TIMEOUT_SECS" | awk '
+    /^[0-9]+$/ {
+      value=$0; sub(/^0+/, "", value)
+      if (value != "" && (length(value)<10 ||
+          (length(value)==10 && "x" value <= "x4294967295"))) valid=1
+    }
+    END { exit !(NR == 1 && valid) }
+  ' || die "--timeout-secs requires a positive unsigned 32-bit integer"
   [ -d "$WW_HOME" ] && [ ! -L "$WW_HOME" ] \
     && [ -f "$WW_HOME/host-upgrade.json" ] && [ ! -L "$WW_HOME/host-upgrade.json" ] \
     || die "Recovery requires a pending Host upgrade in a regular host-upgrade.json file."
@@ -461,7 +480,8 @@ spin_ok "Fetched verified Host"
 
 if "$RECOVER"; then
   "${WW_TMPDIR}/ww" upgrade --recover-only --release "$RELEASE_CID" \
-    --ipfs-url "$RECOVERY_IPFS_URL" --trusted-release-keys "$TRUSTED_RELEASE_KEYS"
+    --ipfs-url "$BOOTSTRAP_IPFS_URL" --timeout-secs "$RECOVERY_TIMEOUT_SECS" \
+    --trusted-release-keys "$TRUSTED_RELEASE_KEYS"
   exit 0
 fi
 
@@ -477,10 +497,10 @@ spin_ok "Fetched verified package"
 "${WW_TMPDIR}/ww" install --check --payload "${WW_TMPDIR}/fhs" \
   --manifest "${WW_TMPDIR}/CHECKSUMS.txt" --signature "${WW_TMPDIR}/CHECKSUMS.txt.sig" \
   --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
-  --bootstrap-release "${IPFS_BASE#/ipfs/}"
+  --ipfs-url "$BOOTSTRAP_IPFS_URL" --bootstrap-release "${IPFS_BASE#/ipfs/}"
 "${WW_TMPDIR}/ww" install --payload "${WW_TMPDIR}/fhs" \
   --manifest "${WW_TMPDIR}/CHECKSUMS.txt" --signature "${WW_TMPDIR}/CHECKSUMS.txt.sig" \
   --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
-  --bootstrap-release "${IPFS_BASE#/ipfs/}"
+  --ipfs-url "$BOOTSTRAP_IPFS_URL" --bootstrap-release "${IPFS_BASE#/ipfs/}"
 "${WW_HOME}/bin/ww" --version
 printf '\nInstalled Host, baseline FHS, and identity. Register a service separately with ww daemon install.\n'

@@ -1,149 +1,233 @@
-# Native Host replacement engine
+# Native Host startup, replacement, and recovery
 
-`ww upgrade` connects authenticated release selection to the #739 transaction
-engine. `PreverifiedCandidate::from_release` accepts only an authenticated
-release and selects the current platform. Native replacement remains gated by
-`NativeService` compatibility and restart admission. The installer is separate
-and refuses different existing native bytes.
+`ww upgrade` selects an authenticated native Host and delegates replacement to
+the existing `Engine`. The installer, FHS updater, and daemon registration retain
+their separate responsibilities. Native replacement does not change the FHS,
+identity, namespaces, service arguments, or publication authority.
 
-## Admission boundaries
+The `NativeService` adapter is enabled as a Linux GNU ARM64 qualification
+candidate. Disposable installed-CLI qualification is in progress. Other targets
+remain refused. macOS also lacks qualified exact running-executable evidence.
 
-The release selector must authenticate both the installed artifact and the
-selected candidate. Version text and source revision are provenance, not exact
-artifact identity. `ArtifactIdentity` names an explicit digest algorithm, exact
-digest, and executable size. Staging recomputes the selected digest and size
-from the supplied bytes. Supported digest algorithms are SHA-256 and BLAKE3;
-the engine never infers an algorithm from digest length.
+## Startup admission
 
-Candidate bytes arrive separately from authenticated selection. The CLI checks
-manifest signature, descriptor binding, platform compatibility profile,
-transport-root link, and exact reconstructed digest/size. Artifact download is
-bounded and uses signed artifact CIDs. Independent release keys remain the trust
-root. Explicit `--release CID` permits historical selection without lowering
-freshness state; automatic channel selection awaits trusted channel provisioning.
+A fresh signed installation creates a durable installation identity, retains the
+public signed proof, and enters `RequiredUnbound`. Installation does not authorize
+`ww run` or start a service. Admission binds exact normalized startup inputs while
+the installation is stopped:
 
-A new `install --release` records an untrusted CID locator in
-`installed-release.json`. Upgrade reauthenticates that release and verifies the
-installed executable; the locator itself supplies no authentication. Legacy or
-local-payload installs without provenance refuse native replacement.
+```sh
+ww startup admit --timeout-secs 300 service
+ww startup admit --timeout-secs 300 run --executor-threads 2
+```
 
-`installation.json` accepts legacy version 1 and scoped version 2. BLAKE3
-ownership hashes do not authenticate a release. The native engine changes only
-the executable slot and preserves FHS and legacy namespace/service provenance.
-Incomplete and unknown receipts cause refusal.
+These commands require a supported native adapter. The number above is an
+explicit example budget, not a measured or automatic timeout recommendation.
+`--check` prepares the inputs and reports the proposed admission without changing
+the contract. Preparation can fetch and retain public content in Kubo.
 
-## Transaction ownership
+Managed admission reads the actual loaded service definition, drop-ins, argument
+vector, working directory, and effective environment. Custom definitions remain
+unchanged. Guarded managed invocations currently require explicit positive
+executor and compiler worker counts (`--executor-threads` or
+`WW_EXECUTOR_THREADS`, and `WW_COMPILE_WORKERS`). The adapter does not infer
+service CPU defaults from the admission command's process.
 
-`Engine::open` holds `~/.ww-installation.lock` until the engine is dropped.
-Installation, existing update/removal callers, and daemon definition writers use
-the same lock. Existing mutators refuse when `host-upgrade.json` exists, even
-after the process that held the lock exits. Service-manager child commands retain
-the lock if their CLI parent exits. Do not unlink the lock to bypass contention.
+Generated Linux units use `WorkingDirectory=%h` to require the account home
+resolved by the user manager. Custom units with optional working-directory fallback are
+unsupported and remain unchanged.
 
-The engine changes only these installation paths:
+Standalone admission binds the supplied `run` arguments and environment. A
+standalone contract cannot authorize a process in the owned `ww.service` cgroup.
+An admitted manual process holds a shared instance lease until exit. The operator
+must stop that process before replacement, re-admission, or removal.
+
+At startup, the Host captures identity, namespace files, local source bytes,
+runtime settings, and publication settings before Host effects. The Host compares
+the captured identity with the admitted contract, then consumes that same capture.
+Changes to an admitted input require explicit stopped re-admission. A baseline
+FHS update does not implicitly grant a new startup contract.
+
+## Independent release trust
+
+The startup state and contract retain the absolute, custody-checked path supplied
+through `--trusted-release-keys`. The file contains independently provisioned
+public keys. The Host never provisions publisher credentials or signing keys.
+
+Pending launches and new candidate acceptance reread that path. Replacing a path
+component with a symlink, changing file custody, or removing the required current
+key causes refusal. Rotating public keys at the bound path does not require a new
+path binding. Explicit stopped `startup admit --trusted-release-keys FILE` changes
+the binding after authenticating the installed generation with the supplied keys.
+
+Exact committed current and previous generations can authenticate with their
+retained historical public-key evidence. This exception permits historical
+rollback; it does not admit a different candidate signed by a removed key. No
+operation lowers the release consumer's freshness floor.
+
+## Durable installation tuple
+
+The accepted native generation binds all of the following:
+
+- Exact executable digest algorithm, digest, and size.
+- Native ownership slot in `installation.json`.
+- Compact v1 transport-root locator in `installed-release.json`.
+- Signed manifest, descriptor, binding, and root-block evidence.
+- Startup contract and durable startup disposition.
+
+The compact locator remains untrusted. A source revision, version string,
+pathname, ownership digest, or service-manager PID cannot substitute for signed
+release evidence or exact executable identity.
 
 | Path under `~/.ww` | Purpose |
-|---|---|
+| --- | --- |
 | `bin/ww` | Installed native executable |
-| `bin/.ww-host-upgrade/` | Verified staging, replacement, and retained executable bytes |
-| `host-upgrade.json` | One pending transaction, bounded to 64 KiB |
-| `host-upgrade-retained.json` | Current and one previous artifact's recorded provenance |
-| `installation.json` | Existing receipt; only executable ownership changes |
+| `bin/.ww-host-upgrade/` | Staged and retained executables, startup state, contract, and public proofs |
+| `host-upgrade.json` | One bounded V2 transaction journal, including admission-only operations |
+| `host-upgrade-retained.json` | Current and one previous authenticated native generation |
+| `installation.json` | Software ownership receipt |
+| `installed-release.json` | Compact untrusted release locator |
 
-Metadata writes sync the temporary file, rename it, and sync the containing
-directory. Executable staging occurs on the destination filesystem. The installed
-executable changes only after the complete staged bytes match the selected
-identity and operational compatibility has passed. Candidate download or staging
-failure leaves the installed executable unchanged.
+Metadata records are bounded to 64 KiB. Retained signed proof envelopes have a
+separate 8 MiB bound and retain each underlying release-verifier bound.
+Writes sync a temporary file, rename the file, and sync its parent directory.
+The journal is removed last. This protocol provides logical atomic acceptance;
+the files do not change simultaneously.
 
-The transaction records intent before replacement and restart. Previous bytes
-remain available through replacement, restart, readiness checks, and receipt
-commit. After success, the engine retains one previous artifact. Cleanup does not
-prune IPFS content or alter deployment authority.
+Initialization records intent before incomplete receipt, marker, identity, and
+software writes. The complete receipt is published last. Retrying initialization
+preserves the installation identity and private identity bytes. Exact-artifact
+reinstallation preserves an admitted contract and accepted provenance, including
+when another signed release contains identical executable bytes.
 
-| Durable phase | Recovery policy |
-|---|---|
-| `Staging`, `Ready` | Abort staging; verify and preserve the original installed executable |
-| `Replacing`, `Installed`, `Restarting`, `Verified` | Restore recorded previous bytes and receipt after service/compatibility checks |
-| `Restoring` | Continue recorded recovery; retain pending state if recovery cannot complete |
-| `Restored` | Verify the restored executable, original receipt, and original retention metadata; finish cleanup without restarting again |
-| `Committed` | Verify the committed executable/receipt and finish cleanup |
+## Leases and pending launches
 
-`operator_upgrade` resolves a pending transaction before calling its new-release
-selection callback. The recovery result identifies the exact artifact and whether
-recovery aborted staging, restored the previous artifact, or completed a commit.
-The same invocation does not then select a different release. `operator_rollback` uses only the
-previous recorded artifact and retained bytes. Rollback uses the same replacement
-owner and does not lower release freshness or rewind deployment heads.
+`~/.ww-installation.lock` excludes installation writers. Stable external instance
+and startup locks coordinate replacement with running Hosts. Writers acquire
+mutation, instance, and startup leases in that order. A writer publishes Blocked
+before stopping an owned service, releases the startup lease, and then obtains
+instance exclusion. Do not remove lock files to bypass contention.
 
-The authenticated shell recovery path uses `Engine::require_pending_recovery`
-before native network selection, then `Engine::recover_authenticated`. The latter
-requires an independently authenticated selection that matches the full recorded
-previous or candidate generation. The CLI also verifies its own executable bytes.
-This recovery-only path cannot start a new transaction. See the shell invocation
-and endpoint requirements in [installation and recovery](installation.md).
+Only an originally running managed service receives a pending transaction launch
+permit. The permit binds the transaction, contract, exact executable, manager
+identity, and recorded service configuration. A busy mutation lock is not launch
+authority. A stopped or absent service remains stopped throughout replacement.
 
-`upgrade --json` reports a structured outcome, selected and observed artifact
-identities, native artifact paths changed, activation, and recovery action.
-Observed identity describes bytes on disk; it does not certify running readiness.
-Changed paths exclude journal and retained-copy metadata. Unknown failure state
-uses null values for activation and changed paths.
+The child validates its permit before capture and again before effects. The
+pending journal supplies the effective candidate or restored contract while
+steady metadata still contains the other generation. A terminal journal admits
+only its exact recorded managed generation. Terminal cleanup does not initiate
+another restart.
 
-Records currently depend on the operator's private local filesystem custody.
-Production integration must define retained signed-evidence validation with
-#738; private journal metadata must not become a substitute signature verifier.
+## Process identity and readiness
 
-## Service and deployment checks
+Linux observation pins the process with a pidfd, identifies its boot/start token,
+opens `/proc/PID/exe`, and hashes the complete running executable. The verifier
+checks executable and process identity before and after private IPC. The service
+manager must report the same process and invocation.
 
-Service observations distinguish registration, startup enablement, running PID,
-failed state, executable path, and effective configuration. Unknown or
-contradictory state refuses replacement. Custom service definitions and drop-ins
-are observed without rewriting them.
+The private readiness protocol binds a fresh challenge, launch nonce, startup
+contract, executable, and coherent serving epoch. The Host holds a CLOEXEC socket
+open until acknowledgement. The verifier rejects EOF or extra data before
+acknowledging. A stale buffered reply after `exec` cannot satisfy that exchange.
+Readiness works with the HTTP admin listener disabled.
 
-Only a previously running managed service can be restarted. A stopped service,
-including a failed service with no running process, remains stopped. An absent
-service can yield executable installation, never a claim of live readiness.
+macOS `SecCode` and mapped-image observations did not establish the required main
+executable identity in the adversarial probe. A matching code-directory hash and
+an expected secondary mapping were insufficient to prove complete main-image
+bytes. macOS native admission remains unavailable.
 
-Live replacement requires evidence that captured startup configuration, prepared
-FHS/local sources, and publisher target match the next startup. The restarted
-Host must enforce that admission before publishing or activating guests. Admission
-must cover every launch after replacement, including automatic service-manager
-restarts; checking files only before an explicit restart is insufficient. Serving readiness must accompany
-exact native artifact identity and the service manager's matching new process.
-Git SHA, version text, process existence, and `/healthz` alone do not qualify.
+## Replacement and recovery
 
-Current Hosts do not provide the required captured startup/native identity
-evidence. `NativeService` therefore observes systemd/launchd state but refuses
-live admission, restart, and compatibility certification. A production adapter
-must check the staged candidate against the effective prepared deployment before
-enabling even a stopped-service command. Missing live evidence requires explicit
-service shutdown; it does not authorize guessing or activating pending edits.
+```sh
+ww upgrade --release CID --timeout-secs 300
+ww upgrade --rollback --timeout-secs 300
+ww upgrade --release CID --check
+```
 
-Readiness uses a finite caller-supplied deadline. There is no production default:
-existing Kubo wait/retry, source preparation, and kernel lifecycle bounds can
-exceed the provisional 120 seconds. The service backend must honor its deadline;
-the byte supplier must separately bound download I/O. Deadline checks guard
-executable replacement and receipt commit. An admitted commit finishes durability
-and cleanup even if those filesystem operations outlast the deadline. Recovery failure retains
-the journal and previous bytes and reports the residual state. An incompatible
-previous Host must remain stopped rather than changing the authoritative image.
+These forms read the admitted managed service's actual configuration. For a
+standalone contract, append the original `run` options to recapture its inputs:
 
-## Qualification and production gates
+```sh
+ww upgrade --release CID --timeout-secs 300 run --executor-threads 2 /srv/workload
+ww upgrade --release CID --check run --executor-threads 2 /srv/workload
+ww upgrade --rollback --timeout-secs 300 run --executor-threads 2 /srv/workload
+ww upgrade --recover-only --release CID --timeout-secs 300 run --executor-threads 2 /srv/workload
+```
 
-Unit tests use real temporary filesystem operations and deterministic service
-evidence. They qualify transaction policy separately from native service-manager
-restart behavior. Native observation tests do not establish successful live
-restart, cold-start timing, power-loss durability, or production trust provisioning.
+Use the admitted working directory, HOME, environment, identity, sources, and run
+options. Options before `run` control release selection; options after `run`
+describe the Host invocation. For example, each position has its own `--ipfs-url`.
+The CLI compares the complete captured identity with the persisted contract
+before publishing captured sources or replacing native bytes. Changed inputs
+refuse; the command does not implicitly re-admit them.
 
-Before permitting native replacement through the CLI, integrate and qualify:
+Omitting `run` never reconstructs standalone inputs from defaults. Changed
+standalone operations require the explicit subcommand. An exact-artifact
+standalone no-op skips recapture. A managed contract rejects the `run` subcommand
+and continues to use the manager's existing configuration.
 
-1. Trusted automatic channel selection, retained signed evidence, and atomic
-   installed-release provenance changes during native commit/recovery.
-2. Candidate/effective-deployment compatibility using the prepared FHS machinery.
-3. Captured startup evidence and admission enforced before restarted Host effects.
-4. Exact running native identity and serving readiness on systemd and launchd.
-5. Recovery from real service restart failure and measured bounded cold startup.
+Rollback preserves the current admitted inputs while selecting retained native
+bytes. Interrupted recovery compares against the transaction's recorded
+before-contract. For `--recover-only`, the selected CID must authenticate the
+executable running recovery; the journal determines the restored generation.
+Standalone replacement requires the admitted manual process to be stopped and
+does not grant automatic restart authority.
 
-The CLI separates `install`, `image update`, `upgrade`, `uninstall`, and daemon
-registration/removal. The native engine never updates FHS or service defaults,
-publishes IPNS values, or authorizes a production rollout.
+Changed upgrades, rollback, and recovery require a positive explicit timeout.
+Exact-artifact no-ops and read-only checks do not need a restart budget.
+The journal records a separate containment budget of at most 30 seconds. After
+operation failure, the engine records `Containing` before waiting for the
+startup lease. That phase rejects pending launch permits and retains the exact
+process target for recovery. One cleanup deadline bounds lease contention,
+publication of `Blocked`, the owned-service stop, and reobservation. Unconfirmed
+containment retains the non-runnable journal and recovery evidence. This budget
+is not a restart default. Filesystem syscalls have no hard real-time bound.
+Rollback preflight (`--rollback --check`) remains unavailable. Automatic channel
+selection still requires independent trusted-channel provisioning; explicit CID
+selection does not activate that separate feature.
+
+The engine authenticates both generations, captures effective inputs, retains
+rollback material, and preflights both exact executables with the production
+composer and linker. Preflight does not activate guests. The engine records stop
+intent, confirms quiescence, replaces the executable, and permits only the
+recorded child. Live commit requires exact new-process evidence and serving
+readiness. Stopped replacement proves that no process started.
+
+Recovery runs before selecting another release. Early recovery preserves the
+previous tuple. Recovery after replacement blocks starts, contains the owned
+service, verifies previous compatibility, and restores the complete previous
+tuple. Missing or conflicting proof retains the blocked journal and recovery
+material. Terminal recovery verifies the durable accepted tuple and finishes
+cleanup without another restart.
+
+Legacy V1 journals permit early abort. Post-replacement V1 recovery requires an
+independently authenticated exact recorded generation; the engine does not infer
+a transport root from a descriptor CID or grant guarded startup authority.
+Existing unguarded installations remain supported for their existing operations;
+changed native upgrade requires explicit migration work and cannot silently
+convert ownership metadata into release authority.
+
+Uninstall blocks new starts before stopping an owned service. After instance
+exclusion, uninstall records `Uninstalled` and removes owned software. The
+installation identity, startup marker, signed proofs, private data, and removal
+tombstone remain available for validated retry.
+
+## Qualification limits
+
+Filesystem crash tests establish transaction behavior, not native manager
+acceptance. Local source builds establish component behavior, not genuine
+release-producer evidence. The acceptance runner invokes actual installed CLI
+and manager commands in a separately provisioned disposable account:
+
+```sh
+python3 scripts/qualify_native_upgrade.py --platform PLATFORM --home ABS_HOME \
+  --service-manager systemd --release-a CID --release-b CID \
+  --trusted-release-keys ABS_PUBLIC_KEY_FILE --ipfs-url URL --timeout-secs N \
+  --output ABS_EVIDENCE_DIRECTORY
+```
+
+The runner requires original producer receipts and a root-provisioned disposable
+account marker. A partial matrix returns a nonzero exit. Each supported platform
+needs its own changed-upgrade, rollback, failure, crash, preservation, and
+login/boot evidence. Neither these tests nor a PR authorizes production activation.

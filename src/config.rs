@@ -26,6 +26,101 @@ fn default_filter(level: &str) -> String {
         .join(",")
 }
 
+/// Invocation-time logging settings. Capture is local and starts no exporter.
+/// Guarded startup hashes these normalized values before calling `initialize`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracingSettings {
+    filter: String,
+    json: bool,
+    ansi: bool,
+    invalid_format: bool,
+    invalid_telemetry: bool,
+    telemetry: Option<crate::telemetry::Config>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TracingSettings {
+    pub fn capture() -> Self {
+        use std::{env::VarError, io::IsTerminal};
+        let is_terminal = std::io::stderr().is_terminal();
+        let level = if is_terminal { "warn" } else { "info" };
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter(level)))
+            .to_string();
+        let (json, invalid_format) = match std::env::var("WW_LOG_FORMAT").as_deref() {
+            Ok("compact") => (false, false),
+            Ok("json") => (true, false),
+            Ok("auto") | Err(VarError::NotPresent) => (!is_terminal, false),
+            _ => (!is_terminal, true),
+        };
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let telemetry = crate::telemetry::Config::from_env();
+        Self {
+            filter,
+            json,
+            ansi: !json && is_terminal && !no_color,
+            invalid_format,
+            invalid_telemetry: telemetry.is_err(),
+            telemetry: telemetry.ok().flatten(),
+        }
+    }
+
+    /// Normalize an observed service environment without consulting the caller's
+    /// environment or terminal state.
+    pub fn from_environment(
+        environment: &std::collections::BTreeMap<String, String>,
+        is_terminal: bool,
+    ) -> Self {
+        let level = if is_terminal { "warn" } else { "info" };
+        let filter = environment
+            .get("RUST_LOG")
+            .and_then(|value| tracing_subscriber::EnvFilter::try_new(value).ok())
+            .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(default_filter(level)))
+            .to_string();
+        let (json, invalid_format) = match environment.get("WW_LOG_FORMAT").map(String::as_str) {
+            Some("compact") => (false, false),
+            Some("json") => (true, false),
+            None | Some("auto") => (!is_terminal, false),
+            _ => (!is_terminal, true),
+        };
+        let telemetry = (|| -> anyhow::Result<Option<crate::telemetry::Config>> {
+            let Some(endpoint) = environment.get("WW_OTLP_ENDPOINT") else {
+                return Ok(None);
+            };
+            let ratio = environment
+                .get("WW_TRACE_SAMPLE_RATIO")
+                .map(String::as_str)
+                .unwrap_or("0.01")
+                .parse()?;
+            let limit = environment
+                .get("WW_TRACE_MAX_SPANS_PER_SECOND")
+                .map(String::as_str)
+                .unwrap_or("100")
+                .parse()?;
+            crate::telemetry::Config::new(endpoint, ratio, limit).map(Some)
+        })();
+        Self {
+            filter,
+            json,
+            ansi: !json
+                && is_terminal
+                && environment
+                    .get("NO_COLOR")
+                    .is_none_or(|value| value.is_empty()),
+            invalid_format,
+            invalid_telemetry: telemetry.is_err(),
+            telemetry: telemetry.ok().flatten(),
+        }
+    }
+
+    /// Start diagnostics using the captured values without rereading environment.
+    pub fn initialize(self) -> Option<crate::telemetry::TelemetryGuard> {
+        initialize_tracing(self)
+    }
+}
+
 /// Initialize tracing using `RUST_LOG` and `WW_LOG_FORMAT`.
 ///
 /// Default log level depends on context:
@@ -52,33 +147,31 @@ fn default_filter(level: &str) -> String {
 /// export and emit event 111 without echoing configuration values.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn init_tracing() -> Option<crate::telemetry::TelemetryGuard> {
+    if TRACING_INITIALIZED.get().is_some() {
+        return None;
+    }
+    TracingSettings::capture().initialize()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static TRACING_INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn initialize_tracing(settings: TracingSettings) -> Option<crate::telemetry::TelemetryGuard> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use std::{env::VarError, io::IsTerminal};
         use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
         // Repeated Kernel::run calls must not start temporary exporter threads.
         // Unlike tracing::dispatcher::has_been_set(), this does not mistake a
         // previously scoped test subscriber for a permanent global subscriber.
-        static INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        if INITIALIZED.set(()).is_err() {
+        if TRACING_INITIALIZED.set(()).is_err() {
             return None;
         }
 
-        let is_terminal = std::io::stderr().is_terminal();
-        let level = if is_terminal { "warn" } else { "info" };
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter(level)));
-        let (json, invalid_format) = match std::env::var("WW_LOG_FORMAT").as_deref() {
-            Ok("compact") => (false, false),
-            Ok("json") => (true, false),
-            Ok("auto") | Err(VarError::NotPresent) => (!is_terminal, false),
-            _ => (!is_terminal, true),
-        };
-        let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-        let telemetry = crate::telemetry::Config::from_env()
-            .and_then(|config| config.map(crate::telemetry::start).transpose());
-        let invalid_telemetry = telemetry.is_err();
+        let filter = tracing_subscriber::EnvFilter::new(&settings.filter);
+        let telemetry = settings.telemetry.map(crate::telemetry::start).transpose();
+        let invalid_telemetry = settings.invalid_telemetry || telemetry.is_err();
         let (layer, guard) = match telemetry {
             Ok(Some((layer, guard))) => (Some(layer), Some(guard)),
             _ => (None, None),
@@ -93,13 +186,13 @@ pub fn init_tracing() -> Option<crate::telemetry::TelemetryGuard> {
                     .with_writer(std::io::stderr)
                     .fmt_fields(crate::logging::SafeFields)
                     .event_format(crate::logging::SafeEvent {
-                        json,
-                        ansi: !json && is_terminal && !no_color,
+                        json: settings.json,
+                        ansi: settings.ansi,
                     }),
             )
             .try_init();
         // Do not emit additional diagnostics through a subscriber owned by a caller.
-        if initialized.is_ok() && invalid_format {
+        if initialized.is_ok() && settings.invalid_format {
             tracing::warn!(
                 event_code = 103u64,
                 "invalid WW_LOG_FORMAT; expected auto, compact, or json; using auto"

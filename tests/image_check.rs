@@ -772,7 +772,10 @@ async fn uncertain_pin_and_car_acknowledgements_retain_real_pins_without_unpin_r
                 async move {
                     observed.lock().unwrap().push(uri.path().to_owned());
                     // Unexpected cleanup requests are recorded but never forwarded.
-                    if !matches!(uri.path(), "/api/v0/pin/add" | "/api/v0/dag/import") {
+                    if !matches!(
+                        uri.path(),
+                        "/api/v0/block/get" | "/api/v0/pin/add" | "/api/v0/dag/import"
+                    ) {
                         return (
                             axum::http::StatusCode::BAD_REQUEST,
                             b"unexpected request".to_vec(),
@@ -828,11 +831,24 @@ async fn uncertain_pin_and_car_acknowledgements_retain_real_pins_without_unpin_r
         } else {
             vec!["/api/v0/pin/add", "/api/v0/dag/import"]
         };
-        assert_eq!(
-            *requests.lock().unwrap(),
-            expected,
-            "failed acknowledgement must not trigger pin/rm or retry"
+        let observed = requests.lock().unwrap();
+        let first_publication = observed
+            .iter()
+            .position(|path| path == "/api/v0/pin/add")
+            .expect("the real pin operation must execute");
+        assert!(
+            first_publication > 0,
+            "capture must inspect immutable content before publication"
         );
+        assert!(observed[..first_publication]
+            .iter()
+            .all(|path| path == "/api/v0/block/get"));
+        assert_eq!(
+            &observed[first_publication..],
+            expected,
+            "failed acknowledgement must not trigger pin/rm, another read, or retry"
+        );
+        drop(observed);
         kubo.bytes(&["repo", "gc"]);
         kubo.bytes(&["pin", "ls", "--type=recursive", &root.to_string()]);
         assert_eq!(

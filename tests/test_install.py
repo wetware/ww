@@ -12,15 +12,18 @@ import subprocess
 import tempfile
 import unittest
 from release_auth_fixture import (bootstrap_arguments, cid_text, generate_key,
-                                  manifest_root, sign_manifest)
+                                  manifest_root, package_release,
+                                  ReleaseMetadataServer, sign_manifest)
 
 REPO = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', type=Path, required=True)
 parser.add_argument('--fhs', type=Path, required=True)
+parser.add_argument('--package-tool', type=Path, required=True)
 args, remaining = parser.parse_known_args()
 BINARY = args.binary.resolve(strict=True)
 FHS = args.fhs.resolve(strict=True)
+PACKAGE_TOOL = args.package_tool.resolve(strict=True)
 HOST_PATH = 'bin/ww/{}/{}/ww'.format(
     'macos' if platform.system() == 'Darwin' else 'linux',
     'aarch64' if platform.machine() in ('arm64', 'aarch64') else 'x86_64')
@@ -32,6 +35,16 @@ def digest(path):
 
 
 class Installation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tools = tempfile.TemporaryDirectory(prefix='ww-install-tools-')
+        cls.addClassCleanup(cls.tools.cleanup)
+        cls.package_tool = Path(cls.tools.name) / 'ww-release-package'
+        # Artifact download does not retain executable mode. Change only a
+        # private fixture copy, preserving the supplied artifact bytes.
+        shutil.copyfile(PACKAGE_TOOL, cls.package_tool)
+        cls.package_tool.chmod(0o700)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='ww-install-test-')
         self.addCleanup(self.tmp.cleanup)
@@ -42,7 +55,19 @@ class Installation(unittest.TestCase):
         self.release = self.root / 'release'
         (self.release / HOST_PATH).parent.mkdir(parents=True)
         shutil.copy2(BINARY, self.release / HOST_PATH)
+        target = {'bin/ww/linux/aarch64/ww': 'aarch64-unknown-linux-gnu',
+                  'bin/ww/linux/x86_64/ww': 'x86_64-unknown-linux-gnu',
+                  'bin/ww/macos/aarch64/ww': 'aarch64-apple-darwin',
+                  'bin/ww/macos/x86_64/ww': 'x86_64-apple-darwin'}[HOST_PATH]
+        self.targets = [target]
+        if target == 'x86_64-unknown-linux-gnu':
+            alias = self.release / 'bin/ww/linux/musl-x86_64/ww'
+            alias.parent.mkdir(parents=True)
+            shutil.copy2(BINARY, alias)
+            self.targets.append('x86_64-unknown-linux-musl')
         shutil.copytree(FHS, self.release / 'fhs')
+        self.metadata = ReleaseMetadataServer()
+        self.addCleanup(self.metadata.close)
         self.checksums()
         self.stubs = self.root / 'transport'
         self.stubs.mkdir()
@@ -74,33 +99,70 @@ esac
                         TEST_ROOT_BLOCK=str(self.root / 'root.block'),
                         PATH=str(self.stubs) + os.pathsep + os.environ['PATH'],
                         NO_COLOR='1', WW_CWASM_DIR=str(self.root / 'cwasm'),
-                        IPFS_API='http://127.0.0.1:1', IPFS_ROUTING_API='http://127.0.0.1:1')
+                        IPFS_API=self.metadata.endpoint, IPFS_ROUTING_API='http://127.0.0.1:1')
 
-    def checksums(self):
-        records = [(name, self.release / name) for name in PAYLOADS]
-        if HOST_PATH == 'bin/ww/linux/x86_64/ww':
-            # The release validation lane runs its static musl artifact on GNU
-            # Linux; authorize the same fixture bytes for that native target.
-            records.insert(1, ('bin/ww/linux/musl-x86_64/ww', self.release / HOST_PATH))
-        (self.release / 'CHECKSUMS.txt').write_text('# sha256\n' + ''.join(
-            f'{digest(path)}  {name}\n' for name, path in records))
-        sign_manifest(self.private, self.release / 'CHECKSUMS.txt')
-        self.bind_manifest()
+    def checksums(self, valid_payload=True):
+        if valid_payload:
+            package = package_release(self.package_tool, self.release, self.root / 'spool',
+                                      self.private, self.trusted_keys, self.targets)
+            self.release_cid = package['root']
+            (self.root / 'root.block').write_bytes(
+                (self.root / 'spool/blocks' / self.release_cid).read_bytes())
+            self.publish_metadata()
+        else:
+            # Preserve the valid descriptor while signing the corrupted bytes.
+            # The shell must pass its hash checks; native metadata must refuse
+            # the disagreement. Separate direct tests below reach FHS validation.
+            manifest = self.release / 'CHECKSUMS.txt'
+            records = [line.split('  ', 1)[1] for line in manifest.read_text().splitlines()[1:]]
+            manifest.write_text('# sha256\n' + ''.join(
+                f'{digest(self.release / name)}  {name}\n' for name in records))
+            sign_manifest(self.private, manifest)
+            self.bind_manifest()
 
-    def bind_manifest(self):
-        block = manifest_root((self.release / 'CHECKSUMS.txt').read_bytes())
+    def bind_manifest(self, descriptor_link=True):
+        descriptor = (self.release / 'RELEASE-DESCRIPTOR.cbor').read_bytes()
+        block = manifest_root((self.release / 'CHECKSUMS.txt').read_bytes(),
+                              descriptor if descriptor_link else None)
         (self.root / 'root.block').write_bytes(block)
         self.release_cid = cid_text(block)
+        self.publish_metadata()
+
+    def publish_metadata(self):
+        self.descriptor_cid = (self.release / 'RELEASE-DESCRIPTOR').read_text().strip()
+        self.metadata.routes = {
+            ('/api/v0/cat', f'/ipfs/{self.release_cid}/{name}'):
+                (self.release / name).read_bytes()
+            for name in ('CHECKSUMS.txt', 'CHECKSUMS.txt.sig', 'RELEASE-DESCRIPTOR')}
+        self.metadata.routes.update({
+            ('/api/v0/block/get', self.descriptor_cid):
+                (self.release / 'RELEASE-DESCRIPTOR.cbor').read_bytes(),
+            ('/api/v0/block/get', self.release_cid): (self.root / 'root.block').read_bytes()})
         if hasattr(self, 'env'):
             self.env['TEST_RELEASE_CID'] = self.release_cid
 
     def install(self, success=True):
+        before_requests = len(self.metadata.requests)
         result = subprocess.run(['sh', str(REPO / 'scripts/install.sh'),
                                  '--release', self.release_cid,
                                  '--trusted-release-keys', str(self.trusted_keys)], env=self.env,
                                 text=True, capture_output=True, timeout=120)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            expected = [('/api/v0/cat', f'/ipfs/{self.release_cid}/{name}')
+                        for name in ('CHECKSUMS.txt', 'CHECKSUMS.txt.sig', 'RELEASE-DESCRIPTOR')]
+            expected += [('/api/v0/block/get', self.descriptor_cid),
+                         ('/api/v0/block/get', self.release_cid)]
+            # Both --check and actual installation authenticate independently.
+            self.assertEqual(self.metadata.requests[before_requests:], expected * 2)
+            startup = json.loads((self.home / '.ww/bin/.ww-host-upgrade/startup-state.json').read_text())
+            self.assertEqual(startup['trusted_release_keys'], str(self.trusted_keys.resolve()))
+            self.assertEqual(startup['disposition'], {'kind': 'required-unbound'})
+            self.assertEqual(startup['native']['transport_root'], self.release_cid)
+            self.assertEqual(startup['native']['descriptor'], self.descriptor_cid)
+            proof = self.home / '.ww/bin/.ww-host-upgrade/proofs' / self.release_cid
+            self.assertEqual(digest(proof), startup['native']['proof']['sha256'])
+            self.assertEqual(proof.stat().st_size, startup['native']['proof']['size'])
             self.assertTrue((self.home / '.ww/identity').is_file())
             installed = self.home / '.ww/bin/ww'
             self.assertFalse(installed.is_symlink())
@@ -177,29 +239,49 @@ esac
                 with self.subTest(name=name, content=content):
                     original = (self.release / name).read_bytes()
                     (self.release / name).write_bytes(content)
-                    self.checksums()
+                    self.checksums(valid_payload=False)
                     before = self.snapshot()
-                    self.install(False)
+                    result = self.install(False)
+                    expected = ('Mandatory payload is empty: ' + name if not content else
+                                'descriptor and signed manifest disagree: ' + name)
+                    self.assertIn(expected, result.stderr)
+                    self.assert_native_refusal_preserved(before)
+                    bootstrap = bootstrap_arguments(self.root / 'corrupt-bootstrap', BINARY,
+                                                    self.release / 'fhs')
+                    result = subprocess.run([str(BINARY), 'install', *bootstrap], env=self.env,
+                                            text=True, capture_output=True, timeout=120)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    expected = ('payload is empty' if not content else
+                                'invalid packaged ' + name.removeprefix('fhs/'))
+                    self.assertIn(expected, result.stderr)
                     self.assert_native_refusal_preserved(before)
                     (self.release / name).write_bytes(original)
                     self.checksums()
 
     def test_checksum_mismatch_missing_and_duplicate_entries_refused(self):
         original = (self.release / 'CHECKSUMS.txt').read_text()
-        for content in (original.replace(digest(self.release / PAYLOADS[1]), '0' * 64),
-                        '\n'.join(original.splitlines()[:-1]) + '\n',
-                        original + original.splitlines()[1] + '\n'):
+        host_row = next(line for line in original.splitlines()
+                        if line.endswith('  ' + HOST_PATH))
+        cases = [(original.replace(digest(self.release / PAYLOADS[1]), '0' * 64),
+                  'Checksum mismatch: fhs/boot/kernel.wasm'),
+                 (''.join(line + '\n' for line in original.splitlines()
+                          if not line.endswith('  fhs/bin/status.wasm')),
+                  'Missing or duplicate SHA-256 entry: fhs/bin/status.wasm'),
+                 (original + host_row + '\n', 'Malformed SHA-256 release manifest')]
+        for content, expected in cases:
             (self.release / 'CHECKSUMS.txt').write_text(content)
             sign_manifest(self.private, self.release / 'CHECKSUMS.txt')
             self.bind_manifest()
-            self.install(False)
+            result = self.install(False)
+            self.assertIn(expected, result.stderr)
             self.assertEqual(self.snapshot(), {})
 
     def test_malformed_identity_preserved(self):
         (self.home / '.ww').mkdir()
         (self.home / '.ww/identity').write_text('malformed identity')
         before = self.snapshot()
-        self.install(False)
+        result = self.install(False)
+        self.assertIn('existing identity is malformed', result.stderr)
         self.assert_native_refusal_preserved(before)
 
     def test_unknown_kernel_collision_preserved(self):
@@ -207,7 +289,9 @@ esac
         destination.parent.mkdir(parents=True)
         destination.write_text('operator kernel')
         before = self.snapshot()
-        self.install(False)
+        result = self.install(False)
+        self.assertIn('unrecognized or altered installation file', result.stderr)
+        self.assertIn(str(destination), result.stderr)
         self.assert_native_refusal_preserved(before)
 
     def test_installer_cannot_update_the_managed_payload(self):
@@ -247,6 +331,39 @@ esac
                                 env=self.env, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(self.snapshot(), before)
+
+    def test_native_metadata_transport_failure_preserves_home(self):
+        self.env['IPFS_API'] = 'http://127.0.0.1:1'
+        before = self.snapshot()
+        result = self.install(False)
+        self.assertIn('fetch release content', result.stderr)
+        self.assertIn('/CHECKSUMS.txt', result.stderr)
+        self.assertEqual(self.metadata.requests, [])
+        self.assert_native_refusal_preserved(before)
+
+    def test_native_descriptor_binding_failure_preserves_home(self):
+        # The shell's manifest membership proof remains valid. Only native
+        # descriptor verification can reject this missing descriptor link.
+        self.bind_manifest(descriptor_link=False)
+        before = self.snapshot()
+        result = self.install(False)
+        self.assertIn('transport root has no descriptor link', result.stderr)
+        self.assertEqual(self.metadata.requests[-2:], [
+            ('/api/v0/block/get', self.descriptor_cid),
+            ('/api/v0/block/get', self.release_cid)])
+        self.assert_native_refusal_preserved(before)
+
+    def test_native_metadata_signature_failure_preserves_home(self):
+        # Shell transport still serves the valid signature. The native HTTP
+        # reread must authenticate independently before reading the descriptor.
+        signature = ('/api/v0/cat', f'/ipfs/{self.release_cid}/CHECKSUMS.txt.sig')
+        self.metadata.routes[signature] = b'\x00' * 64
+        before = self.snapshot()
+        result = self.install(False)
+        self.assertIn('release manifest signature is not authorized', result.stderr)
+        self.assertEqual(self.metadata.requests, [
+            ('/api/v0/cat', f'/ipfs/{self.release_cid}/CHECKSUMS.txt'), signature])
+        self.assert_native_refusal_preserved(before)
 
 
 if __name__ == '__main__':
