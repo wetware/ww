@@ -12,7 +12,6 @@
 //! cancel a filesystem syscall already in progress.
 
 use anyhow::{ensure, Context, Result};
-use sha2::Digest;
 use std::fs::{File, Metadata};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
@@ -131,7 +130,10 @@ impl VerifiedExecutable {
             before.identity == self.identity && before.identity.size == self.artifact.size,
             "executable descriptor identity or size changed"
         );
-        let mut sha256 = sha2::Sha256::new();
+        // Use the native SHA-256 backend for complete executable scans in all
+        // build profiles. Every verification still rereads the held descriptor;
+        // no digest or process observation is reused between trust boundaries.
+        let mut sha256 = ring::digest::Context::new(&ring::digest::SHA256);
         let mut blake3 = blake3::Hasher::new();
         let mut offset = 0;
         let mut buffer = [0; 64 * 1024];
@@ -156,7 +158,7 @@ impl VerifiedExecutable {
             offset += count as u64;
         }
         let digest = match self.artifact.algorithm {
-            DigestAlgorithm::Sha256 => hex::encode(sha256.finalize()),
+            DigestAlgorithm::Sha256 => hex::encode(sha256.finish().as_ref()),
             DigestAlgorithm::Blake3 => blake3.finalize().to_hex().to_string(),
         };
         ensure!(

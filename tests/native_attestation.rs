@@ -60,6 +60,47 @@ fn process_capture_refuses_unqualified_platform() {
     assert!(PinnedProcess::capture(std::process::id(), &expected, deadline()).is_err());
 }
 
+#[test]
+fn sha256_descriptor_matches_vectors_and_rereads_across_buffer_boundaries() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("sha256-byte-fixture");
+    fs::write(&executable, b"abc").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let known = ArtifactIdentity {
+        algorithm: DigestAlgorithm::Sha256,
+        digest: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+        size: 3,
+    };
+    VerifiedExecutable::open(&executable, &known, deadline()).unwrap();
+
+    // Cross SHA-256 padding/block boundaries and the descriptor's 64 KiB read
+    // boundary. RustCrypto supplies an independent reference digest.
+    for size in [55, 56, 63, 64, 65, 65_535, 65_536, 65_537, 131_073] {
+        let bytes: Vec<u8> = (0..size).map(|offset| (offset % 251) as u8).collect();
+        fs::write(&executable, &bytes).unwrap();
+        let expected = identity(&executable, DigestAlgorithm::Sha256);
+        let verified = VerifiedExecutable::open(&executable, &expected, deadline()).unwrap();
+        verified.revalidate(deadline()).unwrap();
+        let before = verified.file_identity().clone();
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap();
+        writer.seek(SeekFrom::End(-1)).unwrap();
+        writer.write_all(&[bytes[size - 1] ^ 1]).unwrap();
+        drop(writer);
+        assert_eq!(verified.file_identity(), &before);
+        assert_eq!(fs::metadata(&executable).unwrap().len(), size as u64);
+        assert!(verified
+            .revalidate(deadline())
+            .unwrap_err()
+            .to_string()
+            .contains("executable descriptor bytes differ from expected artifact"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
