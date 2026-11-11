@@ -561,7 +561,36 @@ jobs:
       timeout-minutes: 20
       run: |
         cargo build --release --locked -p ww-release --features package --bin ww-release-package
-        sha256sum target/release/ww-release-package > "$WW739_LANE/package-tool.sha256"
+
+    - name: Stage private package utility
+      run: |
+        python3 - <<'PY'
+        import filecmp, hashlib, os, shutil, stat
+        from pathlib import Path
+        source = Path('target/release/ww-release-package')
+        info = source.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o022 or not info.st_mode & 0o111):
+            raise SystemExit('unsafe Cargo package utility')
+        def digest(path):
+            with path.open('rb') as stream:
+                return hashlib.file_digest(stream, 'sha256').hexdigest()
+        before = digest(source)
+        lane = Path(os.environ['WW739_LANE'])
+        stage = lane / 'package-tool'
+        stage.mkdir(mode=0o700)
+        target = stage / 'ww-release-package'
+        with source.open('rb') as reader, target.open('xb') as writer:
+            shutil.copyfileobj(reader, writer)
+        target.chmod(0o755)
+        copied = target.lstat()
+        if (copied.st_nlink != 1 or copied.st_uid != info.st_uid
+                or not filecmp.cmp(source, target, shallow=False)
+                or digest(source) != before or digest(target) != before):
+            raise SystemExit('package utility staging changed identity or bytes')
+        (lane / 'package-tool-source.sha256').write_text(f'{before}  {source}\n')
+        (lane / 'package-tool.sha256').write_text(f'{before}  {target}\n')
+        PY
 
     - name: Provision pinned ARM64 runtime dependencies
       run: |
@@ -590,7 +619,7 @@ jobs:
         python3 -c 'import os,pathlib,time; p=pathlib.Path(os.environ["WW739_LANE"]); assert time.time()-int((p/"start-epoch").read_text()) < 95*60, "insufficient cleanup time; no development fixture started"'
         sudo python3 -B scripts/run_native_development_boot.py --disposable-runner \
           --inputs "$WW739_LANE/development" --revision "$CURRENT_REVISION" \
-          --package-tool "$PWD/target/release/ww-release-package" \
+          --package-tool "$WW739_LANE/package-tool/ww-release-package" \
           --ipfs "$WW739_LANE/kubo/ipfs" --timeout-secs 120 \
           --output "$WW739_LANE/development-result"
 
@@ -624,7 +653,7 @@ jobs:
       run: |
         python3 -c 'import os,pathlib,time; p=pathlib.Path(os.environ["WW739_LANE"]); assert time.time()-int((p/"start-epoch").read_text()) < 55*60, "insufficient cleanup time; no release fixture started"'
         sudo python3 -B scripts/run_native_release_integration.py --disposable-runner \
-          --inputs "$WW739_LANE/verified" --package-tool "$PWD/target/release/ww-release-package" \
+          --inputs "$WW739_LANE/verified" --package-tool "$WW739_LANE/package-tool/ww-release-package" \
           --ipfs "$WW739_LANE/kubo/ipfs" --timeout-secs 120 \
           --output "$WW739_LANE/release-result"
 
