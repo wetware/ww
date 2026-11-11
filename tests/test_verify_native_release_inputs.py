@@ -246,6 +246,14 @@ class Inputs(Fixture):
         with self.assertRaisesRegex(RuntimeError, "successful Build"):
             verifier.verify_receipts(self.inputs, "a", self.pins)
 
+    def test_non_object_receipts_refuse(self):
+        for suffix in ("artifact", "run", "build-job", "jobs"):
+            with self.subTest(suffix=suffix):
+                self.receipts("a")
+                write_json(self.inputs / f"a-{suffix}.json", [])
+                with self.assertRaisesRegex(RuntimeError, "receipt must be an object"):
+                    verifier.verify_receipts(self.inputs, "a", self.pins)
+
     def test_duplicate_json_keys_refuse(self):
         (self.inputs / "a-run.json").write_text('{"id": 1, "id": 2}')
         with self.assertRaisesRegex(RuntimeError, "duplicate JSON key"):
@@ -273,6 +281,91 @@ class Inputs(Fixture):
                 verifier.verify(ROOT, self.inputs, output, self.pins_path)
         self.assertFalse(output.exists())
         self.assertEqual(list(self.root.glob(".native-inputs-*")), [])
+
+
+class RetainedInputs(Fixture):
+    def retain(self, captured_at="2026-11-09T22:35:57+00:00"):
+        for label in ("a", "b"):
+            self.mutate("artifact", lambda v: v.update(created_at="2026-11-09T13:00:00Z",
+                                                       expires_at="2026-11-10T13:00:00Z"), label)
+        records = {path.name: {"bytes": path.stat().st_size,
+                               "sha256": verifier.digest(path.read_bytes())}
+                   for path in self.inputs.iterdir()
+                   if path.name not in ("capture-manifest.json", "retention.json")}
+        capture = {"recorded_at_utc": captured_at, "head": "a" * 40,
+                   "files": {"fresh-inputs/" + name: value for name, value in records.items()}}
+        write_json(self.inputs / "capture-manifest.json", capture)
+        manifest = {"schema": 1, "policy": "pr808-original-producer-retention-v1",
+                    "capture_manifest_sha256": verifier.digest((self.inputs / "capture-manifest.json").read_bytes()),
+                    "files": records}
+        write_json(self.inputs / "retention.json", manifest)
+        self.pins["retained_inputs"] = {
+            "policy": "pr808-original-producer-retention-v1",
+            "manifest_sha256": verifier.digest((self.inputs / "retention.json").read_bytes())}
+        write_json(self.pins_path, self.pins)
+
+    def test_retained_original_bytes_survive_transport_expiry_without_relabel(self):
+        self.retain()
+        with self.assertRaisesRegex(RuntimeError, "expired"):
+            verifier.verify_receipts(self.inputs, "a", self.pins)
+        result = verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
+        self.assertEqual(result["receipt_mode"], "pinned_historical_archive")
+        self.assertEqual(result["capture_recorded_at"], "2026-11-09T22:35:57+00:00")
+        self.assertEqual(result["required_checks"]["Test"]["conclusion"], "failure")
+        self.assertFalse(result["required_checks_success"])
+        with patch.object(verifier, "verify_source", return_value={}):
+            output = self.root / "verified"
+            verified = verifier.verify(ROOT, self.inputs, output, self.pins_path, retained=True)
+        self.assertEqual((output / "a.zip").read_bytes(), (self.inputs / "a.zip").read_bytes())
+        self.assertFalse(verified["native_acceptance"])
+
+    def test_changed_archive_or_receipt_and_missing_capture_refuse(self):
+        self.retain()
+        for name in ("a.zip", "a-run.json", "a-build.log", "capture-manifest.json", "retention.json"):
+            with self.subTest(name=name):
+                path = self.inputs / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"changed")
+                with self.assertRaises(RuntimeError):
+                    verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
+                path.write_bytes(original)
+        (self.inputs / "capture-manifest.json").unlink()
+        with self.assertRaises((RuntimeError, FileNotFoundError)):
+            verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
+
+    def test_capture_after_expiry_or_before_creation_refuses(self):
+        for captured in ("2026-11-10T14:00:00Z", "2026-11-08T00:00:00Z", "2026-11-09T22:35:57"):
+            with self.subTest(captured=captured):
+                self.retain(captured)
+                with self.assertRaisesRegex(RuntimeError, "capture|timezone"):
+                    verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
+
+    def test_retention_does_not_authorize_changed_producer_or_upload_receipts(self):
+        self.mutate("run", lambda v: v.update(head_sha="f" * 40))
+        self.retain()
+        with self.assertRaisesRegex(RuntimeError, "producer run differs"):
+            verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
+        self.receipts("a")
+        (self.inputs / "a-build.log").write_text("not an upload receipt")
+        self.retain()
+        with self.assertRaisesRegex(RuntimeError, "upload log receipt"):
+            verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
+
+    def test_retained_receipt_symlink_and_extra_files_refuse(self):
+        self.retain()
+        path = self.inputs / "a-build.log"
+        original = path.read_bytes()
+        elsewhere = self.root / "outside.log"
+        elsewhere.write_bytes(original)
+        path.unlink()
+        path.symlink_to(elsewhere)
+        with self.assertRaisesRegex(RuntimeError, "regular file"):
+            verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
+        path.unlink()
+        path.write_bytes(original)
+        (self.inputs / "unexpected").write_text("unreviewed")
+        with self.assertRaisesRegex(RuntimeError, "file set"):
+            verifier.verify_receipts(self.inputs, "a", self.pins, retained=True)
 
 
 class SourceEquality(unittest.TestCase):

@@ -122,5 +122,9 @@
         }
       }
     }
+  },
+  "retained_inputs": {
+    "policy": "pr808-original-producer-retention-v1",
+    "manifest_sha256": "da7d7180c9a0db24e5b6191d744bb941b85fc870ee27b136b67eefad3fda939e"
   }
 }

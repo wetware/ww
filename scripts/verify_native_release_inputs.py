@@ -4,7 +4,9 @@
 The caller downloads each ZIP, artifact/run/build-job/jobs API record and build
 log separately using authenticated read-only GitHub requests. This offline
 verifier binds those receipts to reviewed pins; it cannot authenticate a caller
-that substitutes forged API responses. Expired inputs and source drift refuse.
+that substitutes forged API responses. Fresh inputs reject transport expiry.
+Explicit retained mode verifies the reviewed archive and pre-expiry capture;
+transport deletion does not revoke these pinned diagnostic bytes. Source drift refuses.
 The unchanged release acceptance gate still rejects both failed producer runs.
 """
 
@@ -27,6 +29,9 @@ from qualify_native_upgrade import validate_producer, verify_producer_files
 
 
 POLICY = "pr808-original-pair-diagnostic-only"
+RETENTION_POLICY = "pr808-original-producer-retention-v1"
+RETENTION_FILES = {label + suffix for label in ("a", "b")
+                   for suffix in (".zip", "-artifact.json", "-run.json", "-build-job.json", "-jobs.json", "-build.log")}
 AUTHORIZED_PAIR = {
     "a": (42623846342, 1, "93de83ad8a0f34b0c9998651e10f1267361265e4"),
     "b": (42648050888, 1, "d3d827c24d2f2d0525fd7056adaf6d18a7f33074"),
@@ -93,9 +98,13 @@ def validate_pins(pins):
              "event": "workflow_dispatch", "target": "aarch64-unknown-linux-gnu",
              "artifact_name": "ww-linux-aarch64", "native_acceptance": False,
              "publication_allowed": False}
-    require(set(pins) == {*fixed, "producers"}, "unknown or missing pin fields")
+    require(set(pins) == {*fixed, "producers", "retained_inputs"}, "unknown or missing pin fields")
     for key, value in fixed.items():
         require(pins[key] == value and type(pins[key]) is type(value), f"unsupported policy pin: {key}")
+    retained = pins["retained_inputs"]
+    require(set(retained) == {"policy", "manifest_sha256"}
+            and retained["policy"] == RETENTION_POLICY
+            and re.fullmatch(r"[0-9a-f]{64}", retained["manifest_sha256"]), "invalid retention pins")
     require(set(pins["producers"]) == {"a", "b"}, "only the original pair is authorized")
     for label, identity in AUTHORIZED_PAIR.items():
         pin = pins["producers"][label]
@@ -136,9 +145,69 @@ def match_fields(record, expected, description):
                 f"{description} differs: {key}")
 
 
-def verify_receipts(inputs, label, pins, now=None):
+def timestamp(value):
+    require(isinstance(value, str), "receipt timestamp must be text")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(parsed.tzinfo is not None, "receipt timestamp requires timezone")
+    return parsed
+
+
+def verify_retained_bundle(inputs, pins):
+    """Authenticate retained bytes against reviewed Git pins, not a live URL.
+
+    The capture record describes the historical acquisition. It is not a new
+    signature, cryptographic timestamp or authority to relabel failed checks.
+    """
+    raw = read_file(inputs / "retention.json", MAX_JSON)
+    manifest_digest = digest(raw)
+    require(manifest_digest == pins["retained_inputs"]["manifest_sha256"], "retention manifest digest differs")
+    manifest = parse_json(raw)
+    require(set(manifest) == {"schema", "policy", "capture_manifest_sha256", "files"}
+            and type(manifest["schema"]) is int and manifest["schema"] == 1
+            and manifest["policy"] == RETENTION_POLICY, "invalid retention manifest")
+    require(set(manifest["files"]) == RETENTION_FILES
+            and {path.name for path in inputs.iterdir()} == RETENTION_FILES | {"retention.json", "capture-manifest.json"},
+            "retained file set differs")
+    capture_raw = read_file(inputs / "capture-manifest.json", MAX_JSON)
+    require(digest(capture_raw) == manifest["capture_manifest_sha256"], "capture manifest digest differs")
+    capture = parse_json(capture_raw)
+    captured = timestamp(capture["recorded_at_utc"])
+    require(re.fullmatch(r"[0-9a-f]{40}", capture["head"]), "invalid capture revision")
+    for name, record in manifest["files"].items():
+        require(set(record) == {"sha256", "bytes"} and type(record["bytes"]) is int
+                and record["bytes"] > 0 and re.fullmatch(r"[0-9a-f]{64}", record["sha256"]),
+                "invalid retained file binding")
+        require(capture["files"].get("fresh-inputs/" + name) == record, "capture file binding differs")
+        raw = read_file(inputs / name, MAX_ARCHIVE if name.endswith(".zip") else MAX_LOG)
+        require(len(raw) == record["bytes"] and digest(raw) == record["sha256"], "retained file digest differs: " + name)
+    for label, pin in pins["producers"].items():
+        require(manifest["files"][label + ".zip"] == {"sha256": pin["archive_sha256"], "bytes": pin["archive_size"]},
+                "retained archive differs from original producer pin")
+    return {"files": manifest["files"], "captured": captured,
+            "capture_recorded_at": capture["recorded_at_utc"],
+            "manifest_sha256": manifest_digest}
+
+
+def verify_receipts(inputs, label, pins, now=None, *, retained=False):
     pin = pins["producers"][label]
-    artifact, run, build, jobs = [read_json(inputs / f"{label}-{suffix}.json")
+    archive = verify_retained_bundle(inputs, pins) if retained else None
+    raw_receipts = {}
+
+    def receipt(suffix):
+        raw = read_file(inputs / f"{label}-{suffix}", MAX_LOG if suffix.endswith(".log") else MAX_JSON)
+        if archive:
+            expected = archive["files"][f"{label}-{suffix}"]
+            require(len(raw) == expected["bytes"] and digest(raw) == expected["sha256"],
+                    "retained receipt changed during verification")
+        raw_receipts[suffix] = raw
+        return raw
+
+    def receipt_json(suffix):
+        value = parse_json(receipt(suffix + ".json"))
+        require(isinstance(value, dict), "JSON receipt must be an object")
+        return value
+
+    artifact, run, build, jobs = [receipt_json(suffix)
                                   for suffix in ("artifact", "run", "build-job", "jobs")]
     repo = pins["repository"]
     api = f"https://api.github.com/repos/{repo}/actions"
@@ -160,9 +229,12 @@ def verify_receipts(inputs, label, pins, now=None):
     match_fields(artifact.get("workflow_run"), {"id": run_id, **source,
                  "repository_id": pins["repository_id"], "head_repository_id": pins["repository_id"]},
                  "artifact source")
-    expires = datetime.fromisoformat(artifact["expires_at"].replace("Z", "+00:00"))
-    require(expires.tzinfo is not None and expires > (now or datetime.now(timezone.utc)),
-            "original artifact has expired")
+    expires = timestamp(artifact["expires_at"])
+    if archive:
+        require(timestamp(artifact["created_at"]) <= archive["captured"] < expires,
+                "capture is outside original artifact retention interval")
+    else:
+        require(expires > (now or datetime.now(timezone.utc)), "original artifact has expired")
 
     entries = jobs.get("jobs")
     require(isinstance(entries, list) and 0 < len(entries) <= 100
@@ -191,7 +263,7 @@ def verify_receipts(inputs, label, pins, now=None):
         steps = [step for step in build.get("steps", []) if step.get("name") == step_name]
         require(len(steps) == 1 and steps[0].get("status") == "completed"
                 and steps[0].get("conclusion") == "success", f"build receipt lacks successful {step_name}")
-    log = read_file(inputs / f"{label}-build.log", MAX_LOG).decode("utf-8")
+    log = receipt("build.log").decode("utf-8")
     expected_log = {
         r"SHA256 digest of uploaded artifact is ([0-9a-f]{64})": pin["archive_sha256"],
         r"Artifact ww-linux-aarch64 successfully finalized\. Artifact ID ([0-9]+)": str(artifact_id),
@@ -205,8 +277,10 @@ def verify_receipts(inputs, label, pins, now=None):
             "workflow_status": run["status"], "workflow_conclusion": run["conclusion"],
             "required_checks": checks, "required_checks_success": False,
             "artifact_expires_at": artifact["expires_at"], "upload_receipt_verified": True,
-            "receipt_sha256": {suffix: digest(read_file(inputs / f"{label}-{suffix}", MAX_LOG))
-                               for suffix in ("artifact.json", "run.json", "build-job.json", "jobs.json", "build.log")}}
+            "receipt_mode": "pinned_historical_archive" if archive else "fresh_api",
+            "capture_recorded_at": archive["capture_recorded_at"] if archive else None,
+            "retention_manifest_sha256": archive["manifest_sha256"] if archive else None,
+            "receipt_sha256": {suffix: digest(raw) for suffix, raw in raw_receipts.items()}}
 
 
 def verify_archive(path, pin, pins, destination):
@@ -362,7 +436,7 @@ def verify_source(checkout, pins):
             "artifact_relabelled_as_checkout": False}
 
 
-def verify(checkout, inputs, output, pins_path):
+def verify(checkout, inputs, output, pins_path, *, retained=False):
     checkout, inputs = checkout.resolve(strict=True), inputs.resolve(strict=True)
     output = output.absolute()
     require(output.parent.resolve(strict=True) == output.parent, "output parent contains aliases")
@@ -370,7 +444,7 @@ def verify(checkout, inputs, output, pins_path):
     pins = read_json(pins_path)
     validate_pins(pins)
     source = verify_source(checkout, pins)
-    evidence = {label: verify_receipts(inputs, label, pins) for label in ("a", "b")}
+    evidence = {label: verify_receipts(inputs, label, pins, retained=retained) for label in ("a", "b")}
     with tempfile.TemporaryDirectory(prefix=".native-inputs-", dir=output.parent) as temporary:
         stage = Path(temporary) / "verified"
         stage.mkdir(mode=0o755)
@@ -396,9 +470,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("checkout", "inputs", "output", "pins"):
         parser.add_argument("--" + name, required=True, type=Path)
+    parser.add_argument("--retained", action="store_true",
+                        help="verify the hash-pinned historical diagnostic archive; never relabel producer source or checks")
     args = parser.parse_args()
     try:
-        result = verify(args.checkout, args.inputs, args.output, args.pins)
+        result = verify(args.checkout, args.inputs, args.output, args.pins, retained=args.retained)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, subprocess.TimeoutExpired) as error:
         print(json.dumps({"status": "REFUSED", "error": str(error),
                           "native_acceptance": False, "publication_allowed": False}), file=sys.stderr)

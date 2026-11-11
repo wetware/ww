@@ -1,0 +1,4 @@
+# Preserve the exact original ZIP, API and log bytes on every checkout.
+inputs/* -text
+# Original upload logs retain exact whitespace; compare their pinned SHA-256 bytes.
+inputs/*-build.log binary
