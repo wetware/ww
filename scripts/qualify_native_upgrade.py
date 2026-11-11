@@ -85,11 +85,16 @@ def validate_producer(receipt, target):
     require(re.fullmatch(r"[0-9a-f]{40}", receipt["revision"]), "invalid producer revision")
     for key in ("sha256", "archive_sha256"):
         require(re.fullmatch(r"[0-9a-f]{64}", receipt[key]), f"invalid producer {key}")
-    require(type(receipt["run_id"]) is int and receipt["run_id"] > 0
-            and type(receipt["attempt"]) is int and receipt["attempt"] > 0,
-            "producer run and attempt must be positive integers")
+    local = receipt["builder"] == f'local-native-diagnostic:{receipt["revision"]}:{target}:release'
+    require((local and target == "aarch64-unknown-linux-gnu"
+             and receipt["run_id"] is None and receipt["attempt"] is None)
+            or (not local and type(receipt["run_id"]) is int and receipt["run_id"] > 0
+                and type(receipt["attempt"]) is int and receipt["attempt"] > 0),
+            "producer run and attempt must match its local or CI context")
     expected = f'github-actions:{receipt["run_id"]}:{receipt["attempt"]}:{target}'
-    require(receipt["builder"] == expected, "source fixture is not an original producer artifact")
+    current = f'github-actions-pr-native:{receipt["run_id"]}:{receipt["attempt"]}:{target}:release'
+    require(receipt["builder"] == expected or (target == "aarch64-unknown-linux-gnu"
+            and (receipt["builder"] == current or local)), "source fixture has no supported producer identity")
     absolute_path(receipt["archive_path"])
     return absolute_path(receipt["path"])
 
@@ -114,6 +119,15 @@ def verify_producer_files(receipt, target, owner=0):
                            "revision": receipt["revision"], "builder": receipt["builder"]},
             "original producer provenance differs")
     expected["PROVENANCE.json"] = (binary.parent / "PROVENANCE.json").read_bytes()
+    if receipt["builder"].startswith(("github-actions-pr-native:", "local-native-diagnostic:")):
+        build = record(binary.parent / "BUILD-RECEIPT.json", owner)
+        require(build.get("policy") == "same-job-native-build-v1" and build.get("profile") == "release"
+                and build.get("target") == target and build.get("builder") == receipt["builder"]
+                and build["ci"]["revision"] == receipt["revision"]
+                and build["host"] == {"size": info.st_size, "sha256": receipt["sha256"]}
+                and build.get("native_acceptance") is False and build.get("publication_allowed") is False,
+                "current native build receipt differs")
+        expected["BUILD-RECEIPT.json"] = (binary.parent / "BUILD-RECEIPT.json").read_bytes()
     for name, raw in expected.items():
         custody(binary.parent / name, owner)
         require((binary.parent / name).read_bytes() == raw, "original producer sidecar differs: " + name)

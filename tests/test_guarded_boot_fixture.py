@@ -135,13 +135,47 @@ class GuardedBootFixture(unittest.TestCase):
         self.assertEqual(args.admission_timeout_secs, 300)
         self.assertTrue(args.guarded)
         self.assertFalse(boot.parse_args(['ww', 'fhs']).guarded)
+        self.assertTrue(boot.parse_args(['ww', 'fhs', '--expect-uninitialized-refusal'])
+                        .expect_uninitialized_refusal)
+        for profile in ('development', 'release'):
+            current = boot.parse_args(options + ['--current-build-receipt', 'BUILD-RECEIPT.json',
+                                                '--build-profile', profile])
+            self.assertEqual(current.build_profile, profile)
         for invalid in (['ww', 'fhs', '--guarded'], options[:-2],
+                        options + ['--expect-uninitialized-refusal'],
+                        options + ['--current-build-receipt', 'BUILD-RECEIPT.json'],
+                        options + ['--build-profile', 'development'],
                         [part for part in options if part != '--guarded'],
                         [part if part != '300' else '0' for part in options],
                         [part if part != '300' else '-1' for part in options]):
             with self.subTest(invalid=invalid), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     boot.parse_args(invalid)
+
+    def test_missing_initialization_control_requires_the_exact_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / 'home'
+            (home / '.ww').mkdir(parents=True)
+            (home / '.ww/identity').write_bytes(b'identity')
+            lease = home / '.ww-host-instance.lock'
+            for code, diagnostic, accepted in [
+                    (1, f'Error: open startup lease {lease}\nNo such file or directory (os error 2)', True),
+                    (0, '', False), (1, 'different startup failure', False)]:
+                with self.subTest(code=code, diagnostic=diagnostic):
+                    def launch(command, cwd, env, output, error, timeout, limit):
+                        output.write_bytes(b'')
+                        error.write_text(diagnostic)
+                        return SimpleNamespace(wait=lambda: code)
+                    with patch.object(boot, 'BoundedProcess', side_effect=launch), \
+                            redirect_stdout(io.StringIO()):
+                        if accepted:
+                            boot.verify_uninitialized_refusal(
+                                ['ww', 'run'], root, {}, home, b'identity', root)
+                        else:
+                            with self.assertRaises(AssertionError):
+                                boot.verify_uninitialized_refusal(
+                                    ['ww', 'run'], root, {}, home, b'identity', root)
 
     def test_admission_preserves_final_run_arguments_and_context(self):
         self.assertTrue(hasattr(boot, 'admit_guarded'), 'explicit admission is missing')

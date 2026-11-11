@@ -378,10 +378,10 @@ jobs:
           target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
         retention-days: 1
 
-  # Temporary PR808 consumer of the reviewed original A/B pair. No new Host
-  # producer, dispatch, publication, or change to the required Test aggregate.
+  # Preserve the original A/B pair as an explicitly historical baseline.
+  # Current-source development and release behavior have separate jobs below.
   test-original-native-arm64:
-    name: Original release GNU ARM64 integration subset
+    name: Historical original release GNU ARM64 integration subset
     if: >-
       github.event_name == 'pull_request'
       && github.repository == 'wetware/ww'
@@ -426,9 +426,13 @@ jobs:
 
     - name: Verify retained original producer inputs
       run: |
-        python3 scripts/verify_native_release_inputs.py --retained --checkout "$PWD" \
+        original_b=d3d827c24d2f2d0525fd7056adaf6d18a7f33074
+        git worktree add --detach "$WW739_LANE/original-source" "$original_b"
+        git -C "$WW739_LANE/original-source" rev-parse HEAD > "$WW739_LANE/original-source-sha"
+        python3 scripts/verify_native_release_inputs.py --retained --checkout "$WW739_LANE/original-source" \
           --inputs "$PWD/tests/fixtures/native-release-originals/inputs" --output "$WW739_LANE/verified" \
           --pins "$PWD/.github/native-release-integration.json"
+        git worktree remove "$WW739_LANE/original-source"
 
     - name: Install package utility toolchain
       uses: dtolnay/rust-toolchain@1.99.1
@@ -488,6 +492,161 @@ jobs:
           ${{ env.WW739_LANE }}/*.jsonl
           ${{ env.WW739_LANE }}/*-sha
         retention-days: 7
+        if-no-files-found: error
+
+  # Positive installed startup needs the admitted native target. Keep the
+  # development profile and all five modes; release execution supplements it.
+  test-current-native-arm64:
+    name: Current GNU ARM64 integration
+    needs: [lockfiles, build-wasm]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+      CURRENT_REVISION: ${{ github.event_name == 'pull_request' && github.repository == 'wetware/ww' && github.event.pull_request.head.repo.full_name == 'wetware/ww' && github.event.pull_request.head.ref == 'lthibault/pasted-text-v38' && github.event.pull_request.head.sha || github.sha }}
+      COMPONENT_REVISION: ${{ github.sha }}
+      WW_BUILD_GIT_SHA: ${{ github.event_name == 'pull_request' && github.repository == 'wetware/ww' && github.event.pull_request.head.repo.full_name == 'wetware/ww' && github.event.pull_request.head.ref == 'lthibault/pasted-text-v38' && github.event.pull_request.head.sha || github.sha }}
+      CURRENT_RELEASE_ENABLED: ${{ github.event_name == 'pull_request' && github.repository == 'wetware/ww' && github.event.pull_request.head.repo.full_name == 'wetware/ww' && github.event.pull_request.head.ref == 'lthibault/pasted-text-v38' }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ env.CURRENT_REVISION }}
+        fetch-depth: 0
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Record exact current source
+      run: |
+        WW739_LANE="$RUNNER_TEMP/ww739-current-integration"
+        printf 'WW739_LANE=%s\n' "$WW739_LANE" >> "$GITHUB_ENV"
+        mkdir -p "$WW739_LANE"
+        date +%s > "$WW739_LANE/start-epoch"
+        git fetch --no-tags origin "$COMPONENT_REVISION"
+        test "$(git rev-parse HEAD)" = "$CURRENT_REVISION"
+        test "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse "$COMPONENT_REVISION^{tree}")"
+        git rev-parse HEAD > "$WW739_LANE/checkout-sha"
+        printf '%s\n' "$COMPONENT_REVISION" > "$WW739_LANE/component-source-sha"
+
+    - uses: actions/download-artifact@v8
+      with:
+        name: wasm-artifacts
+
+    - name: Install pinned native qualification toolchain
+      uses: dtolnay/rust-toolchain@1.99.1
+      with:
+        targets: aarch64-unknown-linux-gnu
+
+    - uses: ./.github/actions/setup-capnp
+      with:
+        cache-key-suffix: current-native-arm64
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: current-native-arm64
+
+    - name: Check current-source integration contracts
+      run: |
+        python3 tests/test_prepare_current_native_release.py -v
+        python3 tests/test_native_development_boot.py -v
+        python3 tests/test_qualify_native_upgrade.py -v
+        python3 tests/test_guarded_boot_fixture.py -v
+        python3 tests/test_native_release_integration.py -v
+        python3 tests/test_native_release_provisioner.py -v
+
+    - name: Build release-profile package utility
+      timeout-minutes: 20
+      run: |
+        cargo build --release --locked -p ww-release --features package --bin ww-release-package
+        sha256sum target/release/ww-release-package > "$WW739_LANE/package-tool.sha256"
+
+    - name: Provision pinned ARM64 runtime dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends dbus-user-session openssl
+        curl --fail --location --max-time 180 \
+          https://github.com/ipfs/kubo/releases/download/v0.33.0/kubo_v0.33.0_linux-arm64.tar.gz \
+          --output "$WW739_LANE/kubo.tar.gz"
+        printf '%s  %s\n' \
+          5bb7773c3399a7a9001fcb579f267ce01e7f6ea3eb1b80661a4093a9514d9ef06fac13bc1150c82c58740d220246ac5f337796fbdf1396a1d82475f4b6fa7929 \
+          "$WW739_LANE/kubo.tar.gz" | sha512sum --check --strict
+        tar -xzf "$WW739_LANE/kubo.tar.gz" -C "$WW739_LANE" kubo/ipfs
+        sha256sum "$WW739_LANE/kubo/ipfs" > "$WW739_LANE/kubo.sha256"
+
+    - name: Build exact development Host without profile optimization
+      timeout-minutes: 35
+      run: |
+        python3 scripts/prepare_current_native_release.py build --checkout "$PWD" \
+          --output "$WW739_LANE/development" --revision "$CURRENT_REVISION" \
+          --component-revision "$COMPONENT_REVISION" --profile development \
+          --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --job "$GITHUB_JOB"
+
+    - name: Validate all five admitted development boot modes
+      timeout-minutes: 20
+      run: |
+        python3 -c 'import os,pathlib,time; p=pathlib.Path(os.environ["WW739_LANE"]); assert time.time()-int((p/"start-epoch").read_text()) < 95*60, "insufficient cleanup time; no development fixture started"'
+        sudo python3 -B scripts/run_native_development_boot.py --disposable-runner \
+          --inputs "$WW739_LANE/development" --revision "$CURRENT_REVISION" \
+          --package-tool "$PWD/target/release/ww-release-package" \
+          --ipfs "$WW739_LANE/kubo/ipfs" --timeout-secs 120 \
+          --output "$WW739_LANE/development-result"
+
+    - name: Verify original baseline for current release comparison
+      if: env.CURRENT_RELEASE_ENABLED == 'true'
+      run: |
+        original_b=d3d827c24d2f2d0525fd7056adaf6d18a7f33074
+        git worktree add --detach "$WW739_LANE/original-source" "$original_b"
+        python3 scripts/verify_native_release_inputs.py --retained \
+          --checkout "$WW739_LANE/original-source" \
+          --inputs "$PWD/tests/fixtures/native-release-originals/inputs" \
+          --output "$WW739_LANE/originals" --pins "$PWD/.github/native-release-integration.json"
+        git worktree remove "$WW739_LANE/original-source"
+
+    - name: Build and independently verify current release candidate C
+      if: env.CURRENT_RELEASE_ENABLED == 'true'
+      timeout-minutes: 35
+      run: |
+        python3 scripts/prepare_current_native_release.py build --checkout "$PWD" \
+          --output "$WW739_LANE/current" --revision "$CURRENT_REVISION" \
+          --component-revision "$COMPONENT_REVISION" --profile release \
+          --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --job "$GITHUB_JOB"
+        python3 scripts/prepare_current_native_release.py verify --checkout "$PWD" \
+          --candidate "$WW739_LANE/current" --revision "$CURRENT_REVISION" \
+          --historical "$WW739_LANE/originals" --pins "$PWD/.github/native-release-integration.json" \
+          --output "$WW739_LANE/verified"
+
+    - name: Validate original A to current C upgrade and rollback
+      if: env.CURRENT_RELEASE_ENABLED == 'true'
+      timeout-minutes: 60
+      run: |
+        python3 -c 'import os,pathlib,time; p=pathlib.Path(os.environ["WW739_LANE"]); assert time.time()-int((p/"start-epoch").read_text()) < 55*60, "insufficient cleanup time; no release fixture started"'
+        sudo python3 -B scripts/run_native_release_integration.py --disposable-runner \
+          --inputs "$WW739_LANE/verified" --package-tool "$PWD/target/release/ww-release-package" \
+          --ipfs "$WW739_LANE/kubo/ipfs" --timeout-secs 120 \
+          --output "$WW739_LANE/release-result"
+
+    - name: Retain exact current inputs and qualification receipts
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: current-native-arm64-integration-${{ github.run_id }}-${{ github.run_attempt }}
+        # Each candidate ZIP already contains the exact Host, FHS and sidecars.
+        path: |
+          ${{ env.WW739_LANE }}/development/candidate.zip
+          ${{ env.WW739_LANE }}/development/*.json
+          ${{ env.WW739_LANE }}/development/*.log
+          ${{ env.WW739_LANE }}/current/candidate.zip
+          ${{ env.WW739_LANE }}/current/*.json
+          ${{ env.WW739_LANE }}/current/*.log
+          ${{ env.WW739_LANE }}/development-result/
+          ${{ env.WW739_LANE }}/release-result/
+          ${{ env.WW739_LANE }}/verified/verified-inputs.json
+          ${{ env.WW739_LANE }}/*.sha256
+          ${{ env.WW739_LANE }}/*-sha
+        retention-days: 90
         if-no-files-found: error
 
   test-host:
@@ -616,7 +775,7 @@ jobs:
         sha256sum target/debug/ww
         WW_TEST_BINARY=target/debug/ww WW_TEST_FHS=target/fhs python3 tests/test_host_install.py
         python3 tests/test_install.py --binary target/debug/ww --fhs target/fhs --package-tool target/release/ww-release-package
-        bash tests/test_installed_boot.sh target/debug/ww target/fhs
+        bash tests/test_installed_boot.sh target/debug/ww target/fhs --expect-uninitialized-refusal
 
     - name: Smoke-test Chess authority proof command
       run: |
@@ -687,17 +846,22 @@ jobs:
         cargo test --locked --manifest-path std/status/Cargo.toml
 
   test:
-    # Preserve the required branch-protection check for both test suites.
+    # Development startup remains required on its admitted native target.
     name: Test
-    needs: [test-host, test-stdlib]
+    needs: [test-host, test-stdlib, test-current-native-arm64, test-original-native-arm64]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-    - name: Require both test suites to pass
+    - name: Require all applicable test suites to pass
       env:
         HOST_RESULT: ${{ needs.test-host.result }}
         STDLIB_RESULT: ${{ needs.test-stdlib.result }}
-      run: test "$HOST_RESULT" = success && test "$STDLIB_RESULT" = success
+        ARM64_RESULT: ${{ needs.test-current-native-arm64.result }}
+        ORIGINAL_RESULT: ${{ needs.test-original-native-arm64.result }}
+        ORIGINAL_REQUIRED: ${{ github.event_name == 'pull_request' && github.repository == 'wetware/ww' && github.event.pull_request.head.repo.full_name == 'wetware/ww' && github.event.pull_request.head.ref == 'lthibault/pasted-text-v38' }}
+      run: |
+        test "$HOST_RESULT" = success && test "$STDLIB_RESULT" = success && test "$ARM64_RESULT" = success
+        if [ "$ORIGINAL_REQUIRED" = true ]; then test "$ORIGINAL_RESULT" = success; fi
 
   build-architecture-map:
     name: Build architecture map

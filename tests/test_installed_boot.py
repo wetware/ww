@@ -157,18 +157,26 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('binary', type=Path)
     parser.add_argument('fhs', type=Path)
-    parser.add_argument('--guarded', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--guarded', action='store_true')
+    mode.add_argument('--expect-uninitialized-refusal', action='store_true',
+                      help='assert that legacy installation cannot start without initialization')
     parser.add_argument('--package-tool', type=Path)
     parser.add_argument('--producer-provenance', type=Path)
+    parser.add_argument('--current-build-receipt', type=Path)
+    parser.add_argument('--build-profile', choices=('development', 'release'))
     parser.add_argument('--admission-timeout-secs', type=positive_seconds)
     parser.add_argument('--evidence', type=Path)
     args = parser.parse_args(argv)
-    options = ('package_tool', 'producer_provenance', 'admission_timeout_secs', 'evidence')
-    if args.guarded and any(getattr(args, name) is None for name in options):
+    required = ('package_tool', 'producer_provenance', 'admission_timeout_secs', 'evidence')
+    if args.guarded and any(getattr(args, name) is None for name in required):
         parser.error('--guarded requires --package-tool, --producer-provenance, '
                      '--admission-timeout-secs and --evidence')
-    if not args.guarded and any(getattr(args, name) is not None for name in options):
+    if not args.guarded and any(getattr(args, name) is not None
+                               for name in (*required, 'current_build_receipt', 'build_profile')):
         parser.error('guarded boot options require --guarded')
+    if (args.current_build_receipt is None) != (args.build_profile is None):
+        parser.error('--current-build-receipt and --build-profile require each other')
     return args
 
 
@@ -297,7 +305,15 @@ def install_guarded(args, root, home, env, evidence):
     with packaged_bootstrap(root / 'bootstrap', args.binary.resolve(strict=True),
                             args.fhs.resolve(strict=True), args.package_tool.resolve(strict=True),
                             args.producer_provenance.resolve(strict=True),
-                            command_runner=package_command) as fixture:
+                            command_runner=package_command,
+                            current_build_receipt=getattr(args, 'current_build_receipt', None),
+                            build_profile=getattr(args, 'build_profile', None)) as fixture:
+        current_build_receipt = getattr(args, 'current_build_receipt', None)
+        if current_build_receipt is not None:
+            shutil.copyfile(current_build_receipt, evidence.path / 'BUILD-RECEIPT.json')
+            evidence.report['build_profile'] = args.build_profile
+            evidence.report['build_receipt_sha256'] = hashlib.sha256(
+                Path(current_build_receipt).read_bytes()).hexdigest()
         evidence.report['bootstrap'] = {
             'root': fixture['root'], 'descriptor': fixture['descriptor'],
             'producer_provenance': fixture['provenance'],
@@ -340,6 +356,24 @@ def stop(child):
         except subprocess.TimeoutExpired:
             child.kill()
             child.wait()
+
+
+def verify_uninitialized_refusal(command, cwd, env, home, identity, root):
+    """Keep missing-initialization refusal separate from the five admitted boots."""
+    lease = home / '.ww-host-instance.lock'
+    state = home / '.ww/bin/.ww-host-upgrade/startup-state.json'
+    assert not lease.exists() and not state.exists(), 'legacy fixture was initialized'
+    output, error = root / 'uninitialized.stdout', root / 'uninitialized.stderr'
+    child = BoundedProcess(command, cwd, env, output, error,
+                           HOST_OUTER_TIMEOUT, MAX_COMMAND_OUTPUT)
+    code = child.wait()
+    diagnostic = error.read_text()
+    assert code == 1, (code, output.read_text(), diagnostic)
+    assert f'open startup lease {lease}' in diagnostic, diagnostic
+    assert 'No such file or directory (os error 2)' in diagnostic, diagnostic
+    assert not lease.exists() and not state.exists(), 'refused launch initialized startup state'
+    assert (home / '.ww/identity').read_bytes() == identity
+    print('PASS: uninitialized installed Host refused before readiness')
 
 
 def wait_http(url, process, log, timeout=90):
@@ -445,6 +479,9 @@ def main(argv=None):
                     command += [str(fhs)]
                 if args.guarded:
                     admit_guarded(command, cwd, host_env, args.admission_timeout_secs, evidence, mode)
+                elif args.expect_uninitialized_refusal:
+                    verify_uninitialized_refusal(command, cwd, host_env, home, identity, root)
+                    return
                 log = (evidence.path if args.guarded else root) / f'host-{mode}.log'
                 if args.guarded:
                     host = BoundedProcess(command, cwd, host_env, log, None,

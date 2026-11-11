@@ -86,21 +86,37 @@ def package_release(tool, tree, spool, private, trusted_keys, targets, *, proven
 
 
 @contextmanager
-def packaged_bootstrap(directory, binary, payload, tool, producer_provenance, *, command_runner=None):
+def packaged_bootstrap(directory, binary, payload, tool, producer_provenance, *, command_runner=None,
+                       current_build_receipt=None, build_profile=None):
     """Complete GNU ARM64 bootstrap using owned copies and independent test trust.
 
-    The lane verifies the original producer receipt before invoking this helper.
-    This fixture preserves that sidecar verbatim; its fresh signature is test
+    The lane verifies the original or current-build receipt before this helper.
+    This fixture preserves its sidecar verbatim; its fresh signature is test
     authority only, never evidence of an officially published release.
     """
     directory = Path(directory).resolve()
     directory.mkdir(mode=0o700)
     provenance = json.loads(Path(producer_provenance).read_text())
     assert set(provenance) == {'repository', 'revision', 'builder'}, provenance
-    assert provenance['repository'] == 'https://github.com/wetware/ww', provenance
     assert re.fullmatch(r'[0-9a-f]{40}', provenance['revision']), provenance
-    assert re.fullmatch(r'github-actions:[1-9][0-9]*:[1-9][0-9]*:aarch64-unknown-linux-gnu',
-                        provenance['builder']), provenance
+    if current_build_receipt is None:
+        assert build_profile is None
+        assert provenance['repository'] == 'https://github.com/wetware/ww', provenance
+        assert re.fullmatch(r'github-actions:[1-9][0-9]*:[1-9][0-9]*:aarch64-unknown-linux-gnu',
+                            provenance['builder']), provenance
+    else:
+        # A current-source build is not an original release artifact.
+        # Verify the separate receipt before packaging any of its exact bytes.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+        from prepare_current_native_release import verify_build_files
+        assert build_profile in ('development', 'release')
+        receipt = Path(current_build_receipt).resolve(strict=True)
+        inputs = receipt.parent
+        assert receipt.name == 'BUILD-RECEIPT.json'
+        assert Path(binary).resolve(strict=True) == inputs / 'ww'
+        assert Path(payload).resolve(strict=True) == inputs / 'fhs'
+        assert Path(producer_provenance).resolve(strict=True) == inputs / 'PROVENANCE.json'
+        verify_build_files(inputs, build_profile, owner=0)
     tree, spool = directory / 'release', directory / 'spool'
     owned_binary = tree / 'bin/ww/linux/aarch64/ww'
     owned_binary.parent.mkdir(parents=True)

@@ -24,6 +24,45 @@ import qualify_native_upgrade as native
 from kubo_fixture import isolated_kubo
 
 
+def verify_input_policy(verified):
+    require(verified.get('status') == 'VERIFIED_DIAGNOSTIC_INPUTS'
+            and verified.get('native_acceptance') is False
+            and verified.get('publication_allowed') is False
+            and verified.get('required_checks_success') is False
+            and verified['source'].get('runtime_source_equal') is True,
+            'input verifier did not preserve the diagnostic-only policy')
+    policy = verified.get('policy')
+    if policy == 'pr808-current-source-native-diagnostic-v1':
+        historical = verified['historical_baseline']
+        build = verified['current_build']
+        require(verified['slot_identities'] == {'a': 'original-producer-A', 'b': 'current-source-candidate-C'}
+                and build['source'] == verified['source']
+                and verified['source']['checkout_revision'] == verified['b']['revision']
+                and verified['source']['artifact_revision'] == verified['b']['revision']
+                and build['ci']['revision'] == verified['b']['revision']
+                and build['host']['sha256'] == verified['b']['sha256']
+                and build['builder'] == verified['b']['builder']
+                and build['profile'] == 'release'
+                and build['ci']['completed_job_receipt'] is False
+                and build['ci']['uploaded_producer_artifact'] is False,
+                'current candidate identity or build evidence differs')
+        require(historical['source']['runtime_source_equal'] is True
+                and historical['source']['checkout_revision'] == historical['source']['artifact_revision'],
+                'historical baseline lacks immutable source equality')
+    else:
+        require(policy == 'pr808-original-pair-diagnostic-only', 'unknown integration input policy')
+        historical = verified
+    require(historical['policy'] == 'pr808-original-pair-diagnostic-only'
+            and historical['native_acceptance'] is False and historical['publication_allowed'] is False
+            and historical['required_checks_success'] is False,
+            'historical producer failures must retain their original policy')
+    failures = {key: historical['producer_evidence'][key]['required_checks']['Test']['conclusion']
+                for key in ('a', 'b')}
+    require(all(value == 'failure' for value in failures.values()),
+            'original producer required-Test failures were not retained')
+    return failures
+
+
 EXPECTED_CHECKS = [
     'authenticated fresh A remains unbound',
     'stopped admission check preserves native acceptance files',
@@ -235,7 +274,7 @@ def run_lane(args, home, paths):
     report = {'version': 1, 'status': 'RUNNING', 'integration_checks_passed': False,
               'native_acceptance': False, 'production_activation': False,
               'producer_required_test': {'a': 'failure', 'b': 'failure'},
-              'development_failure': 'unresolved; existing required Test remains unchanged',
+              'development_profile_result': 'separate required development integration receipt; not inferred from release execution',
               'native_status': None, 'native_exit': None, 'completed': {},
               'overall_timeout_seconds': OVERALL_TIMEOUT_SECONDS,
               'inherited_umask': oct(inherited_umask), 'fixture_setup_umask': '0o022',
@@ -250,16 +289,9 @@ def run_lane(args, home, paths):
         marker = native.record(marker_dir / f'{os.geteuid()}.json', 0)
         verified = native.record(inputs / 'verified-inputs.json', 0)
         package_record = native.record(packages / 'packages.json', 0)
-        require(verified.get('status') == 'VERIFIED_DIAGNOSTIC_INPUTS'
-                and verified.get('native_acceptance') is False
-                and verified.get('publication_allowed') is False
-                and verified.get('required_checks_success') is False
-                and verified['source'].get('runtime_source_equal') is True,
-                'input verifier did not preserve the diagnostic-only policy')
-        report['producer_required_test'] = {key: verified['producer_evidence'][key]
-                                            ['required_checks']['Test']['conclusion'] for key in ('a', 'b')}
-        require(all(value == 'failure' for value in report['producer_required_test'].values()),
-                'original producer required-Test failures were not retained')
+        report['producer_required_test'] = verify_input_policy(verified)
+        report['input_policy'] = verified['policy']
+        report['slot_identities'] = verified.get('slot_identities', {'a': 'original-producer-A', 'b': 'original-producer-B'})
         require(package_record.get('private_signer_removed') is True
                 and package_record.get('publication') is False,
                 'fixture signer custody or publication policy is missing')
@@ -335,6 +367,8 @@ def run_lane(args, home, paths):
         boot_stdout = run('installed-boot', [sys.executable, REPO / 'tests/test_installed_boot.py', binary, fhs,
                           '--guarded', '--package-tool', paths['package_tool'],
                           '--producer-provenance', inputs / 'b/PROVENANCE.json',
+                          *(['--current-build-receipt', inputs / 'b/BUILD-RECEIPT.json', '--build-profile', 'release']
+                            if verified['policy'] == 'pr808-current-source-native-diagnostic-v1' else []),
                           '--admission-timeout-secs', args.timeout_secs, '--evidence', output / 'boot'],
                           600 + 5 * args.timeout_secs)
         validate_boot_output(boot_stdout)

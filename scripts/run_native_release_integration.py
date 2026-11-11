@@ -25,6 +25,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 from release_auth_fixture import generate_key, sign_manifest
 from qualify_native_upgrade import Runner, custody, require, sha256, verify_producer_files
+from prepare_current_native_release import POLICY as CURRENT_POLICY, verify_build_files
 
 MAX_EVIDENCE = 256 * 1024 * 1024
 
@@ -273,6 +274,9 @@ def main():
             verify_producer_files(record[label], "aarch64-unknown-linux-gnu", 0)
         write_json(inputs / "verified-inputs.json", record)
         verify_fhs(inputs, record)
+        if record.get("policy") == CURRENT_POLICY:
+            require(verify_build_files(inputs / "b", "release", owner=0) == record["current_build"],
+                    "copied current build receipt differs from verified input")
         tools = work / "tools"
         tools.mkdir(mode=0o755)
         for source, name in ((args.package_tool, "ww-release-package"), (args.ipfs, "ipfs")):

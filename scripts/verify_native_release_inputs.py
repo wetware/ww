@@ -346,7 +346,7 @@ def verify_archive(path, pin, pins, destination):
 
 
 def git(checkout, *args):
-    result = subprocess.run(["git", "--no-replace-objects", "-C", str(checkout), *args],
+    result = subprocess.run(["git", "--no-replace-objects", "-c", "safe.directory=" + str(checkout), "-C", str(checkout), *args],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
     require(result.returncode == 0, "source verification git command failed: " + result.stderr.decode(errors="replace")[:1024])
     require(len(result.stdout) <= 8 * 1024 ** 2, "source listing exceeds bound")
