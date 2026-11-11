@@ -107,6 +107,7 @@ cid = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 sha2 = "0.10"
+ring = "0.17.14"
 axum = "0.8"
 dirs = { workspace = true }
 indicatif = "0.17"

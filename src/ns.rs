@@ -109,7 +109,32 @@ impl NamespaceConfig {
 /// Looks for `<mount>/etc/ns/*` in each root mount. Returns all found
 /// namespace configs. Later mounts override earlier ones (same name).
 pub fn scan_namespace_configs(mount_paths: &[&Path]) -> Result<Vec<NamespaceConfig>> {
-    let mut configs: HashMap<String, NamespaceConfig> = HashMap::new();
+    Ok(scan_namespace_captures(mount_paths, false)?
+        .into_iter()
+        .map(|captured| captured.config)
+        .collect())
+}
+
+/// Exact namespace bytes retained from the same read which produced `config`.
+pub struct CapturedNamespaceConfig {
+    pub config: NamespaceConfig,
+    pub path: std::path::PathBuf,
+    pub bytes: Vec<u8>,
+}
+
+pub fn capture_namespace_configs(mount_paths: &[&Path]) -> Result<Vec<CapturedNamespaceConfig>> {
+    scan_namespace_captures(mount_paths, true)
+}
+
+fn scan_namespace_captures(
+    mount_paths: &[&Path],
+    bounded: bool,
+) -> Result<Vec<CapturedNamespaceConfig>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut configs: HashMap<String, CapturedNamespaceConfig> = HashMap::new();
+    let mut total_bytes = 0usize;
+    let mut visited_entries = 0usize;
 
     for base in mount_paths {
         let ns_dir = base.join("etc/ns");
@@ -119,23 +144,71 @@ pub fn scan_namespace_configs(mount_paths: &[&Path]) -> Result<Vec<NamespaceConf
         let entries = std::fs::read_dir(&ns_dir)
             .with_context(|| format!("read namespace dir: {}", ns_dir.display()))?;
         for entry in entries {
+            visited_entries += 1;
+            anyhow::ensure!(
+                !bounded || visited_entries <= 4096,
+                "namespace capture directory entry bound exceeded"
+            );
             let entry = entry?;
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                let content = std::fs::read_to_string(&path)
-                    .with_context(|| format!("read namespace config: {}", path.display()))?;
-                let config = NamespaceConfig::parse(name, &content);
+                let bytes = if bounded {
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                        .open(&path)?;
+                    let before = file.metadata()?;
+                    anyhow::ensure!(
+                        before.is_file() && before.len() <= 64 * 1024,
+                        "namespace config is not a bounded regular file"
+                    );
+                    let mut bytes = Vec::new();
+                    (&file).take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+                    let after = file.metadata()?;
+                    anyhow::ensure!(
+                        bytes.len() <= 64 * 1024
+                            && before.dev() == after.dev()
+                            && before.ino() == after.ino()
+                            && before.len() == after.len()
+                            && before.mtime() == after.mtime()
+                            && before.mtime_nsec() == after.mtime_nsec()
+                            && before.ctime() == after.ctime()
+                            && before.ctime_nsec() == after.ctime_nsec(),
+                        "namespace config changed during capture"
+                    );
+                    total_bytes = total_bytes
+                        .checked_add(bytes.len())
+                        .context("namespace capture size overflow")?;
+                    anyhow::ensure!(
+                        total_bytes <= 1024 * 1024 && configs.len() < 128,
+                        "namespace capture exceeds its bound"
+                    );
+                    bytes
+                } else {
+                    std::fs::read(&path)
+                        .with_context(|| format!("read namespace config: {}", path.display()))?
+                };
+                let content =
+                    std::str::from_utf8(&bytes).context("namespace config is not UTF-8")?;
+                let config = NamespaceConfig::parse(name, content);
                 config.validate()?;
-                configs.insert(name.to_string(), config);
+                configs.insert(
+                    name.to_string(),
+                    CapturedNamespaceConfig {
+                        config,
+                        path,
+                        bytes: if bounded { bytes } else { Vec::new() },
+                    },
+                );
             }
         }
     }
 
     let mut result: Vec<_> = configs.into_values().collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
+    result.sort_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(result)
 }
 
@@ -302,6 +375,47 @@ mod tests {
     use cid::Cid;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn namespace_capture_retains_exact_read_and_rejects_unbounded_or_symlink_files() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("etc/ns");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ww");
+        let original = b"# original namespace bytes\n";
+        std::fs::write(&path, original).unwrap();
+        let captured = capture_namespace_configs(&[root.path()]).unwrap();
+        std::fs::write(&path, b"# changed after capture\n").unwrap();
+        assert_eq!(captured[0].bytes, original);
+        assert_eq!(captured[0].path, path);
+        assert_eq!(captured[0].config.name, "ww");
+        std::fs::write(&path, vec![b'#'; 64 * 1024 + 1]).unwrap();
+        assert!(capture_namespace_configs(&[root.path()]).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let target = root.path().join("outside");
+        std::fs::write(&target, original).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(capture_namespace_configs(&[root.path()]).is_err());
+    }
+
+    #[test]
+    fn ordinary_scan_discards_large_raw_files_while_capture_remains_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("etc/ns");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut bytes = vec![b'#'; 1024 * 1024];
+        bytes.push(b'\n');
+        for name in ["first", "second", "third"] {
+            std::fs::write(directory.join(name), &bytes).unwrap();
+        }
+        let internal = scan_namespace_captures(&[root.path()], false).unwrap();
+        assert_eq!(internal.len(), 3);
+        assert!(internal
+            .iter()
+            .all(|entry| entry.bytes.is_empty() && entry.bytes.capacity() == 0));
+        assert_eq!(scan_namespace_configs(&[root.path()]).unwrap().len(), 3);
+        assert!(capture_namespace_configs(&[root.path()]).is_err());
+    }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) {
         let mut request = [0u8; 4096];

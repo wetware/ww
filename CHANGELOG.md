@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Reusable release and readiness foundations.** Capture and reauthenticate
+  signed release proofs, retain immutable configuration and mount inputs, and
+  verify executable custody and epoch-fenced readiness. Native service upgrades
+  remain disabled pending their separate integration gates.
 - **Disposable genuine release rehearsal (#742).** Verify original five-platform
   producer receipts, reconstruct signed releases, exercise bounded CAR transfer
   and rejection controls, and retain command-level evidence. A separate consumer

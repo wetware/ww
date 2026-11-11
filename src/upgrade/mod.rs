@@ -14,6 +14,7 @@ use crate::installation_state::{MutationLock, Receipt};
 use service::{EnabledState, RestartAdmission, RunningState, ServiceControl, ServiceSnapshot};
 use storage::{checkpoint, Paths};
 
+pub mod attestation;
 pub mod service;
 #[doc(hidden)]
 pub mod storage;

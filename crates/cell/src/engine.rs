@@ -165,27 +165,108 @@ struct CacheSettings {
     max_bytes: u64,
 }
 
+/// Parsed invocation-time cache policy. Capturing does not open the cache.
+#[derive(Clone, Debug)]
+pub struct CapturedCacheSettings(Result<Option<CacheSettings>, String>);
+
+impl CapturedCacheSettings {
+    pub fn from_values(directory: Option<PathBuf>, max_bytes: Option<&str>) -> Self {
+        Self((|| {
+            let Some(directory) = directory else {
+                return Ok(None);
+            };
+            let max_bytes = parse_cache_limit(max_bytes).map_err(|value| match value {
+                Some(_) => {
+                    "WW_CWASM_CACHE_MAX_BYTES must be a positive integer byte count".to_owned()
+                }
+                None => "WW_CWASM_CACHE_MAX_BYTES must be greater than zero".to_owned(),
+            })?;
+            Ok(Some(CacheSettings {
+                directory,
+                max_bytes,
+            }))
+        })())
+    }
+    /// Freeze relative cache paths against the invocation directory.
+    pub fn normalize(mut self, cwd: &std::path::Path) -> Self {
+        if let Ok(Some(settings)) = &mut self.0 {
+            if settings.directory.is_relative() {
+                settings.directory = cwd.join(&settings.directory);
+            }
+        }
+        self
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Ok(Some(settings)) = &self.0 {
+            anyhow::ensure!(
+                settings.directory.is_absolute(),
+                "captured cache path is not absolute"
+            );
+            anyhow::ensure!(settings.max_bytes > 0, "captured cache limit is zero");
+        }
+        Ok(())
+    }
+}
+
+pub fn capture_cache_settings() -> CapturedCacheSettings {
+    let directory = std::env::var_os(CWASM_DIR_ENV).map(PathBuf::from);
+    let max_bytes = std::env::var(CWASM_CACHE_MAX_BYTES_ENV);
+    match max_bytes {
+        Ok(value) => CapturedCacheSettings::from_values(directory, Some(&value)),
+        Err(std::env::VarError::NotPresent) => CapturedCacheSettings::from_values(directory, None),
+        Err(_) if directory.is_none() => CapturedCacheSettings(Ok(None)),
+        Err(_) => CapturedCacheSettings(Err(
+            "WW_CWASM_CACHE_MAX_BYTES must be a positive integer byte count".to_owned(),
+        )),
+    }
+}
+
+/// Initialize only after startup admission. Refuse a previously initialized
+/// factory so an admitted configuration cannot silently use another policy.
+pub fn initialize_captured_cache(settings: CapturedCacheSettings) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        FACTORY.get().is_none(),
+        "Wasmtime cache policy was initialized before startup admission"
+    );
+    FACTORY
+        .set(Arc::new(EngineFactory::from_settings(settings.0)))
+        .map_err(|_| anyhow::anyhow!("Wasmtime cache policy changed during startup admission"))
+}
+
+fn parse_cache_limit(raw: Option<&str>) -> Result<u64, Option<&str>> {
+    let value = match raw {
+        Some(value) => value.parse::<u64>().map_err(|_| Some(value))?,
+        None => DEFAULT_CWASM_CACHE_MAX_BYTES,
+    };
+    if value == 0 {
+        Err(None)
+    } else {
+        Ok(value)
+    }
+}
+
 impl CacheSettings {
     fn from_env() -> Result<Option<Self>, String> {
         let Some(directory) = std::env::var_os(CWASM_DIR_ENV).map(PathBuf::from) else {
             return Ok(None);
         };
 
-        let max_bytes = match std::env::var(CWASM_CACHE_MAX_BYTES_ENV) {
-            Ok(value) => value.parse::<u64>().map_err(|_| {
-                format!(
-                    "{CWASM_CACHE_MAX_BYTES_ENV} must be a positive integer byte count, got {value:?}"
-                )
-            })?,
-            Err(std::env::VarError::NotPresent) => DEFAULT_CWASM_CACHE_MAX_BYTES,
-            Err(error) => return Err(format!("failed to read {CWASM_CACHE_MAX_BYTES_ENV}: {error}")),
+        let value = match std::env::var(CWASM_CACHE_MAX_BYTES_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => {
+                return Err(format!(
+                    "failed to read {CWASM_CACHE_MAX_BYTES_ENV}: {error}"
+                ))
+            }
         };
-
-        if max_bytes == 0 {
-            return Err(format!(
-                "{CWASM_CACHE_MAX_BYTES_ENV} must be greater than zero"
-            ));
-        }
+        let max_bytes = parse_cache_limit(value.as_deref()).map_err(|invalid| match invalid {
+            Some(value) => format!(
+                "{CWASM_CACHE_MAX_BYTES_ENV} must be a positive integer byte count, got {value:?}"
+            ),
+            None => format!("{CWASM_CACHE_MAX_BYTES_ENV} must be greater than zero"),
+        })?;
 
         Ok(Some(Self {
             directory,
@@ -350,8 +431,9 @@ fn wasmtime_45_operator_cost() -> OperatorCost {
     }
 }
 
+static FACTORY: OnceLock<Arc<EngineFactory>> = OnceLock::new();
+
 fn engine_factory() -> &'static Arc<EngineFactory> {
-    static FACTORY: OnceLock<Arc<EngineFactory>> = OnceLock::new();
     FACTORY.get_or_init(|| Arc::new(EngineFactory::from_env()))
 }
 
@@ -411,6 +493,61 @@ pub(crate) fn record_instantiation(outcome: Outcome, elapsed: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_cache_initializer_uses_capture_and_refuses_reinitialization() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::tests::captured_cache_initializer_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CWASM_DIR_ENV, "/path/that/must/not/be/used")
+            .env(CWASM_CACHE_MAX_BYTES_ENV, "invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated global cache factory entry point"]
+    fn captured_cache_initializer_probe() {
+        let captured = CapturedCacheSettings::from_values(None, None);
+        initialize_captured_cache(captured).unwrap();
+        assert_eq!(
+            wasmtime_cache_metrics().snapshot().state,
+            WasmtimeCacheState::Disabled
+        );
+        assert!(initialize_captured_cache(CapturedCacheSettings::from_values(None, None)).is_err());
+    }
+
+    #[test]
+    fn captured_cache_freezes_paths_and_policy_without_opening_cache() {
+        let captured = CapturedCacheSettings::from_values(Some("cache".into()), Some("123"))
+            .normalize(std::path::Path::new("/invocation"));
+        let settings = captured.0.unwrap().unwrap();
+        assert_eq!(settings.directory, PathBuf::from("/invocation/cache"));
+        assert_eq!(settings.max_bytes, 123);
+        assert!(
+            CapturedCacheSettings::from_values(Some("cache".into()), Some("0"))
+                .0
+                .is_err()
+        );
+        assert!(CapturedCacheSettings::from_values(None, Some("bad"))
+            .0
+            .unwrap()
+            .is_none());
+        assert!(
+            CapturedCacheSettings::from_values(Some("cache".into()), None)
+                .validate()
+                .is_err()
+        );
+    }
 
     fn component_bytes() -> Vec<u8> {
         wat::parse_str("(component)").expect("minimal component")

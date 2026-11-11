@@ -49,10 +49,12 @@ fn decode_component(encoded: &str) -> String {
 #[derive(Clone, Copy)]
 enum ResponseMode {
     Success,
+    LocalFile(&'static [u8]),
     Resolve,
     Named(&'static str),
     ReadFailure,
     ImportFailure,
+    SecondPinFailure,
     MissingAcknowledgement,
     Stall(&'static str),
 }
@@ -135,11 +137,21 @@ impl FakeKubo {
                     signal.notify_one();
                     std::future::pending::<()>().await;
                 }
-                let failed = matches!(
-                    (mode, request.endpoint.as_str()),
-                    (ResponseMode::ReadFailure, "block/get")
-                        | (ResponseMode::ImportFailure, "dag/import")
-                );
+                let second_pin = matches!(mode, ResponseMode::SecondPinFailure)
+                    && request.endpoint == "pin/add"
+                    && recorded
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r.endpoint == "pin/add")
+                        .count()
+                        == 2;
+                let failed = second_pin
+                    || matches!(
+                        (mode, request.endpoint.as_str()),
+                        (ResponseMode::ReadFailure, "block/get")
+                            | (ResponseMode::ImportFailure, "dag/import")
+                    );
                 let status = if failed {
                     "500 Internal Server Error"
                 } else {
@@ -149,6 +161,16 @@ impl FakeKubo {
                     b"backend failure".to_vec()
                 } else {
                     match request.endpoint.as_str() {
+                        "add" if matches!(mode, ResponseMode::LocalFile(_)) => {
+                            let ResponseMode::LocalFile(bytes) = mode else {
+                                unreachable!()
+                            };
+                            format!(
+                                r#"{{"Name":"source","Hash":"{root}","Size":"{}"}}"#,
+                                bytes.len()
+                            )
+                            .into_bytes()
+                        }
                         "block/get" => blocks
                             .get(&request.argument().parse::<Cid>().unwrap())
                             .unwrap()
@@ -215,7 +237,7 @@ impl FakeKubo {
         assert!(
             requests.iter().all(|request| matches!(
                 request.endpoint.as_str(),
-                "block/get" | "dag/import" | "name/resolve" | "pin/add"
+                "block/get" | "dag/import" | "name/resolve" | "pin/add" | "add"
             )),
             "{requests:?}"
         );
@@ -561,6 +583,216 @@ async fn standalone_http_block_limits_are_typed_but_transport_errors_are_not() {
         }
         server.await.unwrap();
     }
+}
+
+async fn capture_fixture(
+    kubo: &FakeKubo,
+    mounts: &[Mount],
+) -> Result<super::resolution::CapturedMounts> {
+    let (owner, host) = cache::HostFsOwner::start(
+        tokio::runtime::Handle::current(),
+        cache::HostLimits::default(),
+    )
+    .unwrap();
+    let (scope, scope_owner, finalizer, _completion) = host.try_filesystem_scope().unwrap();
+    let transaction = host
+        .try_foreground_transaction(host.try_logical_io().unwrap(), &[&scope])
+        .unwrap();
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    let result = super::resolution::capture_frozen_mounts_with_cancel(
+        mounts,
+        &kubo.client,
+        &transaction,
+        false,
+        &mut cancel,
+    )
+    .await;
+    drop(transaction);
+    drop(scope_owner);
+    drop(finalizer);
+    owner.shutdown().await.unwrap();
+    result
+}
+
+#[tokio::test]
+async fn cancelled_captured_mounts_publish_no_roots() {
+    let (root, block) = directory(&[]);
+    let kubo = FakeKubo::new(HashMap::from([(root, block)]), root, ResponseMode::Success).await;
+    let mounts = crate::mount::parse_args(&[format!("{root}:/a")]).unwrap();
+    let captured = capture_fixture(&kubo, &mounts).await.unwrap();
+    let before = kubo.requests().len();
+    let (_tx, mut cancel) = tokio::sync::watch::channel(true);
+    let error = captured
+        .publish_with_cancel(&kubo.client, &mut cancel)
+        .await
+        .unwrap_err();
+    let failure = error.downcast_ref::<MountResolutionFailure>().unwrap();
+    assert!(failure.retained_roots.is_empty());
+    assert!(!failure.uncertain_publication);
+    assert_eq!(kubo.requests().len(), before);
+}
+
+#[tokio::test]
+async fn captured_publication_reports_acknowledged_root_and_uncertainty_after_failure() {
+    let (root, block) = directory(&[]);
+    let kubo = FakeKubo::new(
+        HashMap::from([(root, block)]),
+        root,
+        ResponseMode::SecondPinFailure,
+    )
+    .await;
+    let mounts = crate::mount::parse_args(&[format!("{root}:/a"), format!("{root}:/b")]).unwrap();
+    let captured = capture_fixture(&kubo, &mounts).await.unwrap();
+    let (_tx, mut cancel) = tokio::sync::watch::channel(false);
+    let error = captured
+        .publish_with_cancel(&kubo.client, &mut cancel)
+        .await
+        .unwrap_err();
+    let failure = error.downcast_ref::<MountResolutionFailure>().unwrap();
+    assert_eq!(failure.retained_roots, [root]);
+    assert!(failure.uncertain_publication);
+    let publications: Vec<_> = kubo
+        .requests()
+        .into_iter()
+        .filter(|r| r.endpoint != "block/get")
+        .map(|r| r.endpoint)
+        .collect();
+    assert_eq!(publications, ["pin/add", "dag/import", "pin/add"]);
+}
+
+#[tokio::test]
+async fn capture_mounts_inspects_without_retention_and_publishes_without_resolving_again() {
+    let bytes = b"selected bytes";
+    let (root, block) = directory(&[("child", bytes)]);
+    let selected = Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(bytes)).unwrap(),
+    );
+    let kubo = FakeKubo::new(
+        HashMap::from([(root, block), (selected, bytes.to_vec())]),
+        root,
+        ResponseMode::Named(""),
+    )
+    .await;
+    let mounts = crate::mount::parse_args(&["/ipns/example.com/child:/etc/file".into()]).unwrap();
+    let captured = capture_fixture(&kubo, &mounts).await.unwrap();
+    let before = kubo.requests();
+    assert_eq!(
+        before
+            .iter()
+            .filter(|r| r.endpoint == "name/resolve")
+            .count(),
+        1
+    );
+    assert!(before
+        .iter()
+        .all(|r| matches!(r.endpoint.as_str(), "name/resolve" | "block/get")));
+    assert_eq!(captured.operation_digests().len(), 1);
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    let resolved = captured
+        .publish_with_cancel(&kubo.client, &mut cancel)
+        .await
+        .unwrap();
+    assert_eq!(resolved.mounts[0].source().cid(), selected);
+    assert_eq!(resolved.retained_roots, [root, selected]);
+    assert!(kubo.requests()[before.len()..]
+        .iter()
+        .all(|r| matches!(r.endpoint.as_str(), "pin/add" | "dag/import")));
+}
+
+#[tokio::test]
+async fn capture_mounts_publication_uses_original_local_bytes_after_path_replacement() {
+    let _serial = super::capture::tests::ASYNC_CAPTURE_TEST.lock().await;
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().canonicalize().unwrap();
+    let file = directory.join("input");
+    std::fs::write(&file, b"original captured bytes").unwrap();
+    let root = Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(b"original captured bytes")).unwrap(),
+    );
+    let kubo = FakeKubo::new(
+        HashMap::from([(root, b"original captured bytes".to_vec())]),
+        root,
+        ResponseMode::LocalFile(b"original captured bytes"),
+    )
+    .await;
+    let mounts = crate::mount::parse_args(&[format!("{}:/etc/input", file.display())]).unwrap();
+    let captured = capture_fixture(&kubo, &mounts).await.unwrap();
+    let first_digest = captured.digest();
+    assert!(kubo.requests().is_empty());
+    std::fs::write(&file, b"replaced private bytes").unwrap();
+    let changed = capture_fixture(&kubo, &mounts).await.unwrap();
+    assert_ne!(first_digest, changed.digest());
+    std::fs::remove_file(file).unwrap();
+    assert_eq!(first_digest, captured.digest());
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    let resolved = captured
+        .publish_with_cancel(&kubo.client, &mut cancel)
+        .await
+        .unwrap();
+    assert_eq!(resolved.mounts[0].source().cid(), root);
+    let request = kubo
+        .requests()
+        .into_iter()
+        .find(|r| r.endpoint == "add")
+        .unwrap();
+    assert!(request
+        .body
+        .windows(b"original captured bytes".len())
+        .any(|w| w == b"original captured bytes"));
+    assert!(!request
+        .body
+        .windows(b"replaced private bytes".len())
+        .any(|w| w == b"replaced private bytes"));
+}
+
+#[tokio::test]
+async fn capture_mounts_digest_binds_operation_order_source_kind_and_target() {
+    let (root, block) = directory(&[]);
+    let kubo = FakeKubo::new(
+        HashMap::from([(root, block)]),
+        root,
+        ResponseMode::Named(""),
+    )
+    .await;
+    let sources = [
+        vec![format!("{root}:/a"), format!("{root}:/b")],
+        vec![format!("{root}:/b"), format!("{root}:/a")],
+        vec![format!("{root}:/a"), format!("{root}:/c")],
+        vec![format!("{root}:/a"), "/ipns/example.com:/b".into()],
+    ];
+    let mut captures = Vec::new();
+    for args in sources {
+        captures.push(
+            capture_fixture(&kubo, &crate::mount::parse_args(&args).unwrap())
+                .await
+                .unwrap(),
+        );
+    }
+    for changed in &captures[1..] {
+        assert_ne!(captures[0].digest(), changed.digest());
+    }
+    assert_eq!(
+        captures[0].operation_digests()[0],
+        captures[1].operation_digests()[1]
+    );
+    assert_eq!(
+        captures[0].operation_digests()[1],
+        captures[1].operation_digests()[0]
+    );
+    assert_eq!(
+        captures[0].operation_digests()[0],
+        captures[2].operation_digests()[0]
+    );
+    assert_ne!(
+        captures[0].operation_digests()[1],
+        captures[3].operation_digests()[1]
+    );
+    assert!(kubo
+        .requests()
+        .iter()
+        .all(|r| matches!(r.endpoint.as_str(), "block/get" | "name/resolve")));
 }
 
 async fn resolve_fixture(kubo: &FakeKubo, mounts: &[Mount], head: bool) -> Result<ResolvedMounts> {

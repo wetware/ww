@@ -8399,6 +8399,7 @@ dependencies = [
  "nix",
  "rand 0.9.4",
  "reqwest",
+ "ring",
  "rpc",
  "rust-ipns",
  "serde",
