@@ -2,6 +2,7 @@
 import argparse
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -33,6 +34,42 @@ def manifest_root(manifest):
     link = (pb_field(10, cid_bytes(manifest)) + pb_field(18, b'CHECKSUMS.txt')
             + b'\x18' + varint(len(manifest)))
     return pb_field(18, link) + pb_field(10, b'\x08\x01')
+
+
+def package_release(tool, tree, spool, private, trusted_keys, targets, *, provenance=None,
+                    command_runner=None):
+    """Package exact fixture bytes; producer provenance must be supplied explicitly."""
+    if provenance is None:
+        provenance = {'repository': 'https://github.com/wetware/ww',
+                      'revision': 'a' * 40, 'builder': 'installer-test-fixture'}
+    value = int.from_bytes(bytes.fromhex('0172002408011220') + bytes([1]) * 32, 'big')
+    channel = ''
+    while value:
+        value, digit = divmod(value, 36)
+        channel = '0123456789abcdefghijklmnopqrstuvwxyz'[digit] + channel
+    metadata = {'channel': 'k' + channel, 'sequence': 1,
+                'version': '0.0.0-fixture', 'source': provenance,
+                'hosts': {target: provenance for target in targets}}
+    (tree / 'VERSION').write_text(metadata['version'] + '\n')
+    (tree / 'REVISION').write_text(provenance['revision'] + '\n')
+    metadata_path = tree.parent / 'metadata.json'
+    metadata_path.write_text(json.dumps(metadata))
+    (tree / 'CHECKSUMS.txt.sig').unlink(missing_ok=True)
+    prepare = [str(tool), 'prepare', '--tree', str(tree), '--spool', str(spool),
+               '--metadata', str(metadata_path)]
+    if command_runner is None:
+        subprocess.run(prepare, check=True, capture_output=True, timeout=90)
+    else:
+        command_runner('package-prepare', prepare)
+    sign_manifest(private, tree / 'CHECKSUMS.txt')
+    finalize = [str(tool), 'finalize', '--tree', str(tree),
+                '--spool', str(spool), '--trusted-keys', str(trusted_keys)]
+    if command_runner is None:
+        result = subprocess.run(finalize, check=True, capture_output=True, text=True, timeout=90)
+        output = result.stdout
+    else:
+        output = command_runner('package-finalize', finalize)
+    return json.loads(output)
 
 
 def generate_key(directory):

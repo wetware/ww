@@ -1,0 +1,130 @@
+{
+  "schema": 1,
+  "policy": "pr808-original-pair-diagnostic-only",
+  "repository": "wetware/ww",
+  "repository_id": 777809247,
+  "branch": "lthibault/pasted-text-v38",
+  "workflow_path": ".github/workflows/rust.yml",
+  "workflow_id": 93232375,
+  "event": "workflow_dispatch",
+  "target": "aarch64-unknown-linux-gnu",
+  "artifact_name": "ww-linux-aarch64",
+  "native_acceptance": false,
+  "publication_allowed": false,
+  "producers": {
+    "a": {
+      "run_id": 42623846342,
+      "attempt": 1,
+      "revision": "93de83ad8a0f34b0c9998651e10f1267361265e4",
+      "artifact_id": 13678483844,
+      "build_job_id": 129190321742,
+      "archive_sha256": "30fb5fe6a817520cdd40b8bbe77189286670e2c64ce3086311986239531aae94",
+      "archive_size": 16145836,
+      "sha256": "ab971ed30ab20e82c1e105a7eda92cc5f1e1e00b85af0fc7fac8e38b9eb3b0a9",
+      "size": 43299912,
+      "workflow_status": "completed",
+      "workflow_conclusion": "failure",
+      "required_checks": {
+        "Build ww-linux-aarch64": {
+          "id": 129190321742,
+          "status": "completed",
+          "conclusion": "success"
+        },
+        "Test": {
+          "id": 129199850648,
+          "status": "completed",
+          "conclusion": "failure"
+        },
+        "Clippy": {
+          "id": 129182974932,
+          "status": "completed",
+          "conclusion": "success"
+        },
+        "Check formatting": {
+          "id": 129182472753,
+          "status": "completed",
+          "conclusion": "success"
+        },
+        "Check committed Cargo lockfiles": {
+          "id": 129182472816,
+          "status": "completed",
+          "conclusion": "success"
+        },
+        "Build native wasm32-wasip3 components": {
+          "id": 129182974967,
+          "status": "completed",
+          "conclusion": "success"
+        }
+      },
+      "fhs": {
+        "fhs/boot/kernel.wasm": {
+          "sha256": "86011f25b97b6202c2703799deca24a411d12d01fe9a376bd767b07706d8d1dd",
+          "size": 1020567
+        },
+        "fhs/bin/status.wasm": {
+          "sha256": "a6322d7ee9f417a111f3d50718842b48b93e67ec1261c04b896caa47ddb87766",
+          "size": 1164733
+        }
+      }
+    },
+    "b": {
+      "run_id": 42648050888,
+      "attempt": 1,
+      "revision": "d3d827c24d2f2d0525fd7056adaf6d18a7f33074",
+      "artifact_id": 13690568235,
+      "build_job_id": 129280662372,
+      "archive_sha256": "fa5d714434d55718f6961c72eab60d8fe68b29bde6a17cde749ee0e0a8073949",
+      "archive_size": 16145831,
+      "sha256": "f7f6e8fabd7a16cbd5eb0a134e7a10a251b69cb2ac716db4e8a065cfd9445875",
+      "size": 43299912,
+      "workflow_status": "completed",
+      "workflow_conclusion": "failure",
+      "required_checks": {
+        "Build ww-linux-aarch64": {
+          "id": 129280662372,
+          "status": "completed",
+          "conclusion": "success"
+        },
+        "Test": {
+          "id": 129310527582,
+          "status": "completed",
+          "conclusion": "failure"
+        },
+        "Clippy": {
+          "id": 129267329537,
+          "status": "completed",
+          "conclusion": "success"
+        },
+        "Check formatting": {
+          "id": 129266566377,
+          "status": "completed",
+          "conclusion": "success"
+        },
+        "Check committed Cargo lockfiles": {
+          "id": 129266566228,
+          "status": "completed",
+          "conclusion": "success"
+        },
+        "Build native wasm32-wasip3 components": {
+          "id": 129267329796,
+          "status": "completed",
+          "conclusion": "success"
+        }
+      },
+      "fhs": {
+        "fhs/boot/kernel.wasm": {
+          "sha256": "86011f25b97b6202c2703799deca24a411d12d01fe9a376bd767b07706d8d1dd",
+          "size": 1020567
+        },
+        "fhs/bin/status.wasm": {
+          "sha256": "a6322d7ee9f417a111f3d50718842b48b93e67ec1261c04b896caa47ddb87766",
+          "size": 1164733
+        }
+      }
+    }
+  },
+  "retained_inputs": {
+    "policy": "pr808-original-producer-retention-v1",
+    "manifest_sha256": "da7d7180c9a0db24e5b6191d744bb941b85fc870ee27b136b67eefad3fda939e"
+  }
+}

@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Offline native qualification foundation (#739).** Verify retained original
+  release artifacts, producer receipts, source identity and package equivalence.
+  Historical failed checks remain failures. Live native qualification remains
+  unavailable until the runtime integration stage.
 - **Reusable release and readiness foundations.** Capture and reauthenticate
   signed release proofs, retain immutable configuration and mount inputs, and
   verify executable custody and epoch-fenced readiness. Native service upgrades

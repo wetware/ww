@@ -113,6 +113,7 @@ jobs:
     - uses: actions/checkout@v5
       with:
         submodules: recursive
+        fetch-depth: 0
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -141,6 +142,28 @@ jobs:
         if command -v shellcheck >/dev/null 2>&1; then
           shellcheck scripts/install.sh scripts/sign_release.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         fi
+
+    - name: Check offline native qualification controls
+      run: |
+        python3 tests/test_verify_native_release_inputs.py
+        python3 tests/test_fetch_native_release_inputs.py
+        python3 tests/test_qualify_native_upgrade.py
+        python3 tests/test_prepare_current_native_release.py
+        python3 tests/test_native_release_integration.py
+        python3 tests/test_native_release_provisioner.py
+        python3 tests/test_native_development_boot.py
+        python3 tests/test_native_qualification_boundary.py
+
+    - name: Verify retained historical release inputs
+      run: |
+        historical="$RUNNER_TEMP/ww-historical-source"
+        git worktree add --detach "$historical" d3d827c24d2f2d0525fd7056adaf6d18a7f33074
+        python3 scripts/verify_native_release_inputs.py \
+          --checkout "$historical" --retained \
+          --inputs tests/fixtures/native-release-originals/inputs \
+          --pins .github/native-release-integration.json \
+          --output "$RUNNER_TEMP/ww-verified-historical"
+        git worktree remove "$historical"
 
     - uses: actions/setup-go@v5
       with:
@@ -527,6 +550,13 @@ jobs:
           exit 1
         fi
         cat proof.stdout
+
+    - name: Compare development and release package outputs
+      run: |
+        cargo build --release --locked -p ww-release --features package --bin ww-release-package
+        python3 tests/test_release_package_profiles.py \
+          --development-tool target/debug/ww-release-package \
+          --release-tool target/release/ww-release-package --fhs target/fhs
 
     - name: Validate public release package library
       run: cargo test --locked -p ww-release --features package
