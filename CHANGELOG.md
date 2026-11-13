@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Portable agent execution policy and Markdown session handoff contract. Track
+  `AGENTS.md` and ignore temporary `.context/` artifacts.
 - **Offline native qualification foundation (#739).** Verify current diagnostic
   build receipts, source identity and package equivalence with generated fixtures.
   Historical A/B binaries, fixed producer policy and custody CI have been removed.
@@ -41,6 +43,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pending authenticated selection, compatibility, and native restart admission.
 
 ### Fixed
+- Pin the host Rust toolchain and CI selectors to 1.99.1. Preserve the separate
+  nightly requirements and defer Rust/Cargo 1.100 compatibility changes.
 - Create private installation and daemon directories under group-writable umasks.
   Existing directories retain their permissions and remain subject to custody
   checks.

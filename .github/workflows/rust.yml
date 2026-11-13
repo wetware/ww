@@ -90,7 +90,7 @@ jobs:
       run: |
         python3 scripts/check_repository_artifacts.py
         python3 tests/test_repository_artifacts.py
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: dtolnay/rust-toolchain@1.99.1
     # Always resolve before dependent jobs restore compiler caches or build.
     - run: bash scripts/check_cargo_lockfiles.sh
     - run: bash tests/test_cargo_lockfiles.sh
@@ -120,7 +120,7 @@ jobs:
         fetch-depth: 0
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.99.1
       with:
         components: rustfmt
 
@@ -238,7 +238,7 @@ jobs:
         submodules: recursive
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.99.1
       with:
         components: clippy
 
@@ -296,7 +296,7 @@ jobs:
         submodules: recursive
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.99.1
       with:
         targets: x86_64-unknown-linux-gnu
 
@@ -319,9 +319,9 @@ jobs:
       with:
         submodules: recursive
 
-    # The native fixture's host tests use stable via rust-toolchain.toml.
+    # Host-side checks use the root rust-toolchain.toml pin.
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.99.1
 
     - name: Install pinned Rust nightly
       uses: dtolnay/rust-toolchain@nightly
@@ -408,7 +408,7 @@ jobs:
         submodules: recursive
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.99.1
       with:
         targets: x86_64-unknown-linux-gnu
 
@@ -564,7 +564,7 @@ jobs:
         submodules: recursive
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.99.1
 
     - uses: ./.github/actions/setup-capnp
 
@@ -706,7 +706,7 @@ jobs:
         name: wasm-artifacts
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.99.1
       with:
         targets: ${{ matrix.target }}
 
