@@ -3,8 +3,10 @@
 ## Permanent rules and task context
 
 This file defines permanent repository rules. Keep task objectives, progress,
-decisions, and evidence in workspace `.context/` files. Never commit temporary
-handoffs. Use [the handoff contract](doc/agent-handoff.md) for new sessions.
+decisions, and evidence in local, untracked files. This repository offers
+`.context/` as an ignored storage convention; no particular directory layout is
+required. Never commit temporary handoffs. Use
+[the handoff contract](doc/agent-handoff.md) for new sessions or delegated tasks.
 
 Read relevant existing guidance, including [AI context](doc/ai-context.md),
 [the agent reference](.agents/prompt.md), and applicable `.agents/skills/` files.
@@ -13,9 +15,11 @@ or required checks.
 
 ## Scope and execution
 
-- Use the least expensive model and reasoning effort adequate for the task.
-  Reserve high effort for architecture, security, concurrency, recovery
-  invariants, and consequential decisions.
+- Where the execution environment supports selection, prefer the least expensive
+  capable model and adequate reasoning effort. Reserve high effort for
+  architecture, security, concurrency, recovery invariants, and consequential
+  decisions. Escalate when the available capability is insufficient; request
+  changes from the user when needed. Do not assume agents can switch models.
 - Work on one independently testable objective at a time. Prefer thin vertical
   slices with explicit acceptance criteria.
 - Read only relevant context and source files. Avoid unnecessary history
@@ -28,14 +32,15 @@ or required checks.
   revision and environment.
 - Avoid unnecessary full builds, repeated CI campaigns, and speculative
   abstractions. Never weaken verification or bypass approval gates to save cost.
-- Do not spawn additional agents or independent reviews by default. Use them
-  only when risk, repository requirements, or demonstrated uncertainty warrants
-  them, within the session's authority.
-- Prefer fresh execution sessions for independent work. Do not rename the
+- Do not delegate additional tasks or request independent reviews by default.
+  Use them only when risk, repository requirements, or demonstrated uncertainty
+  warrants them, within the approval boundary and available environment controls.
+- Prefer fresh sessions for independent work where supported. Do not rename the
   current branch without explicit user instruction. Use `origin/master` as the
   comparison base unless the task specifies another base.
 - Stop when the assigned objective is complete or blocked. Do not invent
-  follow-up work. Do not modify Conductor global settings without authorization.
+  follow-up work. Do not change execution environment settings without
+  authorization.
 
 ## Durable context
 

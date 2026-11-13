@@ -2,24 +2,25 @@
 
 ## Purpose and storage
 
-Use this contract when a new Conductor session continues an existing objective.
+Use this contract when an agent or session continues an existing objective.
 [AGENTS.md](../AGENTS.md) defines permanent rules. A handoff records task state;
 a handoff cannot override those rules or grant new authority.
 
-Store each task-specific handoff in the workspace, for example
-`.context/agent-handoff.md`. Never commit temporary handoffs or their evidence.
-Keep reusable instructions in version control. Do not change Conductor global
-settings to transfer context.
+A handoff is a portable Markdown artifact. Store temporary handoffs and evidence
+in local, untracked files; `.context/agent-handoff.md` is this repository's
+optional convention. No workspace layout, session API, orchestration tool, or
+vendor is required. Transfer the artifact through an authorized channel. Never
+commit temporary handoffs. Keep reusable instructions in version control.
 
 Target 300–500 words per handoff, with 500 words as the maximum. Shorter handoffs
 are acceptable when all fields are complete. Link detailed evidence instead of
 copying transcripts. Use repository-relative paths for tracked files. Identify
-workspace-local evidence explicitly because another workspace might not have it.
+environment-local evidence explicitly because another session might not have it.
 Exclude credentials, private keys, and other secrets.
 
 ## Required fields
 
-Copy this template into a workspace `.context/` file. Complete every field;
+Copy this template into a local, untracked Markdown file. Complete every field;
 write `None` or `Unknown` where applicable.
 
 ```markdown
@@ -30,8 +31,9 @@ State one independently testable outcome and the current scope. List explicit
 non-goals where needed. State whether work is active, complete, or blocked.
 
 ## Branch and HEAD
-Record the workspace path, branch, full HEAD SHA, and comparison base. Record
-uncommitted changes and their ownership. Do not infer state from a branch name.
+Record the repository location or identifier, branch, full HEAD SHA, and
+comparison base. Record uncommitted changes and their ownership. Do not infer
+state from a branch name.
 
 ## Decisions
 List accepted decisions, their rationale, and supporting references. Distinguish
@@ -43,7 +45,7 @@ that the next session must preserve.
 
 ## Relevant files
 List only files needed for the next action. Explain each file's role. Link
-detailed evidence and identify any workspace-local files that need transfer.
+detailed evidence and identify any environment-local files that need transfer.
 
 ## Acceptance criteria
 List observable pass conditions. Record completed validation with the command,

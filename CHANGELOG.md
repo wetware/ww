@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Portable agent execution policy and Markdown session handoff contract. Track
+  `AGENTS.md` and ignore temporary `.context/` artifacts.
 - **Offline native qualification foundation (#739).** Verify retained original
   release artifacts, producer receipts, source identity and package equivalence.
   Historical failed checks remain failures. Live native qualification remains
