@@ -13,13 +13,13 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 import zipfile
+import warnings
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import prepare_current_native_release as current
 import qualify_native_upgrade as qualifier
-import native_release_integration as lane
 
 
 class Candidate(unittest.TestCase):
@@ -71,7 +71,7 @@ class Candidate(unittest.TestCase):
         (self.directory / "REVISION").write_text(self.revision + "\n")
         (self.directory / "SHA256SUMS").write_text(self.receipt["host"]["sha256"] + "  ww\n")
         with zipfile.ZipFile(self.directory / "candidate.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for name in sorted(current.original.MEMBERS | {"BUILD-RECEIPT.json"}):
+            for name in sorted(current.inputs.MEMBERS | {"BUILD-RECEIPT.json"}):
                 archive.write(self.directory / name, name)
         self.bind_archive()
 
@@ -141,13 +141,18 @@ class Candidate(unittest.TestCase):
                     current.verify_build_files(self.directory, "release")
 
     def test_rebound_unsafe_archive_members_refuse(self):
-        for name, mode in (("../ww", stat.S_IFREG | 0o644), ("ww", stat.S_IFLNK | 0o777)):
+        for name, mode in (("../ww", stat.S_IFREG | 0o644), ("/ww", stat.S_IFREG | 0o644),
+                           ("REVISION", stat.S_IFREG | 0o644),
+                           ("fhs/bin/../bin/status.wasm", stat.S_IFREG | 0o644),
+                           (r"fhs\bin\status.wasm", stat.S_IFREG | 0o644),
+                           ("ww", stat.S_IFLNK | 0o777)):
             with self.subTest(name=name):
                 self.freeze()
                 path = self.directory / "candidate.zip"
                 with zipfile.ZipFile(path) as archive:
                     entries = [(entry.filename, archive.read(entry)) for entry in archive.infolist()]
-                with zipfile.ZipFile(path, "w") as archive:
+                with warnings.catch_warnings(), zipfile.ZipFile(path, "w") as archive:
+                    warnings.simplefilter("ignore", UserWarning)
                     for filename, raw in entries:
                         entry = zipfile.ZipInfo(name if filename == "ww" else filename)
                         entry.create_system = 3
@@ -156,6 +161,17 @@ class Candidate(unittest.TestCase):
                 self.bind_archive()
                 with self.assertRaises(RuntimeError):
                     current.verify_build_files(self.directory, "release")
+
+    def test_oversized_current_sidecar_refuses_after_archive_rebinding(self):
+        self.freeze()
+        path = self.directory / "REVISION"
+        path.write_bytes(b'x' * (current.inputs.MAX_SIDECAR + 1))
+        with zipfile.ZipFile(self.directory / "candidate.zip", "w") as archive:
+            for name in sorted(current.inputs.MEMBERS | {"BUILD-RECEIPT.json"}):
+                archive.write(self.directory / name, name)
+        self.bind_archive()
+        with self.assertRaisesRegex(RuntimeError, "exceeds bound"):
+            current.verify_build_files(self.directory, "release")
 
     def test_symlink_and_wrong_owner_refuse(self):
         with self.assertRaises(RuntimeError):
@@ -173,56 +189,6 @@ class Candidate(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "input file set differs"):
                     current.verify_build_files(self.directory, "release")
                 path.unlink()
-
-    def test_current_pair_under_permissive_umask_preserves_bytes_and_original_failures(self):
-        from test_verify_native_release_inputs import Fixture
-        original = Fixture()
-        original.setUp()
-        self.addCleanup(original.doCleanups)
-        old_revision = original.pins["producers"]["b"]["revision"]
-        source = {"artifact_revision": old_revision, "checkout_revision": old_revision, "runtime_source_equal": True}
-        historical = original.root / "historical"
-        with patch.object(current.original, "verify_source", return_value=source):
-            current.original.verify(original.root, original.inputs, historical, original.pins_path)
-        output = self.root / "pair"
-        inherited_umask = os.umask(0)
-        try:
-            with patch.object(current, "verify_candidate", return_value=self.receipt):
-                record = current.combine(self.root, self.directory, self.revision, historical, original.pins_path, output)
-        finally:
-            os.umask(inherited_umask)
-        self.assertEqual(record["slot_identities"], {"a": "original-producer-A", "b": "current-source-candidate-C"})
-        self.assertEqual((output / "a.zip").read_bytes(), (historical / "a.zip").read_bytes())
-        self.assertEqual((output / "b.zip").read_bytes(), (self.directory / "candidate.zip").read_bytes())
-        for label in ("a", "b"):
-            self.assertEqual(stat.S_IMODE((output / (label + ".zip")).stat().st_mode), 0o644)
-        self.assertEqual(lane.verify_input_policy(record), {"a": "failure", "b": "failure"})
-        self.assertNotEqual(record["b"]["revision"], record["historical_baseline"]["b"]["revision"])
-        with patch.object(current, "verify_candidate", return_value=self.receipt):
-            with self.assertRaisesRegex(RuntimeError, "output must be absent"):
-                current.combine(self.root, self.directory, self.revision, historical, original.pins_path, output)
-
-    def test_combination_refuses_changed_historical_fhs(self):
-        from test_verify_native_release_inputs import Fixture
-        original = Fixture()
-        original.setUp()
-        self.addCleanup(original.doCleanups)
-        revision = original.pins["producers"]["b"]["revision"]
-        historical = original.root / "historical"
-        source = {"artifact_revision": revision, "checkout_revision": revision, "runtime_source_equal": True}
-        with patch.object(current.original, "verify_source", return_value=source):
-            current.original.verify(original.root, original.inputs, historical, original.pins_path)
-        output = self.root / "pair"
-        for label in ("a", "b"):
-            path = historical / label / "fhs/boot/kernel.wasm"
-            saved = path.read_bytes()
-            with self.subTest(label=label):
-                path.write_bytes(saved + b"changed")
-                with patch.object(current, "verify_candidate", return_value=self.receipt):
-                    with self.assertRaisesRegex(RuntimeError, "historical FHS bytes differ"):
-                        current.combine(self.root, self.directory, self.revision, historical, original.pins_path, output)
-                self.assertFalse(output.exists())
-                path.write_bytes(saved)
 
     def test_current_source_must_equal_recorded_source(self):
         with patch.object(current, "source_snapshot", return_value=self.source), patch.object(current, "verify_profile"):
@@ -322,9 +288,9 @@ class SourceAndContext(unittest.TestCase):
                 current.verify_profile(self.checkout, "release")
 
     def test_privileged_source_read_trust_is_limited_to_one_checkout_and_command(self):
-        with patch.object(current.original.subprocess, "run", return_value=SimpleNamespace(
+        with patch.object(current.inputs.subprocess, "run", return_value=SimpleNamespace(
                 returncode=0, stdout=b"source", stderr=b"")) as run:
-            self.assertEqual(current.original.git(self.checkout, "rev-parse", "HEAD"), b"source")
+            self.assertEqual(current.inputs.git(self.checkout, "rev-parse", "HEAD"), b"source")
         self.assertEqual(run.call_args.args[0], ["git", "--no-replace-objects", "-c",
             "safe.directory=" + str(self.checkout), "-C", str(self.checkout), "rev-parse", "HEAD"])
 
@@ -441,35 +407,6 @@ class SourceAndContext(unittest.TestCase):
             for revision, profile in (("2" * 40, "development"), (self.revision, "release")):
                 with self.subTest(revision=revision, profile=profile), self.assertRaisesRegex(RuntimeError, "neither the exact head"):
                     current.ci_context(revision, profile, 123, 1, "test")
-
-
-class IntegrationPolicy(unittest.TestCase):
-    def test_current_slot_is_distinct_and_both_original_failures_survive(self):
-        old = {"policy": "pr808-original-pair-diagnostic-only", "status": "VERIFIED_DIAGNOSTIC_INPUTS",
-               "native_acceptance": False, "publication_allowed": False, "required_checks_success": False,
-               "source": {"runtime_source_equal": True, "checkout_revision": "b", "artifact_revision": "b"},
-               "producer_evidence": {label: {"required_checks": {"Test": {"conclusion": "failure"}}} for label in ("a", "b")}}
-        self.assertEqual(lane.verify_input_policy(old), {"a": "failure", "b": "failure"})
-        source = dict(old["source"], checkout_revision="c", artifact_revision="c")
-        value = dict(old, policy=current.POLICY, historical_baseline=copy.deepcopy(old), source=source,
-            slot_identities={"a": "original-producer-A", "b": "current-source-candidate-C"},
-            b={"revision": "c", "sha256": "hash", "builder": "current"},
-            current_build={"source": source, "ci": {"revision": "c", "completed_job_receipt": False,
-                            "uploaded_producer_artifact": False}, "host": {"sha256": "hash"},
-                            "builder": "current", "profile": "release"})
-        self.assertEqual(lane.verify_input_policy(value), {"a": "failure", "b": "failure"})
-        for change in ("historical", "slot", "source", "source-revision"):
-            broken = copy.deepcopy(value)
-            if change == "historical":
-                broken["historical_baseline"]["producer_evidence"]["b"]["required_checks"]["Test"]["conclusion"] = "success"
-            elif change == "slot":
-                broken["slot_identities"]["b"] = "original-producer-B"
-            elif change == "source":
-                broken["current_build"]["ci"]["revision"] = "another"
-            else:
-                broken["source"]["checkout_revision"] = "historical"
-            with self.assertRaises(RuntimeError):
-                lane.verify_input_policy(broken)
 
 
 if __name__ == "__main__":

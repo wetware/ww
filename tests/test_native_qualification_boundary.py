@@ -31,7 +31,22 @@ class Boundary(unittest.TestCase):
         for name in ('run_native_release_integration.py', 'run_native_development_boot.py',
                      'prepare_current_native_release.py --', 'qualify_native_upgrade.py --'):
             self.assertNotIn(name, workflow)
-        self.assertIn('name: Verify retained historical release inputs', workflow)
+        self.assertNotIn('Verify retained historical release inputs', workflow)
+        self.assertNotIn('verify_native_release_inputs.py', workflow)
+        self.assertNotIn('fetch_native_release_inputs.py', workflow)
+        self.assertIn('python3 tests/test_native_release_inputs.py', workflow)
+        self.assertIn('python3 scripts/check_repository_artifacts.py', workflow)
+        self.assertIn('python3 tests/test_repository_artifacts.py', workflow)
+
+    def test_historical_pair_command_is_removed(self):
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/prepare_current_native_release.py'),
+                                 'verify'], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice: 'verify'", result.stderr)
+        for name in ('scripts/verify_native_release_inputs.py', 'scripts/fetch_native_release_inputs.py',
+                     '.github/native-release-integration.json'):
+            self.assertFalse((ROOT / name).exists(), name)
+        self.assertFalse(any((ROOT / 'tests/fixtures/native-release-originals').rglob('*.*')))
 
 
 if __name__ == '__main__':

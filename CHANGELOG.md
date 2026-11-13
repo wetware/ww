@@ -9,10 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Portable agent execution policy and Markdown session handoff contract. Track
   `AGENTS.md` and ignore temporary `.context/` artifacts.
-- **Offline native qualification foundation (#739).** Verify retained original
-  release artifacts, producer receipts, source identity and package equivalence.
-  Historical failed checks remain failures. Live native qualification remains
-  unavailable until the runtime integration stage.
+- **Offline native qualification foundation (#739).** Verify current diagnostic
+  build receipts, source identity and package equivalence with generated fixtures.
+  Historical A/B binaries, fixed producer policy and custody CI have been removed.
+  A committed-artifact guard rejects native headers and blobs over 1 MiB.
+  Live native qualification remains unavailable until the runtime integration stage.
 - **Reusable release and readiness foundations.** Capture and reauthenticate
   signed release proofs, retain immutable configuration and mount inputs, and
   verify executable custody and epoch-fenced readiness. Native service upgrades

@@ -2,7 +2,7 @@
 """Build and freeze a same-job GNU ARM64 diagnostic input from exact CI source.
 
 This receipt describes a local CI build, not an uploaded producer artifact or a
-completed required check. Original A/B evidence retains its separate policy.
+completed required check. It grants no release publication authority.
 """
 
 import argparse
@@ -17,16 +17,14 @@ import stat
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 import tomllib
 import zipfile
 
-import verify_native_release_inputs as original
-from qualify_native_upgrade import custody, verify_producer_files
+import native_release_inputs as inputs
+from qualify_native_upgrade import custody
 
 TARGET = "aarch64-unknown-linux-gnu"
-POLICY = "pr808-current-source-native-diagnostic-v1"
 BUILD_POLICY = "same-job-native-build-v1"
 PROFILE = {
     "release": {"dependency_opt_level": "z", "host_opt_level": 2, "lto": True,
@@ -36,7 +34,7 @@ PROFILE = {
                     "strip": False, "debug_assertions": True, "overflow_checks": True,
                     "debug": 0, "incremental": False},
 }
-require = original.require
+require = inputs.require
 FHS_SOURCE = {"fhs/boot/kernel.wasm": "std/kernel/bin/main.wasm",
               "fhs/bin/status.wasm": "std/status/bin/status.wasm"}
 
@@ -46,29 +44,28 @@ def write_json(path, value):
     path.chmod(0o644)
 
 
-def file_binding(path, limit=original.MAX_HOST):
-    raw = original.read_file(path, limit)
-    return {"sha256": original.digest(raw), "size": len(raw)}
+def file_binding(path, limit=inputs.MAX_HOST):
+    raw = inputs.read_file(path, limit)
+    return {"sha256": inputs.digest(raw), "size": len(raw)}
 
 
 def userspace_description():
     # Debian exposes this fixed OS descriptor through /etc/os-release -> /usr/lib.
     # This is descriptive evidence, not an executable or qualification input.
     path = Path("/etc/os-release").resolve(strict=True)
-    return {"path": str(path), "contents": original.read_file(path, original.MAX_SIDECAR).decode()}
+    return {"path": str(path), "contents": inputs.read_file(path, inputs.MAX_SIDECAR).decode()}
 
 
 def source_snapshot(checkout, revision, component_revision):
     require(re.fullmatch(r"[0-9a-f]{40}", revision) is not None
             and re.fullmatch(r"[0-9a-f]{40}", component_revision) is not None,
             "source revisions must be full Git SHA1 values")
-    require(original.git(checkout, "rev-parse", "HEAD").decode().strip() == revision,
+    require(inputs.git(checkout, "rev-parse", "HEAD").decode().strip() == revision,
             "checkout HEAD differs from requested revision")
-    tree = original.git(checkout, "rev-parse", revision + "^{tree}").decode().strip()
-    require(original.git(checkout, "rev-parse", component_revision + "^{tree}").decode().strip() == tree,
+    tree = inputs.git(checkout, "rev-parse", revision + "^{tree}").decode().strip()
+    require(inputs.git(checkout, "rev-parse", component_revision + "^{tree}").decode().strip() == tree,
             "component artifact source tree differs from current Host source")
-    result = original.verify_source(checkout, {"producers": {"b": {"revision": revision}},
-                                     "workflow_path": ".github/workflows/rust.yml"})
+    result = inputs.verify_source(checkout, revision, ".github/workflows/rust.yml")
     result.update(component_revision=component_revision, source_tree=tree,
                   component_tree_equal=True)
     return result
@@ -81,7 +78,7 @@ def build_command(profile):
 
 
 def verify_profile(checkout, profile):
-    value = tomllib.loads(original.read_file(checkout / "Cargo.toml", original.MAX_JSON).decode())
+    value = tomllib.loads(inputs.read_file(checkout / "Cargo.toml", inputs.MAX_JSON).decode())
     require(value.get("profile") == {"release": {"opt-level": "z", "lto": True, "strip": True,
                                                 "package": {"ww": {"opt-level": 2}}}},
             "Cargo profiles changed; review the effective build contract")
@@ -103,7 +100,7 @@ def ci_context(revision, profile, run_id, attempt, job):
             and str(attempt) == os.environ.get("GITHUB_RUN_ATTEMPT")
             and job == os.environ.get("GITHUB_JOB") and run_id > 0 and attempt > 0,
             "current build CI invocation differs")
-    event = original.read_json(Path(os.environ["GITHUB_EVENT_PATH"]))
+    event = inputs.read_json(Path(os.environ["GITHUB_EVENT_PATH"]))
     event_name = os.environ.get("GITHUB_EVENT_NAME")
     pr_source = {}
     if event_name == "pull_request":
@@ -153,8 +150,8 @@ def build(checkout, output, revision, component_revision, profile, run_id=None, 
     settings = verify_profile(checkout, profile)
     components = {}
     for name, source_name in FHS_SOURCE.items():
-        components[name] = file_binding(checkout / "target" / name, original.MAX_FHS)
-        require(components[name] == file_binding(checkout / source_name, original.MAX_FHS),
+        components[name] = file_binding(checkout / "target" / name, inputs.MAX_FHS)
+        require(components[name] == file_binding(checkout / source_name, inputs.MAX_FHS),
                 "downloaded and embedded FHS differ: " + name)
     target = checkout / "target" / ("current-native-" + profile)
     target.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -180,8 +177,8 @@ def build(checkout, output, revision, component_revision, profile, run_id=None, 
     require(process.returncode == 0, "current native build failed; retain build.log")
     require(source_snapshot(checkout, revision, component_revision) == source, "source changed during native build")
     for name, source_name in FHS_SOURCE.items():
-        require(file_binding(checkout / "target" / name, original.MAX_FHS) == components[name]
-                and file_binding(checkout / source_name, original.MAX_FHS) == components[name],
+        require(file_binding(checkout / "target" / name, inputs.MAX_FHS) == components[name]
+                and file_binding(checkout / source_name, inputs.MAX_FHS) == components[name],
                 "FHS changed during native build")
     binary = target / TARGET / ("release" if profile == "release" else "debug") / "ww"
     binding = file_binding(binary, 1024 ** 3)
@@ -220,11 +217,11 @@ def build(checkout, output, revision, component_revision, profile, run_id=None, 
                "native_acceptance": False, "publication_allowed": False}
     write_json(output / "BUILD-RECEIPT.json", receipt)
     with zipfile.ZipFile(output / "candidate.zip", "x", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name in sorted(original.MEMBERS | {"BUILD-RECEIPT.json"}):
+        for name in sorted(inputs.MEMBERS | {"BUILD-RECEIPT.json"}):
             archive.write(output / name, name)
     (output / "candidate.zip").chmod(0o644)
     write_json(output / "candidate.json", {"schema": 1, "policy": BUILD_POLICY,
-        "build_receipt": file_binding(output / "BUILD-RECEIPT.json", original.MAX_JSON),
+        "build_receipt": file_binding(output / "BUILD-RECEIPT.json", inputs.MAX_JSON),
         "archive": file_binding(output / "candidate.zip", 1024 ** 3)})
     verify_candidate(checkout, output, revision, profile)
     return receipt
@@ -238,12 +235,12 @@ def verify_build_files(directory, profile, owner=None):
     for path in directory.rglob("*"):
         custody(path, owner, directory=path.is_dir())
     require({str(path.relative_to(directory)) for path in directory.rglob("*") if path.is_file()}
-            == original.MEMBERS | {"BUILD-RECEIPT.json", "candidate.json", "candidate.zip", "build.log"},
+            == inputs.MEMBERS | {"BUILD-RECEIPT.json", "candidate.json", "candidate.zip", "build.log"},
             "current input file set differs")
-    record = original.read_json(directory / "candidate.json")
-    receipt = original.read_json(directory / "BUILD-RECEIPT.json")
+    record = inputs.read_json(directory / "candidate.json")
+    receipt = inputs.read_json(directory / "BUILD-RECEIPT.json")
     require(record == {"schema": 1, "policy": BUILD_POLICY,
-                      "build_receipt": file_binding(directory / "BUILD-RECEIPT.json", original.MAX_JSON),
+                      "build_receipt": file_binding(directory / "BUILD-RECEIPT.json", inputs.MAX_JSON),
                       "archive": file_binding(directory / "candidate.zip", 1024 ** 3)},
             "candidate receipt or archive digest differs")
     require(receipt["schema"] == 1 and receipt["policy"] == BUILD_POLICY
@@ -291,8 +288,8 @@ def verify_build_files(directory, profile, owner=None):
             "current compiler environment differs")
     require(file_binding(directory / "ww", 1024 ** 3) == receipt["host"], "current Host binding differs")
     require(file_binding(directory / "build.log", 64 * 1024 ** 2) == receipt["build_log"], "current build log differs")
-    require(set(receipt["fhs"]) == original.FHS, "current FHS set differs")
-    members = original.MEMBERS | {"BUILD-RECEIPT.json"}
+    require(set(receipt["fhs"]) == inputs.FHS, "current FHS set differs")
+    members = inputs.MEMBERS | {"BUILD-RECEIPT.json"}
     with zipfile.ZipFile(directory / "candidate.zip") as archive:
         entries = archive.infolist()
         require(len(entries) == len(members) and {entry.filename for entry in entries} == members,
@@ -301,23 +298,23 @@ def verify_build_files(directory, profile, owner=None):
             require(entry.orig_filename == entry.filename and stat.S_ISREG(entry.external_attr >> 16)
                     and not entry.flag_bits & 1 and entry.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED),
                     "unsafe current archive member")
-            raw = original.read_file(directory / entry.filename,
-                                     1024 ** 3 if entry.filename == "ww" else original.MAX_FHS
-                                     if entry.filename in original.FHS else original.MAX_JSON)
+            raw = inputs.read_file(directory / entry.filename,
+                                     1024 ** 3 if entry.filename == "ww" else inputs.MAX_FHS
+                                     if entry.filename in inputs.FHS else inputs.MAX_JSON)
             require(entry.file_size == len(raw) and archive.read(entry) == raw, "current archive member differs")
     for name, binding in receipt["fhs"].items():
-        raw = original.read_file(directory / name, original.MAX_FHS)
-        require(raw[:8] == b"\x00asm\x0d\x00\x01\x00" and file_binding(directory / name, original.MAX_FHS) == binding,
+        raw = inputs.read_file(directory / name, inputs.MAX_FHS)
+        require(raw[:8] == b"\x00asm\x0d\x00\x01\x00" and file_binding(directory / name, inputs.MAX_FHS) == binding,
                 "current FHS binding differs")
-    host = original.read_file(directory / "ww", 1024 ** 3)
+    host = inputs.read_file(directory / "ww", 1024 ** 3)
     require(len(host) >= 64 and host[:7] == b"\x7fELF\x02\x01\x01"
             and struct.unpack_from("<HHI", host, 16) == (3, 183, 1)
             and struct.unpack_from("<H", host, 52)[0] == 64 and revision.encode() in host,
             "current executable target or embedded revision differs")
-    require(original.read_json(directory / "PROVENANCE.json") == {
+    require(inputs.read_json(directory / "PROVENANCE.json") == {
                 "repository": "https://github.com/" + ci.get("source_repository", "wetware/ww"), "revision": revision, "builder": builder}
-            and original.read_file(directory / "REVISION", original.MAX_SIDECAR) == (revision + "\n").encode()
-            and original.read_file(directory / "SHA256SUMS", original.MAX_SIDECAR) == (receipt["host"]["sha256"] + "  ww\n").encode(),
+            and inputs.read_file(directory / "REVISION", inputs.MAX_SIDECAR) == (revision + "\n").encode()
+            and inputs.read_file(directory / "SHA256SUMS", inputs.MAX_SIDECAR) == (receipt["host"]["sha256"] + "  ww\n").encode(),
             "current executable sidecars differ")
     return receipt
 
@@ -329,75 +326,6 @@ def verify_candidate(checkout, directory, revision, profile, owner=None):
             == receipt["source"], "current source changed after build")
     verify_profile(checkout, profile)
     return receipt
-
-
-def combine(checkout, candidate, revision, historical, pins_path, output):
-    receipt = verify_candidate(checkout, candidate, revision, "release")
-    pins = original.read_json(pins_path)
-    original.validate_pins(pins)
-    require(historical.absolute() == historical.resolve(strict=True), "historical directory contains aliases")
-    historical = historical.resolve(strict=True)
-    custody(historical, os.geteuid(), directory=True)
-    for path in historical.rglob("*"):
-        custody(path, os.geteuid(), directory=path.is_dir())
-    old = original.read_json(historical / "verified-inputs.json")
-    require(old["policy"] == original.POLICY and old["status"] == "VERIFIED_DIAGNOSTIC_INPUTS"
-            and old["pins_sha256"] == original.digest(original.read_file(pins_path, original.MAX_JSON))
-            and old["source"]["artifact_revision"] == pins["producers"]["b"]["revision"]
-            and old["source"]["checkout_revision"] == pins["producers"]["b"]["revision"]
-            and old["source"]["runtime_source_equal"] is True
-            and old["native_acceptance"] is False and old["publication_allowed"] is False,
-            "historical baseline must retain the original policy and immutable B checkout")
-    for label in ("a", "b"):
-        require(old["producer_evidence"][label]["required_checks"] == pins["producers"][label]["required_checks"]
-                and old[label]["sha256"] == pins["producers"][label]["sha256"]
-                and old[label]["archive_sha256"] == pins["producers"][label]["archive_sha256"],
-                "historical producer evidence differs")
-        require(old[label]["path"] == str(historical / label / "ww")
-                and old[label]["archive_path"] == str(historical / (label + ".zip")),
-                "historical producer paths differ")
-        expected_fhs = pins["producers"][label]["fhs"]
-        require(old["producer_evidence"][label]["fhs"] == expected_fhs,
-                "historical FHS evidence differs")
-        directory = historical / label
-        require({str(path.relative_to(directory)) for path in directory.rglob("*") if path.is_file()}
-                == original.MEMBERS, "historical input file set differs")
-        for name, binding in expected_fhs.items():
-            require(file_binding(directory / name, original.MAX_FHS) == binding,
-                    "historical FHS bytes differ")
-        verify_producer_files(old[label], TARGET, os.geteuid())
-    output = output.absolute()
-    require(not output.exists() and output.parent.resolve(strict=True) == output.parent,
-            "combined output must be absent below a canonical parent")
-    with tempfile.TemporaryDirectory(prefix=".current-inputs-", dir=output.parent) as temporary:
-        stage = Path(temporary) / "verified"
-        stage.mkdir(mode=0o755)
-        # Reconstruct A from the hash-pinned archive, not mutable extracted files.
-        original.verify_archive(historical / "a.zip", pins["producers"]["a"], pins, stage / "a")
-        shutil.copytree(candidate, stage / "b")
-        verify_build_files(stage / "b", "release")
-        shutil.copyfile(candidate / "candidate.zip", stage / "b.zip")
-        (stage / "b.zip").chmod(0o644)
-        markers = {"a": dict(old["a"]), "b": {"path": "", "archive_path": "",
-            "sha256": receipt["host"]["sha256"], "archive_sha256": file_binding(stage / "b.zip", 1024 ** 3)["sha256"],
-            "revision": revision, "run_id": receipt["ci"].get("run_id"), "attempt": receipt["ci"].get("attempt"),
-            "builder": receipt["builder"]}}
-        for label, marker in markers.items():
-            marker.update(path=str(stage / label / "ww"), archive_path=str(stage / (label + ".zip")))
-            verify_producer_files(marker, TARGET, os.geteuid())
-            marker.update(path=str(output / label / "ww"), archive_path=str(output / (label + ".zip")))
-        result = {"schema": 1, "policy": POLICY, "status": "VERIFIED_DIAGNOSTIC_INPUTS",
-                  "native_acceptance": False, "publication_allowed": False, "required_checks_success": False,
-                  "source": receipt["source"], "pins_sha256": old["pins_sha256"],
-                  "slot_identities": {"a": "original-producer-A", "b": "current-source-candidate-C"},
-                  "historical_baseline": old, "current_build": receipt,
-                  "producer_evidence": {"a": old["producer_evidence"]["a"],
-                                        "b": {"kind": "same-job-current-native-build", "fhs": receipt["fhs"],
-                                              "completed_job_receipt": False, "required_checks_success": False}}, **markers}
-        write_json(stage / "verified-inputs.json", result)
-        require(not output.exists(), "combined output appeared during verification")
-        stage.rename(output)
-    return result
 
 
 def main():
@@ -413,17 +341,10 @@ def main():
         producer.add_argument("--" + name, type=int)
     producer.add_argument("--local-diagnostic", action="store_true")
     producer.add_argument("--profile", choices=PROFILE, required=True)
-    consumer = modes.add_parser("verify")
-    for name in ("checkout", "candidate", "historical", "pins", "output"):
-        consumer.add_argument("--" + name, required=True, type=Path)
-    consumer.add_argument("--revision", required=True)
     args = parser.parse_args()
     try:
-        if args.mode == "build":
-            build(args.checkout, args.output, args.revision, args.component_revision,
-                  args.profile, args.run_id, args.attempt, args.job, local_diagnostic=args.local_diagnostic)
-        else:
-            combine(args.checkout, args.candidate, args.revision, args.historical, args.pins, args.output)
+        build(args.checkout, args.output, args.revision, args.component_revision,
+              args.profile, args.run_id, args.attempt, args.job, local_diagnostic=args.local_diagnostic)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(json.dumps({"status": "REFUSED", "error": str(error)}), file=sys.stderr)
         return 1

@@ -86,6 +86,11 @@ compilation and pure/unit tests do not require a running Kubo daemon. See
 Repository builds use committed Cargo lockfiles. See the
 [lockfile policy and dependency-update workflow](doc/dependencies/lockfiles.md).
 
+Commit source and small intentional fixtures, not compiled release artifacts.
+`python3 scripts/check_repository_artifacts.py` checks committed Git bytes for
+native binary headers, blobs over 1 MiB, and the retired historical fixture path.
+Small archives are not inspected internally. Store build outputs outside Git.
+
 ### Run a node
 
 ```bash
@@ -175,7 +180,6 @@ an image. A published guest requires an application-specific composition path.
 - [Capabilities](doc/capabilities.md): the capability model and Cap'n Proto schemas
 - [CLI reference](doc/cli.md): full command-line usage
 - [Release rehearsal](doc/release-rehearsal.md): disposable genuine-artifact and consumer qualification
-- [Historical native release inputs](tests/fixtures/native-release-originals/README.md): offline artifact and provenance verification
 - [Image layout](doc/images.md): FHS convention, mounts, on-chain coordination
 - [Provider routing](doc/routing.md): independent discovery and host-PeerID announcement capabilities
 - [Keys & identity](doc/keys.md): Ed25519 identity management
