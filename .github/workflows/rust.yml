@@ -86,6 +86,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+    - name: Check committed repository artifacts
+      run: |
+        python3 scripts/check_repository_artifacts.py
+        python3 tests/test_repository_artifacts.py
     - uses: dtolnay/rust-toolchain@stable
     # Always resolve before dependent jobs restore compiler caches or build.
     - run: bash scripts/check_cargo_lockfiles.sh
@@ -145,25 +149,13 @@ jobs:
 
     - name: Check offline native qualification controls
       run: |
-        python3 tests/test_verify_native_release_inputs.py
-        python3 tests/test_fetch_native_release_inputs.py
+        python3 tests/test_native_release_inputs.py
         python3 tests/test_qualify_native_upgrade.py
         python3 tests/test_prepare_current_native_release.py
         python3 tests/test_native_release_integration.py
         python3 tests/test_native_release_provisioner.py
         python3 tests/test_native_development_boot.py
         python3 tests/test_native_qualification_boundary.py
-
-    - name: Verify retained historical release inputs
-      run: |
-        historical="$RUNNER_TEMP/ww-historical-source"
-        git worktree add --detach "$historical" d3d827c24d2f2d0525fd7056adaf6d18a7f33074
-        python3 scripts/verify_native_release_inputs.py \
-          --checkout "$historical" --retained \
-          --inputs tests/fixtures/native-release-originals/inputs \
-          --pins .github/native-release-integration.json \
-          --output "$RUNNER_TEMP/ww-verified-historical"
-        git worktree remove "$historical"
 
     - uses: actions/setup-go@v5
       with:

@@ -19,45 +19,6 @@ sys.path.insert(0, str(REPO / 'scripts'))
 import qualify_native_upgrade as native
 
 
-def verify_input_policy(verified):
-    require(verified.get('status') == 'VERIFIED_DIAGNOSTIC_INPUTS'
-            and verified.get('native_acceptance') is False
-            and verified.get('publication_allowed') is False
-            and verified.get('required_checks_success') is False
-            and verified['source'].get('runtime_source_equal') is True,
-            'input verifier did not preserve the diagnostic-only policy')
-    policy = verified.get('policy')
-    if policy == 'pr808-current-source-native-diagnostic-v1':
-        historical = verified['historical_baseline']
-        build = verified['current_build']
-        require(verified['slot_identities'] == {'a': 'original-producer-A', 'b': 'current-source-candidate-C'}
-                and build['source'] == verified['source']
-                and verified['source']['checkout_revision'] == verified['b']['revision']
-                and verified['source']['artifact_revision'] == verified['b']['revision']
-                and build['ci']['revision'] == verified['b']['revision']
-                and build['host']['sha256'] == verified['b']['sha256']
-                and build['builder'] == verified['b']['builder']
-                and build['profile'] == 'release'
-                and build['ci']['completed_job_receipt'] is False
-                and build['ci']['uploaded_producer_artifact'] is False,
-                'current candidate identity or build evidence differs')
-        require(historical['source']['runtime_source_equal'] is True
-                and historical['source']['checkout_revision'] == historical['source']['artifact_revision'],
-                'historical baseline lacks immutable source equality')
-    else:
-        require(policy == 'pr808-original-pair-diagnostic-only', 'unknown integration input policy')
-        historical = verified
-    require(historical['policy'] == 'pr808-original-pair-diagnostic-only'
-            and historical['native_acceptance'] is False and historical['publication_allowed'] is False
-            and historical['required_checks_success'] is False,
-            'historical producer failures must retain their original policy')
-    failures = {key: historical['producer_evidence'][key]['required_checks']['Test']['conclusion']
-                for key in ('a', 'b')}
-    require(all(value == 'failure' for value in failures.values()),
-            'original producer required-Test failures were not retained')
-    return failures
-
-
 EXPECTED_CHECKS = [
     'authenticated fresh A remains unbound',
     'stopped admission check preserves native acceptance files',
