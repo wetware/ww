@@ -18,6 +18,25 @@ Metadata does not compile crates or execute build scripts, but can download
 registry or Git dependencies. CI runs this check before Rust build jobs restore
 compiler caches. A cache hit cannot skip the check.
 
+## Host toolchain
+
+The supported host toolchain is Rust 1.99.1. Keep `rust-toolchain.toml` and the
+host toolchain selections in `.github/workflows/rust.yml` aligned. P3 component
+builds and fuzzing retain their separate `nightly-2026-08-30` requirement.
+
+Rust/Cargo 1.100 migration is separate follow-up work:
+
+- Make unit return types explicit for the infinite task in
+  `crates/cell/tests/composer_kubo.rs` and the panic-only bootstrap closure in
+  `crates/rpc/src/managed_rpc.rs`.
+- Resolve the `NetworkBehaviour` derive's unreachable conversion in `src/host.rs`
+  without suppressing diagnostics or removing connection limits.
+- Update `tests/test_build_payloads.py` to locate the current build-script
+  executable across the Cargo build-layout change.
+
+Validate that migration with strict workspace Clippy, the workspace test-binary
+build, and `make package-check`. Retain `--locked` and `-D warnings`.
+
 ## Lockfile ownership
 
 The root `Cargo.lock` governs the host workspace, including Chess, Discovery,
