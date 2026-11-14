@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Recoverable native Host-upgrade integration (#739).** Authenticate native
+  replacement, retain bounded rollback, and support explicit authenticated
+  recovery after updater interruption. Operators own unattended supervision;
+  production acceptance and publication remain separately gated.
 - Portable agent execution policy and Markdown session handoff contract. Track
   `AGENTS.md` and ignore temporary `.context/` artifacts.
 - **Offline native qualification foundation (#739).** Verify current diagnostic

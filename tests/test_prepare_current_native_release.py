@@ -592,7 +592,7 @@ class SourceAndContext(unittest.TestCase):
                 patch.object(current, "userspace_description", return_value={"path": "/usr/lib/os-release", "contents": "ID=fixture"}), \
                 patch.object(current.subprocess, "run", side_effect=fake_build), \
                 patch.object(current.subprocess, "check_output", return_value=b"fixture tool version\n"), \
-                patch.dict(os.environ, {"RUSTFLAGS": "--cfg injected", "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0"}):
+                patch.dict(os.environ, {"GITHUB_ACTIONS": "false", "RUSTFLAGS": "--cfg injected", "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0"}):
             inherited_umask = os.umask(0)
             try:
                 receipt = current.build(self.checkout, output, self.revision, self.revision, "release", local_diagnostic=True)
@@ -621,12 +621,26 @@ class SourceAndContext(unittest.TestCase):
                     patch.object(current.platform, "machine", return_value="aarch64"), \
                     patch.object(current, "source_snapshot", return_value={}), \
                     patch.object(current, "verify_profile", return_value=current.PROFILE["release"]), \
-                    patch.object(current.subprocess, "run", side_effect=fail_build):
+                    patch.object(current.subprocess, "run", side_effect=fail_build), \
+                    patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}):
                 with self.assertRaises(subprocess.TimeoutExpired if timeout else RuntimeError):
                     current.build(self.checkout, output, self.revision, self.revision, "release", local_diagnostic=True)
             self.assertEqual((output / "build.log").read_bytes(), b"compiler failed before output\n")
             self.assertFalse((output / "candidate.json").exists())
             self.assertFalse((output / "BUILD-RECEIPT.json").exists())
+
+    def test_local_diagnostic_in_actions_refuses_before_build_or_output(self):
+        output = self.root / "forbidden-diagnostic"
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(current.platform, "system", return_value="Linux"), \
+                patch.object(current.platform, "machine", return_value="aarch64"), \
+                patch.object(current, "source_snapshot") as snapshot, \
+                patch.object(current.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "local diagnostic cannot replace actual CI source authority"):
+                current.build(self.checkout, output, self.revision, self.revision, "release", local_diagnostic=True)
+            snapshot.assert_not_called()
+            run.assert_not_called()
+        self.assertFalse(output.exists())
 
     def test_actual_ci_identity_and_release_repository_gate(self):
         event = self.root / "event.json"
