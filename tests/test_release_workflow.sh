@@ -139,11 +139,11 @@ def validate_car_boundary(text):
                       'cp "artifacts/ww-$platform/$receipt" "release-input/artifacts/ww-$platform/$receipt"'],
             'release input must contain only the release tree and original receipts')
     require('./ww-release-package pack-tree --tree release-input --spool release-input-spool' in staging
-            and './ww-release-package export-car --spool release-input-spool --car release-input.car' in staging,
+            and './ww-release-package export-car --spool release-input-spool --car "$RELEASE_INPUT_CAR"' in staging,
             'release input must use the public content encoder')
     uploads = [step for step in steps if 'uses: actions/upload-artifact@' in step]
     require(len(uploads) == 2, 'release inputs and image must use separate artifacts')
-    for path in ('release-input.car', 'tested-image.tar'):
+    for path in ('${{ env.RELEASE_INPUT_CAR }}', 'tested-image.tar'):
         upload = [step for step in uploads if re.search(r'^        path: '+re.escape(path)+r'$', step, re.M)]
         require(len(upload) == 1, 'missing single-file artifact: '+path)
         require('actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9' in upload[0]
@@ -168,7 +168,7 @@ mutations = [
     ('cp -R release-tree release-input/release-tree', 'cp -R release-tree release-input/release-tree\n        cp ww-release-package release-input/tool'),
     ('./ww-release-package export-car', './ww-release-package verify'),
     ('./ww-release-package pack-tree', './ww-release-package verify'),
-    ('path: release-input.car', 'path: release-input-spool/'),
+    ('path: ${{ env.RELEASE_INPUT_CAR }}', 'path: release-input-spool/'),
     ('cp "artifacts/ww-$platform/$receipt"', 'cp "replacement/$receipt"'),
 ]
 for old, new in mutations:
@@ -181,7 +181,7 @@ for old, new in mutations:
 print(f'PASS: raw CAR source contract and {len(mutations)} mutation controls')
 PYGUARD
 
-# Freeze the existing job-level admission controls during the maintenance hold.
+# Freeze official controls and the explicit disposable qualification exception.
 # This covers ordinary Rust/metrics CI, release validation, GHCR and Pages.
 # YAML/action validation is separate; this check follows the workflow's layout.
 actual_admission="$(awk '
@@ -221,12 +221,13 @@ expected_admission="$({
     if: ${{ always() }}
   build-architecture-map:
     if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/master'
-          && needs.changes.outputs.architecture_map == 'true')
+      !inputs.artifact_only
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push' && github.ref == 'refs/heads/master'
+              && needs.changes.outputs.architecture_map == 'true'))
     needs: [changes, fmt, clippy, solidity, build, test, test-architecture-map]
   deploy-architecture-map:
-    if: ${{ needs.build-architecture-map.result == 'success' }}
+    if: ${{ !inputs.artifact_only && needs.build-architecture-map.result == 'success' }}
     needs: build-architecture-map
   build-binaries:
     if: >-
@@ -236,13 +237,21 @@ expected_admission="$({
     needs: [changes, fmt, clippy, solidity, build, build-wasm]
   validate-release:
     if: >-
-      github.ref == 'refs/heads/master'
-      && (github.event_name == 'workflow_dispatch'
-          || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')
+      (inputs.artifact_only && github.event_name == 'workflow_dispatch'
+          && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/master')
+      || (!inputs.artifact_only && github.ref == 'refs/heads/master'
+          && (github.event_name == 'workflow_dispatch'
+              || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
     needs: [changes, test, build-binaries, build-wasm]
+  qualification:
+    if: >-
+      inputs.artifact_only && github.event_name == 'workflow_dispatch'
+      && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/master'
+      && needs.test.result == 'success' && needs.validate-release.result == 'success'
+    needs: [test, validate-release]
   release_image:
     if: >-
-      !cancelled() && github.ref == 'refs/heads/master'
+      !cancelled() && !inputs.artifact_only && github.ref == 'refs/heads/master'
       && needs.test.result == 'success' && needs.validate-release.result == 'success'
       && (github.event_name == 'workflow_dispatch'
           || (github.event_name == 'push' && github.ref == 'refs/heads/master'

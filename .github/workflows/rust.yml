@@ -5,7 +5,12 @@ on:
     branches: [ "master", "staging" ]
   pull_request:
     branches: [ "master", "staging" ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      artifact_only:
+        description: Disposable qualification on a non-master branch; no publication or deployment
+        type: boolean
+        default: false
 
 # Serialize release-producing runs per ref so image + IPNS publication from
 # different commits cannot interleave. Retain every pending run. The durable
@@ -19,6 +24,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   WW_BUILD_GIT_SHA: ${{ github.sha }}
+  RELEASE_INPUT_CAR: ${{ inputs.artifact_only && 'qualification-release-input.car' || 'release-input.car' }}
 
 jobs:
   # === Path-based change detection (master push only) ===
@@ -141,6 +147,7 @@ jobs:
         bash tests/test_deploy_context.sh
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
+        python3 tests/test_artifact_qualification.py
         python3 tests/test_release_auth.py
         bash -n scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         if command -v shellcheck >/dev/null 2>&1; then
@@ -430,7 +437,12 @@ jobs:
           ipfs bootstrap rm --all
           ipfs bootstrap add "$IPFS_PEER_ADDR"
         fi
-        ipfs daemon --enable-gc &
+        if [ "$ARTIFACT_ONLY" = true ]; then
+          ipfs bootstrap rm --all
+          ipfs daemon --offline --enable-gc &
+        else
+          ipfs daemon --enable-gc &
+        fi
         # Plain `ipfs id` can open the repo offline and race the daemon for repo.lock.
         KUBO_API_FILE="${IPFS_PATH:-$HOME/.ipfs}/api"
         for _ in $(seq 1 30); do
@@ -448,7 +460,8 @@ jobs:
         esac
         echo "WW_TEST_KUBO_ADDR=127.0.0.1:$KUBO_API_PORT" >> "$GITHUB_ENV"
       env:
-        IPFS_PEER_ADDR: ${{ secrets.IPFS_PEER_ADDR }}
+        ARTIFACT_ONLY: ${{ inputs.artifact_only }}
+        IPFS_PEER_ADDR: ${{ !inputs.artifact_only && secrets.IPFS_PEER_ADDR || '' }}
 
     - uses: Swatinem/rust-cache@v2
       with:
@@ -598,9 +611,10 @@ jobs:
   build-architecture-map:
     name: Build architecture map
     if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/master'
-          && needs.changes.outputs.architecture_map == 'true')
+      !inputs.artifact_only
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push' && github.ref == 'refs/heads/master'
+              && needs.changes.outputs.architecture_map == 'true'))
     needs: [changes, fmt, clippy, solidity, build, test, test-architecture-map]
     runs-on: ubuntu-latest
     permissions:
@@ -637,7 +651,7 @@ jobs:
 
   deploy-architecture-map:
     name: Deploy architecture map
-    if: ${{ needs.build-architecture-map.result == 'success' }}
+    if: ${{ !inputs.artifact_only && needs.build-architecture-map.result == 'success' }}
     needs: build-architecture-map
     runs-on: ubuntu-latest
     permissions:
@@ -766,9 +780,11 @@ jobs:
   validate-release:
     name: Validate release packages and container boot
     if: >-
-      github.ref == 'refs/heads/master'
-      && (github.event_name == 'workflow_dispatch'
-          || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')
+      (inputs.artifact_only && github.event_name == 'workflow_dispatch'
+          && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/master')
+      || (!inputs.artifact_only && github.ref == 'refs/heads/master'
+          && (github.event_name == 'workflow_dispatch'
+              || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
     needs: [changes, test, build-binaries, build-wasm]
     runs-on: ubuntu-latest
     steps:
@@ -817,11 +833,11 @@ jobs:
           done
         done
         ./ww-release-package pack-tree --tree release-input --spool release-input-spool
-        ./ww-release-package export-car --spool release-input-spool --car release-input.car
+        ./ww-release-package export-car --spool release-input-spool --car "$RELEASE_INPUT_CAR"
     - name: Upload validated release input CAR
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
-        path: release-input.car
+        path: ${{ env.RELEASE_INPUT_CAR }}
         archive: false
         if-no-files-found: error
         retention-days: 1
@@ -835,10 +851,23 @@ jobs:
         if-no-files-found: error
         retention-days: 1
 
+  # Admission requires this marker and skipped publication/deployment jobs.
+  qualification:
+    name: Test-only release qualification
+    if: >-
+      inputs.artifact_only && github.event_name == 'workflow_dispatch'
+      && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/master'
+      && needs.test.result == 'success' && needs.validate-release.result == 'success'
+    needs: [test, validate-release]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+    - run: echo 'Disposable artifact only; not an official release admission.'
+
   release_image:
     name: Build and publish ww-master image
     if: >-
-      !cancelled() && github.ref == 'refs/heads/master'
+      !cancelled() && !inputs.artifact_only && github.ref == 'refs/heads/master'
       && needs.test.result == 'success' && needs.validate-release.result == 'success'
       && (github.event_name == 'workflow_dispatch'
           || (github.event_name == 'push' && github.ref == 'refs/heads/master'

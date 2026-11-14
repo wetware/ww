@@ -6,6 +6,69 @@ the public `ww-release-package` executable and disposable Ed25519 signing keys.
 It does not publish, provision trusted channels, register services, or admit a
 protected production workflow.
 
+## Artifact-only CI qualification
+
+The existing `.github/workflows/rust.yml` accepts a boolean `artifact_only`
+input, defaulting to `false`. An explicit `true` on a reviewed non-`master`
+branch reuses all five native builds, Wasm builds, package validation and
+container boot checks. It exports the same raw CAR format as
+`qualification-release-input.car`, retaining the original producer receipts.
+It does not run the Pages build/deployment or GHCR publication jobs. IPFS
+publication remains unconditionally disabled. The Host test Kubo runs offline
+and receives no configured production peer address in this mode.
+
+The dependency graph is:
+
+```text
+checks + Wasm → five native builds → validate-release → qualification marker
+                      Test ───────────────┘                  │
+                                       successful overall run required
+Pages build/deploy: skipped    GHCR: skipped    IPFS publication: held
+```
+
+Ordinary master pushes and dispatches retain their existing behavior. Do not
+use ordinary dispatch for a disposable qualification. Qualification on `master`
+or a tag cannot pass the qualification marker or produce the qualification CAR.
+
+A future run requires separate approval to push the reviewed patch to a named
+non-`master` branch, followed by approval for exactly one dispatch of
+`wetware/ww/.github/workflows/rust.yml` on that branch at its recorded full commit
+SHA, with `artifact_only=true`. Verify the remote branch still names that SHA
+immediately before dispatch. The approval must exclude retries, other workflows,
+publication, deployment and production signing. Example, **only after approval**:
+
+```sh
+gh workflow run rust.yml --repo wetware/ww --ref QUALIFICATION_BRANCH -f artifact_only=true
+```
+
+Private `tools/release-publisher/scripts/artifact-handoff.py fetch-qualification`
+provides separate test admission. Use the reviewed private tooling revision and
+supply the exact branch, run, attempt, source/tool revisions, artifact ID and
+API digest. Admission requires a successful overall run, the `Test-only release
+qualification` marker, skipped publication/deployment jobs, and original
+five-platform receipts from that same run and attempt. It retains the downloaded
+CAR for the signing rehearsal below. Downloading alone does not establish
+admission. Keep the output and original API metadata as evidence.
+
+```sh
+python3 /path/to/reviewed/infra/tools/release-publisher/scripts/artifact-handoff.py fetch-qualification \
+  --branch QUALIFICATION_BRANCH --run-id RUN_ID --attempt ATTEMPT \
+  --revision FULL_PRODUCER_SHA --tool-revision FULL_PACKAGE_TOOL_SHA \
+  --artifact-id ARTIFACT_ID --digest sha256:API_DIGEST \
+  --package-tool /path/to/reviewed/ww-release-package --out /fresh/private/admission
+```
+
+The existing private tool uses `WW_ARTIFACT_READ_TOKEN` for read-only GitHub API
+access. Keep the credential out of logs and signing output. The command does not
+request a production signing key or publish the candidate.
+
+Qualification admission carries `purpose: disposable-qualification`. Official
+admission still requires `master`, the official artifact name, and successful
+GHCR publication. Official sealing and receipt verification reject marked test
+data. Test signing uses only the disposable keys and independent verifier trust
+created by the existing rehearsal. A locally signed test CAR does not authorize
+official signing or publication. Never provision its keys as production trust.
+
 Build the tool from a recorded source revision:
 
 ```sh
