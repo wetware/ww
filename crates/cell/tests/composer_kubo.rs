@@ -23,7 +23,7 @@ async fn capture_local(requests: Vec<cell::image::CaptureRequest>) -> cell::imag
         .try_foreground_transaction(host.try_logical_io().unwrap(), &[&scope])
         .unwrap();
     let result =
-        cell::image::CaptureBatch::capture(requests, &transaction, Default::default()).await;
+        cell::image::CaptureBatch::capture(requests, &transaction, Default::default(), ()).await;
     drop(transaction);
     drop(fs_owner);
     finalizer.run().await.unwrap();
@@ -1647,6 +1647,7 @@ async fn immutable_mount_resolution_fetches_remote_roots_and_subpaths_before_ack
             &transaction,
             false,
             &mut cancel,
+            (),
         )
         .await
         .unwrap();

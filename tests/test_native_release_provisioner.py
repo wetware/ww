@@ -18,7 +18,7 @@ import run_native_release_integration as provision
 from qualify_native_upgrade import custody
 
 
-class UnavailableEntrypoints(unittest.TestCase):
+class IncompleteArguments(unittest.TestCase):
     def test_live_runners_refuse_before_creating_output(self):
         repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
@@ -29,13 +29,36 @@ class UnavailableEntrypoints(unittest.TestCase):
                 with self.subTest(name=name):
                     result = subprocess.run([sys.executable, str(repo / name), '--output', str(output)],
                                             capture_output=True, text=True, timeout=10)
-                    self.assertEqual(result.returncode, 3, result.stderr)
-                    report = json.loads(result.stdout)
-                    self.assertEqual(report['status'], 'UNAVAILABLE')
-                    self.assertFalse(report['native_acceptance'])
-                    self.assertFalse(report['production_activation'])
-                    self.assertFalse(report['integration_checks_passed'])
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn('required', result.stderr)
                     self.assertFalse(output.exists())
+
+
+class AccountCreation(unittest.TestCase):
+    def test_partial_useradd_failure_retains_exact_account_for_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            worker = provision.Provisioner(root)
+            account = SimpleNamespace(pw_uid=1234, pw_gid=1234, pw_name='ww739-fixture', pw_dir=str(root / 'h'))
+            with patch.object(provision.pwd, 'getpwnam', side_effect=[KeyError(), account]), \
+                    patch.object(worker, 'run', side_effect=RuntimeError('partial useradd')):
+                with self.assertRaisesRegex(RuntimeError, 'partial useradd'):
+                    worker.create_account(account.pw_name, root / 'h')
+            self.assertIs(worker.account, account)
+
+    def test_existing_or_unexpected_account_is_never_owned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            worker = provision.Provisioner(root)
+            account = SimpleNamespace(pw_uid=1234, pw_dir='/unrelated')
+            for records in ([account], [KeyError(), account]):
+                with patch.object(provision.pwd, 'getpwnam', side_effect=records), \
+                        patch.object(worker, 'run') as run:
+                    with self.assertRaises(RuntimeError):
+                        worker.create_account('ww739-fixture', root / 'h')
+                    self.assertIsNone(worker.account)
+                    if len(records) == 1:
+                        run.assert_not_called()
 
 
 class ExclusiveMarker(unittest.TestCase):
@@ -365,6 +388,28 @@ class AccountCleanup(unittest.TestCase):
                 provision.quiesce_account(self.account)
         self.send_signal.assert_called_once_with(9001, signal.SIGKILL)
         self.close_pidfd.assert_called_once_with(9001)
+
+
+class CurrentBuildCustody(unittest.TestCase):
+    def test_both_copied_release_builds_are_verified_before_account_creation(self):
+        from test_prepare_current_native_release import Candidate
+        fixture = Candidate()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        other = fixture.second_candidate()
+        output = fixture.root / 'pair'
+        value = fixture.pair(other, output)
+        with patch.object(provision, "pair_source_roles", return_value=value["source_roles"]):
+            provision.verify_current_builds(output, value, owner=os.geteuid())
+        changed_roles = dict(value["source_roles"], harness_revision="4" * 40)
+        with patch.object(provision, "pair_source_roles", return_value=changed_roles):
+            with self.assertRaisesRegex(RuntimeError, "source authority"):
+                provision.verify_current_builds(output, value, owner=os.geteuid())
+        path = output / 'b/ww'
+        path.write_bytes(b'changed second build')
+        with patch.object(provision, "pair_source_roles", return_value=value["source_roles"]):
+            with self.assertRaisesRegex(RuntimeError, 'Host binding'):
+                provision.verify_current_builds(output, value, owner=os.geteuid())
 
 
 if __name__ == '__main__':

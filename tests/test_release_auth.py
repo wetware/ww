@@ -345,10 +345,27 @@ esac
         self.refuse_before_transport(['--version', 'test-release'])
 
     def test_recovery_requires_pending_journal_before_transport(self):
-        for flags in (['--recover'], ['--recover', '--release', 'test-release']):
+        for flags in (['--recover', '--timeout-secs', '15'], ['--recover', '--timeout-secs', '15', '--release', 'test-release']):
             with self.subTest(flags=flags):
                 result = self.refuse_before_transport(flags)
                 self.assertIn('pending Host upgrade', result.stderr)
+
+    def test_recovery_requires_positive_timeout_before_transport(self):
+        self.prepare_recovery()
+        for flags in ([], ['--timeout-secs', '0'], ['--timeout-secs', '-1'],
+                      ['--timeout-secs', 'NaN'], ['--timeout-secs', '1.5'],
+                      ['--timeout-secs', '4294967296'],
+                      ['--timeout-secs', '18446744073709551616'],
+                      ['--timeout-secs']):
+            with self.subTest(flags=flags):
+                result = self.refuse_before_transport(['--recover', '--release', self.release_cid, *flags])
+                self.assertIn('--timeout-secs', result.stderr)
+
+    def test_install_forwards_configured_ipfs_endpoint(self):
+        self.env['IPFS_API'] = 'http://127.0.0.1:41003'
+        self.run_installer(success=True)
+        for call in self.calls.read_text().splitlines()[:2]:
+            self.assertIn('--ipfs-url http://127.0.0.1:41003', call)
 
     def prepare_recovery(self, pointer=None):
         root = self.home / '.ww'
@@ -370,24 +387,24 @@ esac
             with self.subTest(contents=contents):
                 if contents is not None:
                     pointer.write_bytes(contents)
-                result = self.refuse_before_transport(['--recover'])
+                result = self.refuse_before_transport(['--recover', '--timeout-secs', '15'])
                 self.assertIn('--release', result.stderr)
         pointer.unlink()
         pointer.symlink_to(self.manifest)
-        self.refuse_before_transport(['--recover'])
+        self.refuse_before_transport(['--recover', '--timeout-secs', '15'])
 
     def test_recovery_rejects_symlinked_journal_before_transport(self):
         self.prepare_recovery()
         journal = self.home / '.ww/host-upgrade.json'
         journal.unlink()
         journal.symlink_to(self.manifest)
-        self.refuse_before_transport(['--recover', '--release', self.release_cid])
+        self.refuse_before_transport(['--recover', '--timeout-secs', '15', '--release', self.release_cid])
 
     def run_recovery(self, flags=(), expected_exit=0):
         self.env['TEST_CID'] = self.release_cid
         before = {str(path.relative_to(self.home)): path.read_bytes()
                   for path in self.home.rglob('*') if path.is_file()}
-        result = subprocess.run(['sh', str(INSTALLER), '--recover', *flags,
+        result = subprocess.run(['sh', str(INSTALLER), '--recover', '--timeout-secs', '15', *flags,
                                  '--trusted-release-keys', str(self.keys)],
                                 env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
@@ -405,7 +422,7 @@ esac
                 self.run_recovery()
                 self.assertEqual(self.calls.read_text().splitlines(), [
                     f'upgrade --recover-only --release {self.release_cid} '
-                    f'--ipfs-url http://localhost:5001 --trusted-release-keys {self.keys}'])
+                    f'--ipfs-url http://localhost:5001 --timeout-secs 15 --trusted-release-keys {self.keys}'])
                 self.assertEqual(self.transport.read_text().splitlines(), [
                     'id', f'cat /ipfs/{self.release_cid}/CHECKSUMS.txt',
                     f'cat /ipfs/{self.release_cid}/CHECKSUMS.txt.sig',
@@ -445,7 +462,7 @@ esac
         sentinel = directory / 'sentinel'
         sentinel.write_bytes(b'private unrelated state')
         self.env['WW_TMPDIR'] = str(directory)
-        self.refuse_before_transport(['--recover'])
+        self.refuse_before_transport(['--recover', '--timeout-secs', '15'])
         self.assertTrue(directory.exists(), 'cleanup removed inherited WW_TMPDIR')
         self.assertEqual(sentinel.read_bytes(), b'private unrelated state')
 

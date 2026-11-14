@@ -12,14 +12,15 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-import zipfile
 import warnings
+import zipfile
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import prepare_current_native_release as current
 import qualify_native_upgrade as qualifier
+import native_release_integration as lane
 
 
 class Candidate(unittest.TestCase):
@@ -52,6 +53,7 @@ class Candidate(unittest.TestCase):
             "ci": {"repository": "wetware/ww", "source_repository": "wetware/ww",
                    "event": "pull_request", "branch": "qualification-fixture",
                    "run_id": 123, "attempt": 1, "job": "test-native", "revision": self.revision,
+                   "workflow_ref": "wetware/ww/.github/workflows/rust.yml@refs/pull/1/merge",
                    "head_revision": self.revision, "head_repository": "wetware/ww",
                    "revision_kind": "pull-request-head", "workflow_sha": self.source["component_revision"],
                    "completed_job_receipt": False, "uploaded_producer_artifact": False},
@@ -190,6 +192,129 @@ class Candidate(unittest.TestCase):
                     current.verify_build_files(self.directory, "release")
                 path.unlink()
 
+    def second_candidate(self):
+        other = Candidate()
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        prior = other.revision
+        other.revision = '3' * 40
+        other.builder = "github-actions-pr-native:123:1:" + current.TARGET + ":release"
+        binary = other.directory / 'ww'
+        binary.write_bytes(binary.read_bytes().replace(prior.encode(), other.revision.encode()))
+        other.source.update(checkout_revision=other.revision, artifact_revision=other.revision)
+        other.receipt['ci'].update(revision=other.revision, head_revision=self.revision,
+            revision_kind='pinned-reduced-baseline', baseline_pin={'schema': 1, 'repository': 'wetware/ww',
+                'revision': other.revision, 'contract': 'managed-systemd-v3'})
+        other.receipt['environment']['WW_BUILD_GIT_SHA'] = other.revision
+        other.receipt['host'] = current.file_binding(binary)
+        other.freeze()
+        return other
+
+    def roles(self, other):
+        pin = {'schema': 1, 'repository': 'wetware/ww', 'revision': other.revision, 'contract': 'managed-systemd-v3'}
+        return {'harness_revision': self.revision, 'baseline_pin': pin,
+                'baseline_pin_sha256': current.inputs.digest((json.dumps(pin, indent=2) + '\n').encode())}
+
+    def pair(self, other, output):
+        def verify(checkout, directory, revision, profile):
+            receipt = current.verify_build_files(directory, profile)
+            self.assertEqual(receipt['source']['checkout_revision'], revision)
+            return receipt
+        with patch.object(current, 'verify_candidate', side_effect=verify), \
+                patch.object(current, 'pair_source_roles', return_value=self.roles(other)):
+            return current.combine_current(self.root, self.directory, self.revision,
+                other.root, other.directory, other.revision, output)
+
+    def test_current_pair_preserves_both_actual_build_receipts(self):
+        other = self.second_candidate()
+        output = self.root / 'pair'
+        mask = os.umask(0)
+        try:
+            result = self.pair(other, output)
+        finally:
+            os.umask(mask)
+        self.assertEqual(result['policy'], current.PAIR_POLICY)
+        self.assertEqual(result['slot_identities'], {'a': 'reduced-current-R1', 'b': 'reduced-current-R0'})
+        self.assertEqual(result['current_builds'], {'a': self.receipt, 'b': other.receipt})
+        for slot, source in [('a', self.directory), ('b', other.directory)]:
+            self.assertEqual((output / (slot + '.zip')).read_bytes(), (source / 'candidate.zip').read_bytes())
+            self.assertEqual(stat.S_IMODE((output / (slot + '.zip')).stat().st_mode), 0o644)
+        lane.verify_input_policy(result)
+        with self.assertRaisesRegex(RuntimeError, 'output must be absent'):
+            self.pair(other, output)
+
+    def test_current_pair_refuses_identical_bytes_or_changed_second_build(self):
+        with self.assertRaisesRegex(RuntimeError, 'source roles'):
+            self.pair(self, self.root / 'identical')
+        other = self.second_candidate()
+        (other.directory / 'ww').write_bytes(b'corrupt')
+        with self.assertRaisesRegex(RuntimeError, 'Host binding'):
+            self.pair(other, self.root / 'corrupt')
+        self.assertFalse((self.root / 'corrupt').exists())
+
+    def test_pair_policy_refuses_swapped_source_profile_and_receipt(self):
+        other = self.second_candidate()
+        result = self.pair(other, self.root / 'pair')
+        for field in ('source', 'profile', 'receipt', 'slots'):
+            broken = copy.deepcopy(result)
+            if field == 'source':
+                broken['current_builds']['a']['source']['checkout_revision'] = other.revision
+            elif field == 'profile':
+                broken['current_builds']['b']['profile'] = 'development'
+            elif field == 'receipt':
+                broken['current_builds']['a'] = broken['current_builds']['b']
+            else:
+                broken['slot_identities']['b'] = 'original-producer-B'
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                lane.verify_input_policy(broken)
+
+    def test_pair_rejects_role_swaps_and_unpinned_local_builds_before_output(self):
+        other = self.second_candidate()
+        builds = {'a': self.receipt, 'b': other.receipt}
+        roles = self.roles(other)
+        current.validate_pair_roles(builds, roles)
+        for mutation in ('swap', 'older-final', 'unpinned-local', 'mixed-authority'):
+            changed = copy.deepcopy(builds)
+            if mutation == 'swap':
+                changed = {'a': changed['b'], 'b': changed['a']}
+            elif mutation == 'older-final':
+                changed['a']['ci']['revision'] = '4' * 40
+            else:
+                for slot in ('a', 'b') if mutation == 'unpinned-local' else ('b',):
+                    changed[slot]['ci'] = {'kind': 'local-native-diagnostic', 'revision': changed[slot]['ci']['revision']}
+                if mutation == 'unpinned-local':
+                    changed['b']['ci']['revision'] = '4' * 40
+            with self.subTest(mutation=mutation), patch.object(current, 'verify_candidate', side_effect=[changed['a'], changed['b']]), \
+                    patch.object(current, 'pair_source_roles', return_value=roles):
+                output = self.root / mutation
+                with self.assertRaises(RuntimeError):
+                    current.combine_current(self.root, self.directory, self.revision,
+                        other.root, other.directory, other.revision, output)
+                self.assertFalse(output.exists())
+        local = copy.deepcopy(builds)
+        for slot in ('a', 'b'):
+            local[slot]['ci'] = {'kind': 'local-native-diagnostic', 'revision': local[slot]['ci']['revision']}
+        current.validate_pair_roles(local, roles)
+
+    def test_ci_pair_requires_matching_real_run_job_head_and_component_context(self):
+        other = self.second_candidate()
+        builds = {'a': self.receipt, 'b': other.receipt}
+        roles = self.roles(other)
+        for field in ('run_id', 'attempt', 'job', 'workflow_sha', 'workflow_ref', 'head_revision', 'head_repository'):
+            changed = copy.deepcopy(builds)
+            changed['b']['ci'][field] = 999 if field in ('run_id', 'attempt') else 'different'
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, 'context'):
+                current.validate_pair_roles(changed, roles)
+        changed = copy.deepcopy(builds)
+        del changed['a']['ci']['job']
+        del changed['b']['ci']['job']
+        with self.assertRaisesRegex(RuntimeError, 'context'):
+            current.validate_pair_roles(changed, roles)
+        changed = copy.deepcopy(builds)
+        changed['b']['ci']['revision_kind'] = 'pull-request-head'
+        with self.assertRaisesRegex(RuntimeError, 'source roles'):
+            current.validate_pair_roles(changed, roles)
+
     def test_current_source_must_equal_recorded_source(self):
         with patch.object(current, "source_snapshot", return_value=self.source), patch.object(current, "verify_profile"):
             current.verify_candidate(self.root, self.directory, self.revision, "release")
@@ -254,7 +379,7 @@ class SourceAndContext(unittest.TestCase):
         self.checkout.mkdir()
         (self.checkout / "Cargo.toml").write_text('[profile.release]\nopt-level="z"\nlto=true\nstrip=true\n[profile.release.package.ww]\nopt-level=2\n')
         (self.checkout / ".github/workflows").mkdir(parents=True)
-        (self.checkout / ".github/workflows/rust.yml").write_text('name: test\njobs:\n  build-binaries:\n    run: build\n')
+        (self.checkout / ".github/workflows/rust.yml").write_text('name: test\njobs:\n  build-wasm:\n    run: make test-wasm\n  build-binaries:\n    run: build\n')
         self.git("init", "-q")
         self.git("add", ".")
         self.git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
@@ -276,8 +401,146 @@ class SourceAndContext(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "HEAD differs"):
             current.source_snapshot(self.checkout, self.revision, self.revision)
         head = self.git("rev-parse", "HEAD").strip()
-        with self.assertRaisesRegex(RuntimeError, "component artifact source tree differs"):
+        with self.assertRaisesRegex(RuntimeError, "component artifact source differs"):
             current.source_snapshot(self.checkout, head, self.revision)
+
+    def test_equal_tree_snapshot_preserves_original_r0_receipt_schema(self):
+        # This is the exact source_snapshot output shape emitted by reviewed R0.
+        expected = current.inputs.verify_source(self.checkout, self.revision, '.github/workflows/rust.yml')
+        expected.update(component_revision=self.revision, source_tree=self.git('rev-parse', 'HEAD^{tree}').strip(),
+                        component_tree_equal=True)
+        self.assertEqual(current.source_snapshot(self.checkout, self.revision, self.revision), expected)
+
+    def test_pair_authority_reads_actual_harness_head_and_committed_pin(self):
+        baseline = self.revision
+        current.write_json(self.checkout / current.BASELINE_PIN, {'schema': 1, 'repository': 'wetware/ww',
+                           'revision': baseline, 'contract': 'managed-systemd-v3'})
+        with self.assertRaises((RuntimeError, subprocess.SubprocessError)):
+            current.pair_source_roles(self.checkout)
+        self.git('add', current.BASELINE_PIN)
+        self.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'pin baseline')
+        roles = current.pair_source_roles(self.checkout)
+        self.assertEqual(roles['harness_revision'], self.git('rev-parse', 'HEAD').strip())
+        self.assertEqual(roles['baseline_pin']['revision'], baseline)
+        path = self.checkout / current.BASELINE_PIN
+        path.write_text(path.read_text() + ' ')
+        with self.assertRaisesRegex(RuntimeError, 'not committed'):
+            current.pair_source_roles(self.checkout)
+
+    def test_non_component_changes_reuse_components_with_unequal_trees(self):
+        for name in ('README.md', 'CHANGELOG.md', 'doc/deployment.md', 'doc/release-authentication.md',
+                     'scripts/native_release_inputs.py', 'scripts/verify_native_release_inputs.py',
+                     'scripts/check_repository_artifacts.py', 'tests/test_repository_artifacts.py',
+                     'tests/test_release_workflow.sh',
+                     'tests/test_native_release_inputs.py', 'tests/test_verify_native_release_inputs.py',
+                     'tests/test_fetch_native_release_inputs.py'):
+            with self.subTest(non_component=name):
+                path = self.checkout / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('qualification documentation')
+                self.git('add', name)
+                self.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'documentation')
+                head = self.git('rev-parse', 'HEAD').strip()
+                source = current.source_snapshot(self.checkout, head, self.revision)
+                self.assertFalse(source['component_tree_equal'])
+                self.assertTrue(source['component_source_equal'])
+                self.assertTrue(current.verify_component_binding(source))
+                self.assertEqual(len(source['component_manifest_sha256']), 64)
+                self.assertNotEqual(source['source_tree'], source['component_source_tree'])
+
+    def test_retired_qualification_deletion_preserves_component_binding(self):
+        names = (
+            '.github/native-release-integration.json',
+            'scripts/fetch_native_release_inputs.py',
+            'scripts/verify_native_release_inputs.py',
+            'tests/test_fetch_native_release_inputs.py',
+            'tests/test_verify_native_release_inputs.py',
+            'tests/fixtures/native-release-originals/README.md',
+            'tests/fixtures/native-release-originals/.gitattributes',
+            'tests/fixtures/native-release-originals/inputs/a-artifact.json',
+            'tests/fixtures/native-release-originals/inputs/a-build-job.json',
+            'tests/fixtures/native-release-originals/inputs/a-build.log',
+            'tests/fixtures/native-release-originals/inputs/a-jobs.json',
+            'tests/fixtures/native-release-originals/inputs/a-run.json',
+            'tests/fixtures/native-release-originals/inputs/a.zip',
+            'tests/fixtures/native-release-originals/inputs/b-artifact.json',
+            'tests/fixtures/native-release-originals/inputs/b-build-job.json',
+            'tests/fixtures/native-release-originals/inputs/b-build.log',
+            'tests/fixtures/native-release-originals/inputs/b-jobs.json',
+            'tests/fixtures/native-release-originals/inputs/b-run.json',
+            'tests/fixtures/native-release-originals/inputs/b.zip',
+            'tests/fixtures/native-release-originals/inputs/capture-manifest.json',
+            'tests/fixtures/native-release-originals/inputs/retention.json',
+        )
+        for name in names:
+            path = self.checkout / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('generated historical qualification fixture')
+        self.git('add', '.')
+        self.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'historical paths')
+        baseline = self.git('rev-parse', 'HEAD').strip()
+        for name in names:
+            (self.checkout / name).unlink()
+        self.git('add', '-u')
+        self.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture cleanup')
+        head = self.git('rev-parse', 'HEAD').strip()
+        source = current.source_snapshot(self.checkout, head, baseline)
+        self.assertFalse(source['component_tree_equal'])
+        self.assertTrue(source['component_source_equal'])
+        self.assertTrue(current.verify_component_binding(source))
+
+    def test_component_exclusions_are_exact_paths(self):
+        for name in ('doc/deployment.md.extra', 'doc/release-authentication.md.extra',
+                     'CHANGELOG.md.extra', 'scripts/native_release_inputs.py.extra',
+                     'scripts/other_build_input.py', 'src/main.rs',
+                     'scripts/check_repository_artifacts.py.extra', 'tests/test_repository_artifacts.py.extra',
+                     'tests/test_release_workflow.sh.extra',
+                     'tests/fixtures/native-release-originals/inputs/a.zip.extra',
+                     'tests/fixtures/native-release-originals/inputs/new-build-input',
+                     '.github/native-release-integration.json.extra'):
+            with self.subTest(unapproved=name):
+                path = self.checkout / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('not an approved documentation path')
+                self.git('add', name)
+                self.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'unapproved path')
+                head = self.git('rev-parse', 'HEAD').strip()
+                with self.assertRaisesRegex(RuntimeError, 'component artifact source differs'):
+                    current.source_snapshot(self.checkout, head, self.revision)
+                path.unlink()
+                self.git('add', name)
+                self.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'remove fixture path')
+
+    def test_component_recipe_is_checked_even_when_other_workflow_jobs_change(self):
+        workflow = self.checkout / '.github/workflows/rust.yml'
+        workflow.write_text(workflow.read_text().replace('make test-wasm', 'make different-wasm'))
+        self.git('add', '.github/workflows/rust.yml')
+        self.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'component recipe')
+        head = self.git('rev-parse', 'HEAD').strip()
+        with self.assertRaisesRegex(RuntimeError, 'component artifact source differs'):
+            current.source_snapshot(self.checkout, head, self.revision)
+
+    def test_baseline_ci_authority_requires_exact_pin_from_actual_pr_head(self):
+        path = self.checkout / current.BASELINE_PIN
+        current.write_json(path, {'schema': 1, 'repository': 'wetware/ww',
+                                 'revision': self.revision, 'contract': 'managed-systemd-v3'})
+        self.git('add', current.BASELINE_PIN)
+        self.git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'reviewed pin')
+        head = self.git('rev-parse', 'HEAD').strip()
+        event = self.root / 'event.json'
+        current.write_json(event, {'pull_request': {'head': {'repo': {'full_name': 'wetware/ww'},
+                                                            'ref': 'any-branch', 'sha': head}}})
+        env = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'wetware/ww', 'GITHUB_RUN_ID': '123',
+               'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_JOB': 'test', 'GITHUB_EVENT_PATH': str(event),
+               'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_SHA': head}
+        with patch.dict(os.environ, env, clear=True), patch.object(current, '__file__', str(self.checkout / 'scripts/prepare.py')):
+            context = current.ci_context(self.revision, 'release', 123, 1, 'test')
+            self.assertEqual(context['revision_kind'], 'pinned-reduced-baseline')
+            self.assertEqual(context['head_revision'], head)
+            self.assertEqual(context['revision'], self.revision)
+            path.write_text(path.read_text() + ' ')
+            with self.assertRaisesRegex(RuntimeError, 'exact PR-head repository content'):
+                current.ci_context(self.revision, 'release', 123, 1, 'test')
 
     def test_custom_cargo_home_configuration_refuses(self):
         cargo_home = self.root / "custom-cargo-home"
@@ -405,8 +668,16 @@ class SourceAndContext(unittest.TestCase):
             self.assertEqual(result["head_repository"], "fork/ww")
             self.assertEqual(result["head_revision"], "1" * 40)
             for revision, profile in (("2" * 40, "development"), (self.revision, "release")):
-                with self.subTest(revision=revision, profile=profile), self.assertRaisesRegex(RuntimeError, "neither the exact head"):
+                with self.subTest(revision=revision, profile=profile), self.assertRaisesRegex(RuntimeError, "neither the exact head|baseline"):
                     current.ci_context(revision, profile, 123, 1, "test")
+
+
+class IntegrationPolicy(unittest.TestCase):
+    def test_historical_and_mixed_policies_cannot_authorize_reduced_execution(self):
+        for policy in ('pr808-original-pair-diagnostic-only', 'pr808-current-source-native-diagnostic-v1',
+                       'pr739-current-forward-native-diagnostic-v1'):
+            with self.subTest(policy=policy), self.assertRaises(RuntimeError):
+                lane.verify_input_policy({'schema': 1, 'policy': policy})
 
 
 if __name__ == "__main__":

@@ -1,8 +1,7 @@
 //! Service evidence for native Host replacement.
 //!
-//! Native adapters are observation-only until candidate compatibility and
-//! child-side startup admission are implemented and qualified. Successful
-//! service-manager calls alone never establish live-upgrade readiness.
+//! Native mutation is restricted to the Linux GNU ARM64 qualification candidate.
+//! Successful service-manager calls alone never establish live-upgrade readiness.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -11,9 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::installation_state::MutationLock;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use super::ArtifactIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -45,7 +46,7 @@ pub struct ServiceSnapshot {
 /// These are observations, not authorization to alter deployment authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StartupIdentity {
+pub(super) struct StartupIdentity {
     /// Effective startup configuration, including the configured authoritative
     /// source identity, but excluding that source's moving head value.
     pub configuration: String,
@@ -61,13 +62,13 @@ pub struct StartupIdentity {
 /// The native adapter cannot currently construct this admission.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RestartAdmission {
+pub(super) struct LegacyRestartAdmission {
     pub(crate) startup: StartupIdentity,
     pub(crate) configuration_identity: String,
     pub(crate) prior_pid: u32,
 }
 
-impl RestartAdmission {
+impl LegacyRestartAdmission {
     pub fn validate(&self, before: &ServiceSnapshot) -> Result<()> {
         self.startup.validate()?;
         ensure!(
@@ -101,15 +102,21 @@ impl RestartAdmission {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RunningEvidence {
+#[cfg(test)]
+pub(super) struct LegacyRunningEvidence {
     pub pid: u32,
     pub artifact: ArtifactIdentity,
     pub startup: StartupIdentity,
     pub serving_ready: bool,
 }
 
-impl RunningEvidence {
-    pub fn verify(&self, admission: &RestartAdmission, artifact: &ArtifactIdentity) -> Result<()> {
+#[cfg(test)]
+impl LegacyRunningEvidence {
+    pub fn verify(
+        &self,
+        admission: &LegacyRestartAdmission,
+        artifact: &ArtifactIdentity,
+    ) -> Result<()> {
         admission.startup.validate()?;
         self.startup.validate()?;
         ensure!(
@@ -132,32 +139,170 @@ impl RunningEvidence {
     }
 }
 
-/// Operations must preserve definitions, keys, user data, and authority heads.
-/// `compatible` checks the current effective deployment, including rollback.
-/// `restart` must enforce admission in the child before publication or guests.
+/// Bounded operations under a trusted service manager. No method grants launch authority.
+// Test-only legacy hooks keep the original V1 fixture machinery local; no
+// production method exposes the private historical admission record types.
+#[cfg_attr(test, allow(private_interfaces))]
 pub trait ServiceControl {
-    fn snapshot(&mut self) -> Result<ServiceSnapshot>;
-    fn admit_restart(&mut self, before: &ServiceSnapshot) -> Result<RestartAdmission>;
-    /// Recheck prepared next-start inputs against the durable admission during
-    /// recovery. The original process may already have stopped. Child-side
-    /// enforcement remains required before publication or guest execution.
-    fn revalidate_restart(&mut self, admission: &RestartAdmission) -> Result<()>;
-    fn restart(
+    fn snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot>;
+    fn reset_failed(
         &mut self,
-        admission: &RestartAdmission,
-        expected: &ArtifactIdentity,
+        _before: &ServiceSnapshot,
+        _mutation: &MutationLock,
+        _deadline: Instant,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Observe exact running executable identity and readiness without starting it.
+    fn verify_ready(
+        &mut self,
+        _before: &ServiceSnapshot,
+        _deadline: Instant,
+    ) -> Result<ServiceSnapshot> {
+        bail!("managed native readiness observation is not supported")
+    }
+    /// Historical V1 journals use the ordinary lifecycle configuration format.
+    fn legacy_snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot> {
+        self.snapshot(deadline)
+    }
+    /// Refuse unsupported configuration/readiness before any transaction writes.
+    fn preflight(&mut self, _before: &ServiceSnapshot, _deadline: Instant) -> Result<()> {
+        bail!("managed native replacement is not supported")
+    }
+    /// Return only after manager stop and exit of the observed process are confirmed.
+    fn quiesce(
+        &mut self,
+        _before: &ServiceSnapshot,
+        _mutation: &MutationLock,
+        _deadline: Instant,
+    ) -> Result<ServiceSnapshot> {
+        bail!("managed native quiescence is not supported")
+    }
+    /// Start a previously running service and confirm its serving readiness.
+    fn start_ready(
+        &mut self,
+        _before: &ServiceSnapshot,
+        _mutation: &MutationLock,
+        _deadline: Instant,
+    ) -> Result<ServiceSnapshot> {
+        bail!("managed native readiness is not supported")
+    }
+    fn stop(
+        &mut self,
+        before: &ServiceSnapshot,
+        mutation: &MutationLock,
         deadline: Instant,
-    ) -> Result<RunningEvidence>;
-    fn stop(&mut self, deadline: Instant) -> Result<()>;
-    fn compatible(&mut self, artifact: &ArtifactIdentity, executable: &Path) -> Result<()>;
+    ) -> Result<()> {
+        self.quiesce(before, mutation, deadline).map(|_| ())
+    }
+    #[cfg(test)]
+    fn legacy_admit_restart(&mut self, _: &ServiceSnapshot) -> Result<LegacyRestartAdmission> {
+        bail!("legacy fixture only")
+    }
+    #[cfg(test)]
+    fn legacy_revalidate_restart(&mut self, _: &LegacyRestartAdmission) -> Result<()> {
+        bail!("legacy fixture only")
+    }
+    #[cfg(test)]
+    fn legacy_restart(
+        &mut self,
+        _: &LegacyRestartAdmission,
+        _: &ArtifactIdentity,
+        _: Instant,
+    ) -> Result<LegacyRunningEvidence> {
+        bail!("legacy fixture only")
+    }
+    #[cfg(test)]
+    fn legacy_stop(&mut self, _: Instant) -> Result<()> {
+        bail!("legacy fixture only")
+    }
+    #[cfg(test)]
+    fn legacy_compatible(&mut self, _: &ArtifactIdentity, _: &Path) -> Result<()> {
+        bail!("legacy fixture only")
+    }
 }
 
+pub struct NativeService {
+    home: PathBuf,
+}
+impl NativeService {
+    pub fn new(home: impl Into<PathBuf>) -> Self {
+        Self { home: home.into() }
+    }
+    fn supported(&self) -> Result<()> {
+        ensure!(
+            cfg!(all(
+                target_os = "linux",
+                target_arch = "aarch64",
+                target_env = "gnu"
+            )),
+            "automatic native replacement requires managed GNU ARM64 Linux/systemd"
+        );
+        Ok(())
+    }
+}
+impl ServiceControl for NativeService {
+    fn reset_failed(
+        &mut self,
+        before: &ServiceSnapshot,
+        mutation: &MutationLock,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.supported()?;
+        super::native_linux::reset_failed(&self.home, before, mutation, deadline)
+    }
+
+    fn verify_ready(
+        &mut self,
+        before: &ServiceSnapshot,
+        deadline: Instant,
+    ) -> Result<ServiceSnapshot> {
+        self.supported()?;
+        super::native_linux::verify_ready(&self.home, before, deadline)
+    }
+
+    fn snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot> {
+        if cfg!(all(
+            target_os = "linux",
+            target_arch = "aarch64",
+            target_env = "gnu"
+        )) {
+            return super::native_linux::snapshot(&self.home, deadline);
+        }
+        lifecycle_snapshot(&self.home, deadline)
+    }
+
+    fn legacy_snapshot(&mut self, deadline: Instant) -> Result<ServiceSnapshot> {
+        lifecycle_snapshot(&self.home, deadline)
+    }
+    fn preflight(&mut self, before: &ServiceSnapshot, deadline: Instant) -> Result<()> {
+        self.supported()?;
+        super::native_linux::preflight(&self.home, before, deadline)
+    }
+    fn quiesce(
+        &mut self,
+        before: &ServiceSnapshot,
+        mutation: &MutationLock,
+        deadline: Instant,
+    ) -> Result<ServiceSnapshot> {
+        self.supported()?;
+        super::native_linux::quiesce(&self.home, before, mutation, deadline)
+    }
+    fn start_ready(
+        &mut self,
+        before: &ServiceSnapshot,
+        mutation: &MutationLock,
+        deadline: Instant,
+    ) -> Result<ServiceSnapshot> {
+        self.supported()?;
+        super::native_linux::start_ready(&self.home, before, mutation, deadline)
+    }
+}
 const MAX_OBSERVATION_BYTES: usize = 64 * 1024;
 const MAX_IDENTITY_BYTES: usize = 4096;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-
 impl StartupIdentity {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         for value in [
             Some(self.configuration.as_str()),
             self.fhs_baseline.as_deref(),
@@ -175,6 +320,125 @@ impl StartupIdentity {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct Observation {
+    pub(super) status: ExitStatus,
+    pub(super) stdout: String,
+    pub(super) stderr: String,
+}
+
+pub(super) fn observe_until(
+    program: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> Result<Observation> {
+    observe_command(program, args, deadline, None)
+}
+
+pub(super) fn action_until(
+    program: &str,
+    args: &[&str],
+    mutation: &MutationLock,
+    deadline: Instant,
+) -> Result<Observation> {
+    observe_command(program, args, deadline, Some(mutation))
+}
+
+fn observe_command(
+    program: &str,
+    args: &[&str],
+    deadline: Instant,
+    mutation: Option<&MutationLock>,
+) -> Result<Observation> {
+    ensure!(
+        Instant::now() < deadline,
+        "native service query exceeded deadline before spawn"
+    );
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(mutation) = mutation {
+        mutation.inherit_to(&mut command)?;
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start native service query {program}"))?;
+    let result = (|| {
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("native query stdout unavailable")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("native query stderr unavailable")?;
+        for descriptor in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            // SAFETY: descriptors are owned by the live ChildStdout/ChildStderr
+            // values. fcntl reads/changes descriptor flags without pointers.
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+            ensure!(flags >= 0, "read native query pipe flags");
+            ensure!(
+                unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+                "set native query pipe nonblocking"
+            );
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        loop {
+            ensure!(
+                Instant::now() < deadline,
+                "native service query exceeded deadline"
+            );
+            read_available(&mut stdout, &mut out, deadline)?;
+            read_available(&mut stderr, &mut err, deadline)?;
+            if let Some(status) = child.try_wait().context("inspect native query process")? {
+                // The final kernel pipe buffers may have filled after the
+                // previous read and before process exit.
+                read_available(&mut stdout, &mut out, deadline)?;
+                read_available(&mut stderr, &mut err, deadline)?;
+                return Ok(Observation {
+                    status,
+                    stdout: String::from_utf8(out).context("native query stdout is not UTF-8")?,
+                    stderr: String::from_utf8(err).context("native query stderr is not UTF-8")?,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+fn read_available(reader: &mut impl Read, bytes: &mut Vec<u8>, deadline: Instant) -> Result<()> {
+    let mut buffer = [0u8; 4096];
+    loop {
+        ensure!(
+            Instant::now() < deadline,
+            "native service query exceeded deadline"
+        );
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(size) => {
+                ensure!(
+                    bytes.len() + size <= MAX_OBSERVATION_BYTES,
+                    "native service query exceeded output bound"
+                );
+                bytes.extend_from_slice(&buffer[..size]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error).context("read native service query"),
+        }
     }
 }
 
@@ -463,240 +727,6 @@ fn launchd_snapshot(print: &str, enabled: &str, definition: &[u8]) -> Result<Ser
     })
 }
 
-/// Read-only native adapter. Candidate compatibility, exact process identity,
-/// and startup admission remain production integration gates.
-pub struct NativeService {
-    home: PathBuf,
-}
-
-impl NativeService {
-    pub fn new(home: impl Into<PathBuf>) -> Result<Self> {
-        let home = home.into();
-        ensure!(home.is_absolute(), "native service HOME must be absolute");
-        Ok(Self { home })
-    }
-}
-
-impl ServiceControl for NativeService {
-    fn snapshot(&mut self) -> Result<ServiceSnapshot> {
-        if cfg!(target_os = "linux") {
-            let show = observe("/usr/bin/systemctl", &[
-                "--user", "show", "ww.service", "--no-pager",
-                "--property=LoadState,UnitFileState,ActiveState,SubState,MainPID,Result,ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths,NeedDaemonReload",
-            ], COMMAND_TIMEOUT)?;
-            ensure!(
-                show.status.success(),
-                "systemd query failed: {}",
-                show.stderr.trim()
-            );
-            let initial = systemd_snapshot(&show.stdout, &[])?;
-            if !initial.registered {
-                return Ok(initial);
-            }
-            let configuration = observe(
-                "/usr/bin/systemctl",
-                &["--user", "cat", "ww.service", "--no-pager"],
-                COMMAND_TIMEOUT,
-            )?;
-            ensure!(
-                configuration.status.success(),
-                "cannot read effective systemd configuration: {}",
-                configuration.stderr.trim()
-            );
-            systemd_snapshot(&show.stdout, configuration.stdout.as_bytes())
-        } else if cfg!(target_os = "macos") {
-            // SAFETY: geteuid has no pointer arguments or preconditions.
-            let domain = format!("gui/{}", unsafe { libc::geteuid() });
-            let target = format!("{domain}/io.wetware.ww");
-            let print = observe("/bin/launchctl", &["print", &target], COMMAND_TIMEOUT)?;
-            let disabled = observe(
-                "/bin/launchctl",
-                &["print-disabled", &domain],
-                COMMAND_TIMEOUT,
-            )?;
-            ensure!(
-                disabled.status.success(),
-                "launchd domain state is unavailable: {}",
-                disabled.stderr.trim()
-            );
-            let enabled = launchd_enabled(&disabled.stdout)?;
-            let definition_path = self.home.join("Library/LaunchAgents/io.wetware.ww.plist");
-            let definition = read_definition(&definition_path)?;
-            if !print.status.success() {
-                // Missing domains and failed manager queries must never be
-                // interpreted as proof that a service is absent.
-                let uid = domain.strip_prefix("gui/").expect("constructed domain");
-                let absent_message = format!("Bad request.\nCould not find service \"io.wetware.ww\" in domain for user gui: {uid}\n");
-                ensure!(
-                    print.status.code() == Some(113)
-                        && print.stdout.is_empty()
-                        && print.stderr == absent_message,
-                    "launchd service state is unknown: {}",
-                    print.stderr.trim()
-                );
-                let Some(definition) = definition else {
-                    return Ok(absent(disabled.stdout.as_bytes()));
-                };
-                let (executable, default_enabled) = plist_settings(&definition_path)?;
-                return Ok(ServiceSnapshot {
-                    registered: false,
-                    enabled: if enabled == EnabledState::Unknown {
-                        default_enabled
-                    } else {
-                        enabled
-                    },
-                    running: RunningState::Stopped,
-                    failed: false,
-                    executable: Some(executable),
-                    configuration_identity: fingerprint(&[&definition]),
-                });
-            }
-            let definition = definition.context(
-                "loaded launchd service has no recognized definition; service state is ambiguous",
-            )?;
-            let fields = launchd_fields(&print.stdout)?;
-            ensure!(
-                fields.get("path").map(Path::new) == Some(definition_path.as_path()),
-                "loaded launchd service uses a different definition path"
-            );
-            let (executable, default_enabled) = plist_settings(&definition_path)?;
-            let mut snapshot = launchd_snapshot(&print.stdout, &disabled.stdout, &definition)?;
-            ensure!(
-                snapshot.executable.as_ref() == Some(&executable),
-                "launchd program differs from the pending service definition"
-            );
-            if snapshot.enabled == EnabledState::Unknown {
-                snapshot.enabled = default_enabled;
-            }
-            Ok(snapshot)
-        } else {
-            bail!("native service observation supports only per-user systemd and launchd")
-        }
-    }
-
-    fn admit_restart(&mut self, _before: &ServiceSnapshot) -> Result<RestartAdmission> {
-        bail!("live Host upgrade requires reliable captured startup inputs and child-side admission; explicitly stop the managed service before upgrading")
-    }
-
-    fn revalidate_restart(&mut self, _admission: &RestartAdmission) -> Result<()> {
-        bail!("native restart recovery requires reliable captured startup inputs and child-side admission; explicitly stop the managed service and resolve the pending transaction")
-    }
-
-    fn restart(
-        &mut self,
-        _admission: &RestartAdmission,
-        _expected: &ArtifactIdentity,
-        _deadline: Instant,
-    ) -> Result<RunningEvidence> {
-        bail!(
-            "native restart is gated on startup admission and exact running-artifact qualification"
-        )
-    }
-
-    fn stop(&mut self, _deadline: Instant) -> Result<()> {
-        bail!("native service mutation is not qualified; explicitly stop the managed service and verify its state")
-    }
-
-    fn compatible(&mut self, _artifact: &ArtifactIdentity, _executable: &Path) -> Result<()> {
-        bail!("native Host upgrade requires the selected candidate's compatibility check against the current effective deployment; production integration is unavailable")
-    }
-}
-
-#[derive(Debug)]
-struct Observation {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-fn observe(program: &str, args: &[&str], timeout: Duration) -> Result<Observation> {
-    ensure!(
-        !timeout.is_zero(),
-        "native observation deadline must be positive"
-    );
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .context("native observation deadline overflow")?;
-    let mut child = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("start native service query {program}"))?;
-    let result = (|| {
-        let mut stdout = child
-            .stdout
-            .take()
-            .context("native query stdout unavailable")?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .context("native query stderr unavailable")?;
-        for descriptor in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
-            // SAFETY: descriptors are owned by the live ChildStdout/ChildStderr
-            // values. fcntl reads/changes descriptor flags without pointers.
-            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-            ensure!(flags >= 0, "read native query pipe flags");
-            ensure!(
-                unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
-                "set native query pipe nonblocking"
-            );
-        }
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        loop {
-            ensure!(
-                Instant::now() < deadline,
-                "native service query exceeded deadline"
-            );
-            read_available(&mut stdout, &mut out, deadline)?;
-            read_available(&mut stderr, &mut err, deadline)?;
-            if let Some(status) = child.try_wait().context("inspect native query process")? {
-                // The final kernel pipe buffers may have filled after the
-                // previous read and before process exit.
-                read_available(&mut stdout, &mut out, deadline)?;
-                read_available(&mut stderr, &mut err, deadline)?;
-                return Ok(Observation {
-                    status,
-                    stdout: String::from_utf8(out).context("native query stdout is not UTF-8")?,
-                    stderr: String::from_utf8(err).context("native query stderr is not UTF-8")?,
-                });
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    })();
-    if result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    result
-}
-
-fn read_available(reader: &mut impl Read, bytes: &mut Vec<u8>, deadline: Instant) -> Result<()> {
-    let mut buffer = [0u8; 4096];
-    loop {
-        ensure!(
-            Instant::now() < deadline,
-            "native service query exceeded deadline"
-        );
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(size) => {
-                ensure!(
-                    bytes.len() + size <= MAX_OBSERVATION_BYTES,
-                    "native service query exceeded output bound"
-                );
-                bytes.extend_from_slice(&buffer[..size]);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
-            Err(error) => return Err(error).context("read native service query"),
-        }
-    }
-}
-
 fn read_definition(path: &Path) -> Result<Option<Vec<u8>>> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = match std::fs::OpenOptions::new()
@@ -724,14 +754,14 @@ fn read_definition(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-fn plist_settings(path: &Path) -> Result<(PathBuf, EnabledState)> {
+fn plist_settings(path: &Path, deadline: Instant) -> Result<(PathBuf, EnabledState)> {
     let path = path
         .to_str()
         .context("launchd definition path is not UTF-8")?;
-    let output = observe(
+    let output = observe_until(
         "/usr/bin/plutil",
         &["-convert", "json", "-o", "-", "--", path],
-        COMMAND_TIMEOUT,
+        deadline,
     )?;
     ensure!(
         output.status.success(),
@@ -770,6 +800,20 @@ fn plist_settings(path: &Path) -> Result<(PathBuf, EnabledState)> {
     ))
 }
 
+#[cfg(test)]
+fn observe(program: &str, args: &[&str], timeout: Duration) -> Result<Observation> {
+    ensure!(
+        !timeout.is_zero(),
+        "native observation deadline must be positive"
+    );
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("native observation deadline overflow")?;
+    observe_until(program, args, deadline)
+}
+
+#[cfg(test)]
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,8 +957,8 @@ mod tests {
         }
     }
 
-    fn admission() -> RestartAdmission {
-        RestartAdmission {
+    fn admission() -> LegacyRestartAdmission {
+        LegacyRestartAdmission {
             prior_pid: 321,
             configuration_identity: "captured-service".into(),
             startup: StartupIdentity {
@@ -952,7 +996,7 @@ mod tests {
     fn running_evidence_requires_exact_artifact_startup_and_readiness() {
         let admitted = admission();
         let expected = artifact();
-        let good = RunningEvidence {
+        let good = LegacyRunningEvidence {
             pid: 322,
             artifact: expected.clone(),
             startup: admitted.startup.clone(),
@@ -983,22 +1027,6 @@ mod tests {
             }
             assert!(wrong.verify(&admitted, &expected).is_err(), "{pending}");
         }
-    }
-
-    #[test]
-    fn native_adapter_cannot_claim_compatibility_or_live_admission() {
-        let home = tempfile::tempdir().unwrap();
-        let mut service = NativeService::new(home.path()).unwrap();
-        assert!(service.admit_restart(&before()).is_err());
-        assert!(service.revalidate_restart(&admission()).is_err());
-        assert!(service
-            .compatible(&artifact(), &home.path().join("candidate"))
-            .is_err());
-        assert!(service
-            .restart(&admission(), &artifact(), Instant::now())
-            .is_err());
-        assert!(service.stop(Instant::now()).is_err());
-        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -1061,9 +1089,9 @@ mod tests {
     #[ignore = "reads the real per-user manager; run explicitly for platform evidence"]
     fn native_manager_observation() {
         let home = dirs::home_dir().unwrap();
-        let mut service = NativeService::new(home).unwrap();
+        let mut service = NativeService::new(home);
         let observed = service
-            .snapshot()
+            .snapshot(Instant::now() + COMMAND_TIMEOUT)
             .expect("native manager read-only observation");
         eprintln!(
             "registered={} enabled={:?} running={:?} failed={} executable={:?}",
@@ -1095,5 +1123,156 @@ mod tests {
         // test-owned and the mode is a valid permission mask.
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         assert!(read_definition(&fifo).is_err());
+    }
+}
+
+/// Ordinary daemon lifecycle observation. This accepts the existing supported
+/// development/package invocations without granting native replacement support.
+pub fn lifecycle_snapshot(home: &Path, deadline: Instant) -> Result<ServiceSnapshot> {
+    if cfg!(target_os = "linux") {
+        let show = observe_until("/usr/bin/systemctl", &[
+                "--user", "show", "ww.service", "--no-pager",
+                "--property=LoadState,UnitFileState,ActiveState,SubState,MainPID,Result,ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths,NeedDaemonReload",
+            ], deadline)?;
+        ensure!(
+            show.status.success(),
+            "systemd query failed: {}",
+            show.stderr.trim()
+        );
+        let initial = systemd_snapshot(&show.stdout, &[])?;
+        if !initial.registered {
+            return Ok(initial);
+        }
+        let configuration = observe_until(
+            "/usr/bin/systemctl",
+            &["--user", "cat", "ww.service", "--no-pager"],
+            deadline,
+        )?;
+        ensure!(
+            configuration.status.success(),
+            "cannot read effective systemd configuration: {}",
+            configuration.stderr.trim()
+        );
+        systemd_snapshot(&show.stdout, configuration.stdout.as_bytes())
+    } else if cfg!(target_os = "macos") {
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let domain = format!("gui/{}", unsafe { libc::geteuid() });
+        let target = format!("{domain}/io.wetware.ww");
+        let print = observe_until("/bin/launchctl", &["print", &target], deadline)?;
+        let disabled = observe_until("/bin/launchctl", &["print-disabled", &domain], deadline)?;
+        ensure!(
+            disabled.status.success(),
+            "launchd domain state is unavailable: {}",
+            disabled.stderr.trim()
+        );
+        let enabled = launchd_enabled(&disabled.stdout)?;
+        let definition_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
+        let definition = read_definition(&definition_path)?;
+        if !print.status.success() {
+            // Missing domains and failed manager queries must never be
+            // interpreted as proof that a service is absent.
+            let uid = domain.strip_prefix("gui/").expect("constructed domain");
+            let absent_message = format!("Bad request.\nCould not find service \"io.wetware.ww\" in domain for user gui: {uid}\n");
+            ensure!(
+                print.status.code() == Some(113)
+                    && print.stdout.is_empty()
+                    && print.stderr == absent_message,
+                "launchd service state is unknown: {}",
+                print.stderr.trim()
+            );
+            let Some(definition) = definition else {
+                return Ok(absent(disabled.stdout.as_bytes()));
+            };
+            let (executable, default_enabled) = plist_settings(&definition_path, deadline)?;
+            return Ok(ServiceSnapshot {
+                registered: false,
+                enabled: if enabled == EnabledState::Unknown {
+                    default_enabled
+                } else {
+                    enabled
+                },
+                running: RunningState::Stopped,
+                failed: false,
+                executable: Some(executable),
+                configuration_identity: fingerprint(&[&definition]),
+            });
+        }
+        let definition = definition.context(
+            "loaded launchd service has no recognized definition; service state is ambiguous",
+        )?;
+        let fields = launchd_fields(&print.stdout)?;
+        ensure!(
+            fields.get("path").map(Path::new) == Some(definition_path.as_path()),
+            "loaded launchd service uses a different definition path"
+        );
+        let (executable, default_enabled) = plist_settings(&definition_path, deadline)?;
+        let mut snapshot = launchd_snapshot(&print.stdout, &disabled.stdout, &definition)?;
+        ensure!(
+            snapshot.executable.as_ref() == Some(&executable),
+            "launchd program differs from the pending service definition"
+        );
+        if snapshot.enabled == EnabledState::Unknown {
+            snapshot.enabled = default_enabled;
+        }
+        Ok(snapshot)
+    } else {
+        bail!("native service observation supports only per-user systemd and launchd")
+    }
+}
+
+#[cfg(test)]
+mod manager_lock_tests {
+    use super::*;
+    use crate::installation_state::MutationLock;
+    #[test]
+    #[ignore = "worker for managed-command owner crash test"]
+    fn command_owner_worker() {
+        let home = PathBuf::from(std::env::var_os("WW_COMMAND_LOCK_HOME").unwrap());
+        let mutation = MutationLock::acquire(&home).unwrap();
+        let script="printf ready > \"$1/ready\"; n=0; while [ ! -f \"$1/release\" ] && [ $n -lt 400 ]; do sleep 0.01; n=$((n+1)); done; printf effect > \"$1/effect\"";
+        action_until(
+            "/bin/sh",
+            &["-c", script, "fixture", home.to_str().unwrap()],
+            &mutation,
+            Instant::now() + Duration::from_secs(8),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn pending_manager_command_retains_mutation_lock_after_owner_crash() {
+        let home = tempfile::tempdir().unwrap();
+        let mut owner = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "upgrade::service::manager_lock_tests::command_owner_worker",
+                "--ignored",
+            ])
+            .env("WW_COMMAND_LOCK_HOME", home.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while !home.path().join("ready").exists() {
+            assert!(owner.try_wait().unwrap().is_none());
+            assert!(Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        let still_owned = MutationLock::acquire(home.path()).is_err();
+        std::fs::write(home.path().join("release"), b"release").unwrap();
+        while !home.path().join("effect").exists() {
+            assert!(Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        while MutationLock::acquire(home.path()).is_err() {
+            assert!(Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            still_owned,
+            "a late manager request must exclude a second mutation owner after parent crash"
+        );
     }
 }

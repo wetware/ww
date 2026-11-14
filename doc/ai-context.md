@@ -89,8 +89,9 @@ capability protocol over bearer tokens in args/env.
 Software lifecycle boundaries:
 - `install`: Host, baseline FHS, and identity; no daemon or namespace publication.
 - `image update`: authenticated baseline only; no native replacement or restart.
-- `upgrade`: authenticated native selection through #739; native operational
-  compatibility and restart admission still gate actual replacement.
+- `upgrade`: `UpgradeCoordinator` authenticates, stages, stops, replaces, restarts,
+  checks loopback readiness, and commits or recovers. Automatic replacement is
+  limited to managed GNU ARM64 Linux/systemd. Ordinary startup ignores native journals.
 - `uninstall`: owned software and service removal; preserve private user state.
 - `daemon install/uninstall`: disabled registration or checked removal with backup.
 

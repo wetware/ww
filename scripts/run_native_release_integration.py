@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Offline disposable-account helpers; live orchestration is unavailable in PR 2.
+"""Provision one disposable GNU ARM64 integration account on a systemd VM.
 
 Package fixtures use ephemeral keys, never publication or production credentials.
-Account creation and live qualification require the reviewed PR 3 implementation.
+Run only on a disposable runner with real systemd PID 1.
 """
 
+import argparse
 import json
 import os
 from pathlib import Path
+import platform
 import pwd
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 from release_auth_fixture import generate_key, sign_manifest
-from qualify_native_upgrade import Runner, custody, require, sha256, unavailable
+from qualify_native_upgrade import Runner, custody, require, sha256, verify_producer_files
+from prepare_current_native_release import PAIR_POLICY, verify_build_files, pair_source_roles, validate_pair_roles
 
 MAX_EVIDENCE = 256 * 1024 * 1024
 
@@ -107,6 +112,18 @@ def verify_fhs(inputs, record):
                     "copied original FHS differs: " + name)
 
 
+def verify_current_builds(inputs, record, owner=0):
+    require(record.get("schema") == 2 and record.get("policy") == PAIR_POLICY
+            and set(record["current_builds"]) == {"a", "b"}, "requires two reduced current-contract builds")
+    require(record["source_roles"] == pair_source_roles(), "copied pair source authority differs from actual final harness")
+    validate_pair_roles(record["current_builds"], record["source_roles"])
+    for slot in ("a", "b"):
+        require(verify_build_files(inputs / slot, "release", owner=owner) == record["current_builds"][slot],
+                "copied current build receipt differs from verified input")
+    require(record["current_builds"]["a"]["host"]["sha256"] != record["current_builds"]["b"]["host"]["sha256"],
+            "current copied builds must contain distinct executable bytes")
+
+
 def quiesce_account(account):
     """Reap detached fixture sessions before copying evidence or releasing its UID."""
     killed = []
@@ -144,6 +161,7 @@ def quiesce_account(account):
 class Provisioner:
     def __init__(self, output):
         self.output = output
+        self.account = None
         self.runner = Runner(output, output, 90)
         self.runner.env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
         self.deadline = time.monotonic() + 55 * 60
@@ -160,6 +178,43 @@ class Provisioner:
         return subprocess.CompletedProcess(argv, receipt["exit"],
             (self.output / receipt["stdout"]).read_bytes(),
             (self.output / receipt["stderr"]).read_bytes())
+
+    def create_account(self, username, home):
+        try:
+            pwd.getpwnam(username)
+        except KeyError:
+            pass
+        else:
+            raise RuntimeError("generated fixture account already exists")
+        try:
+            self.run("create-account", ["useradd", "--create-home", "--home-dir", home,
+                                       "--shell", "/bin/sh", username])
+        finally:
+            # Retain identity even when useradd fails after creating passwd state.
+            try:
+                created = pwd.getpwnam(username)
+            except KeyError:
+                pass
+            else:
+                require(created.pw_uid >= 1000 and created.pw_dir == str(home), "created account differs")
+                self.account = created
+        require(self.account is not None, "useradd did not create the fixture account")
+        home.chmod(0o700)
+        return self.account
+
+    def start_user_manager(self, account):
+        self.run("start-user-manager", ["systemctl", "start", f"user@{account.pw_uid}.service"])
+        runtime = f"/run/user/{account.pw_uid}"
+        deadline = time.monotonic() + 15
+        while True:
+            result = self.run("user-bus-ready", ["runuser", "-u", account.pw_name, "--", "busctl",
+                "--address=unix:path=" + runtime + "/bus", "call", "org.freedesktop.DBus",
+                "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s",
+                "org.freedesktop.systemd1"], timeout=5, check=False)
+            if result.returncode == 0 and result.stdout.strip() == b"b true":
+                return runtime
+            require(time.monotonic() < deadline, "user manager did not acquire its bus name")
+            time.sleep(0.1)
 
     def packages(self, inputs, output, tool):
         output.mkdir(mode=0o755)
@@ -209,7 +264,8 @@ class Provisioner:
                 require(identity == verified, "package roundtrip identity differs")
                 require(sha256(binary) == sha256(original / "ww"), "packaged Host changed")
                 receipt["release_" + label] = identity["root"]
-                receipt[label] = {"identity": identity, "host_sha256": sha256(binary),
+                receipt[label] = {"identity": identity, "version": metadata["version"],
+                                  "host_sha256": sha256(binary),
                                   "car_sha256": sha256(folder / "release.car"),
                                   "provenance": provenance}
         finally:
@@ -223,8 +279,131 @@ class Provisioner:
 
 
 def main():
-    # PR 3 must restore orchestration with the reviewed runtime and CI policy.
-    return unavailable()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--inputs", type=Path, required=True)
+    parser.add_argument("--package-tool", type=Path, required=True)
+    parser.add_argument("--ipfs", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--timeout-secs", type=int, required=True)
+    parser.add_argument("--disposable-runner", action="store_true", required=True)
+    args = parser.parse_args()
+    inherited_umask = os.umask(0o022)
+    require(os.geteuid() == 0 and platform.system() == "Linux"
+            and platform.machine() == "aarch64", "requires root on disposable native GNU ARM64")
+    require(Path("/proc/1/comm").read_text().strip() == "systemd", "requires actual systemd PID 1")
+    require(0 < args.timeout_secs <= 120, "explicit native operation budget must be 1..120 seconds")
+    for path in (args.inputs, args.package_tool, args.ipfs):
+        require(path.is_absolute() and path.resolve(strict=True) == path, "inputs must be canonical absolute paths")
+    require(args.output.is_absolute() and not args.output.exists(), "output must be a new absolute directory")
+    args.output.mkdir(mode=0o755, parents=True)
+    worker = Provisioner(args.output)
+    # Root owns this short parent; only h/ and t/ are writable by the fixture UID.
+    work = Path(tempfile.mkdtemp(prefix="w", dir="/tmp"))
+    work.chmod(0o755)
+    username = "ww739-" + uuid.uuid4().hex[:12]
+    account = None
+    marker = None
+    marker_identity = None
+    user_output = None
+    report = {"status": "FAILED", "native_acceptance": False,
+              "inherited_umask": oct(inherited_umask), "fixture_setup_umask": "0o022",
+              "wrong_executable_interception": "UNQUALIFIED; not attempted", "work": str(work)}
+    try:
+        code = work / "code"
+        code.mkdir(mode=0o755)
+        checkout = Path(__file__).resolve().parents[1]
+        for folder in ("scripts", "tests"):
+            regular_tree(checkout / folder, code / folder)
+        inputs = work / "inputs"
+        regular_tree(args.inputs, inputs)
+        record = json.loads((inputs / "verified-inputs.json").read_text())
+        require(record.get("schema") == 2 and record.get("policy") == PAIR_POLICY,
+                "requires two reduced current-contract inputs")
+        report["input_policy"] = record["policy"]
+        report["slot_identities"] = record["slot_identities"]
+        for label in ("a", "b"):
+            record[label]["path"] = str(inputs / label / "ww")
+            record[label]["archive_path"] = str(inputs / (label + ".zip"))
+            verify_producer_files(record[label], "aarch64-unknown-linux-gnu", 0)
+        write_json(inputs / "verified-inputs.json", record)
+        verify_fhs(inputs, record)
+        verify_current_builds(inputs, record)
+        tools = work / "tools"
+        tools.mkdir(mode=0o755)
+        for source, name in ((args.package_tool, "ww-release-package"), (args.ipfs, "ipfs")):
+            shutil.copyfile(source, tools / name)
+            (tools / name).chmod(0o755)
+            require(sha256(source) == sha256(tools / name), "tool copy changed")
+        packages = worker.packages(inputs, work / "packages", tools / "ww-release-package")
+        home = work / "h"
+        try:
+            account = worker.create_account(username, home)
+        finally:
+            account = worker.account
+        temporary_root = work / "t"
+        temporary_root.mkdir(mode=0o700)
+        os.chown(temporary_root, account.pw_uid, account.pw_gid)
+        marker_dir = Path("/run/ww739-qualification")
+        marker_dir.mkdir(mode=0o755, exist_ok=True)
+        custody(marker_dir, 0, directory=True)
+        marker = marker_dir / f"{account.pw_uid}.json"
+        marker_identity = create_marker(marker, {"version": 2, "purpose": "disposable-native-upgrade",
+            "input_policy": PAIR_POLICY, "input_manifest_sha256": sha256(inputs / "verified-inputs.json"),
+            "uid": account.pw_uid, "home": str(home), "platform": "linux-aarch64",
+            "release_a": packages["release_a"], "release_b": packages["release_b"],
+            "a": record["a"], "b": record["b"]})
+        report.update(uid=account.pw_uid, username=username, home=str(home),
+                      packages=packages, producer_receipts={k: record[k] for k in ("a", "b")})
+        runtime = worker.start_user_manager(account)
+        worker.run("environment", ["sh", "-c", "uname -a; ldd --version; systemd --version; cat /etc/os-release"])
+        user_output = home / "evidence"
+        command = ["runuser", "-u", username, "--", "env", "-i", "HOME=" + str(home),
+            "USER=" + username, "LOGNAME=" + username, "LANG=C.UTF-8",
+            "XDG_RUNTIME_DIR=" + runtime, "PATH=" + str(tools) + ":/usr/bin:/bin",
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=" + runtime + "/bus",
+            "PYTHONDONTWRITEBYTECODE=1", "sh", "-c", 'cd "$HOME" && exec "$@"',
+            "ww739-release-integration", "python3", str(code / "tests/native_release_integration.py"),
+            "--inputs", str(inputs), "--packages", str(work / "packages"),
+            "--package-tool", str(tools / "ww-release-package"), "--output", str(user_output),
+            "--temporary-root", str(temporary_root),
+            "--timeout-secs", str(args.timeout_secs)]
+        result = worker.run("user-integration", command, timeout=3000, check=False)
+        report["user_exit"] = result.returncode
+        require(result.returncode == 0, "user integration failed; retained result remains failed")
+        report["status"] = "PASS_IMPLEMENTED_INTEGRATION_CONTRACT"
+    except Exception as error:
+        report["error"] = str(error)
+    finally:
+        # Reserve a separate bounded cleanup window after the normal run budget.
+        worker.deadline = time.monotonic() + 180
+        cleanup = []
+        if account is not None:
+            try:
+                require(pwd.getpwnam(username) == account, "fixture account identity changed")
+                worker.run("stop-user-manager", ["systemctl", "stop", f"user@{account.pw_uid}.service"])
+                report["cleanup_killed_pids"] = quiesce_account(account)
+                if user_output is not None and user_output.exists():
+                    report["evidence_sha256"] = copy_evidence(user_output, args.output / "user")
+                worker.run("delete-account", ["userdel", username])
+            except Exception as error:
+                cleanup.append(str(error))
+        if marker_identity is not None:
+            try:
+                info = custody(marker, 0)
+                require((info.st_dev, info.st_ino, sha256(marker)) == marker_identity,
+                        "owned qualification marker identity changed")
+                marker.unlink()
+            except Exception as error:
+                cleanup.append(str(error))
+        if not cleanup:
+            shutil.rmtree(work)
+        report["cleanup_errors"] = cleanup
+        report["fixture_directory_removed"] = not work.exists()
+        if cleanup:
+            report["status"] = "FAILED"
+        write_json(args.output / "provision-result.json", report)
+    print(json.dumps({"status": report["status"], "result": str(args.output / "provision-result.json")}))
+    return 0 if report["status"] == "PASS_IMPLEMENTED_INTEGRATION_CONTRACT" else 1
 
 
 if __name__ == "__main__":

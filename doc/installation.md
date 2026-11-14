@@ -37,25 +37,39 @@ installation. Existing valid identity remains unchanged; malformed identity or
 missing identity in a recorded installation causes refusal.
 
 Installation does not register a daemon, create `etc/ns/ww`, import a standard
-namespace, publish a name, or contact Kubo after the package is staged. Existing
-namespace and service configuration remains unchanged. Private identity, keys,
+namespace, or publish a name. Existing namespace and service configuration
+remains unchanged. Private identity, keys,
 IPNS records, watermarks, caches, logs, and application data stay outside the FHS.
 
 The native bootstrap handoff reauthenticates the staged manifest with the
-independent keyring before parsing or installing component payloads.
+independent keyring before parsing or installing component payloads. It also
+fetches the immutable release descriptor metadata through the shared native
+HTTP release selector after shell staging; staged payloads alone do not supply
+the complete retained proof.
 `ww install --release <CID>` authenticates an immutable release through the
 shared release descriptor and installs its selected platform Host and FHS.
 `--trusted-release-keys` defaults to `/etc/wetware/release-keys`.
 `--check` validates without installing; `--json` prints one versioned result.
 
+The shell stages bytes with the configured `ipfs` CLI. Native installation and
+recovery use the Kubo HTTP endpoint selected by `--ipfs-url`, then `IPFS_API`,
+then `http://localhost:5001`. The shell's `--ipfs-url` is forwarded to those
+native calls; it does not reconfigure the shell's `ipfs` CLI. Configure both
+paths when using a nondefault Kubo, for example:
+
+```sh
+# First configure the ipfs CLI to reach the intended Kubo daemon.
+sh scripts/install.sh --release <CID> --ipfs-url http://127.0.0.1:55001
+```
+
 ## Separate software and service operations
 
 | Command | Effect |
 |---|---|
-| `ww install` | Create or repair the same recorded Host/FHS package and identity. No service registration or publication. |
+| `ww install --release <CID>` | Create the authenticated Host/FHS package and identity, or repair the exact recorded package. No service registration or publication. |
 | `ww image update --release <CID>` | Authenticate and update only the owned baseline FHS. No Host replacement or restart. |
-| `ww upgrade --release <CID>` | Authenticate native selection and enter the #739 engine. Native replacement remains blocked by the operational gates below. |
-| `ww upgrade --rollback` | Request retained native recovery through the same engine and admission gates. |
+| `ww upgrade --release <CID>` | Authenticate native selection through `UpgradeCoordinator`; changed operations require an explicit timeout and supported managed service. |
+| `ww upgrade --rollback` | Restore the authenticated retained native generation through the same coordinator. |
 | `ww uninstall` | Remove owned software and daemon registration; preserve user state and recovery evidence. |
 | `ww daemon install [RUN OPTIONS] [MOUNT...]` | Register a disabled service using existing identity and startup paths. No image import or identity generation. |
 | `ww daemon uninstall` | Stop/unload, disable, verify, back up configuration, then remove owned registration. |
@@ -64,38 +78,35 @@ shared release descriptor and installs its selected platform Host and FHS.
 no top-level `update`. Deployment following remains `run --stem` or
 `run --ipns-stem`; publishers retain authority to advance those sources.
 
-Register a service separately, with the same options as `run`:
+Register a service separately, then use the native service manager to start it.
+Installation and registration do not start the Host or enable login activation.
+For Linux:
 
 ```sh
-ww daemon install --http-listen 127.0.0.1:2080
-```
-
-A fresh registration is disabled and stopped. An identical owned registration
-preserves manager state. A different existing definition causes refusal; remove
-registration explicitly before reconfiguring. Custom identity must already
-exist. Generate a new key at an unused path with `ww keygen --output PATH`.
-The service stores absolute local paths and explicit environment-derived options.
-There is no daemon-only default HTTP listener.
-
-On Linux, activate explicitly:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now ww
+ww daemon install
+systemctl --user start ww.service
 ww healthcheck --ready
+# Optional login activation:
+systemctl --user enable ww.service
 ```
+
+Generated Linux units use the user manager's resolved home as their working
+directory. Custom settings remain unchanged. Automatic native replacement requires
+supported GNU ARM64 systemd configuration and a fixed loopback `/readyz` endpoint.
+No stopped startup admission or private readiness protocol is required.
 
 On macOS, use the logged-in GUI domain:
 
 ```sh
+ww daemon install
 launchctl enable "gui/$(id -u)/io.wetware.ww"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.wetware.ww.plist"
 ww healthcheck --ready
 ```
 
 Registration requires that GUI domain; there is no implicit headless fallback.
-The plist and persistent launchd override both disable fresh registration.
-Service-manager acceptance does not prove Host readiness.
+macOS automatic native replacement remains unsupported. Service-manager
+acceptance alone does not prove Host readiness.
 
 ## Existing files and recovery
 
@@ -104,6 +115,10 @@ to `upgrade`. It refuses a different FHS package and directs the operator to
 `image update`. Re-running a newer shell installer cannot bypass these checks.
 Same-artifact repair can restore missing owned software; unknown collisions,
 symlinks, and altered owned files cause refusal. Unknown FHS files remain intact.
+Select the recorded package with `ww install --release <RECORDED_ROOT>` or rerun
+its signed shell bootstrap. Exact-byte reinstall preserves accepted native
+provenance. Existing installations without native proof need explicit baseline
+repair before a changed upgrade.
 
 Version-2 `installation.json` names executable and FHS ownership separately.
 It retains legacy namespace/service hashes as provenance. Complete version-1
@@ -120,8 +135,9 @@ incomplete ownership and pending FHS updates.
 `image update` runs with the installed Host so production static validation uses
 that Host's engine. It retains both complete baseline generations under
 `.fhs-recovery/` and records `image-update.json` before replacing either file.
-Startup holds `~/.ww-installation.lock` through managed baseline capture. A
-running Host keeps its previously captured baseline.
+Startup holds a shared `~/.ww-fhs.lock` guard through local baseline capture.
+FHS writers acquire `MutationLock` before the exclusive FHS guard. A running Host
+keeps its previously captured baseline without holding either lock.
 
 After interruption, repeat `ww image update`. Recovery finishes the recorded
 target when retained bytes verify, otherwise restores the retained previous
@@ -155,8 +171,8 @@ delegates to the installed `ww uninstall`; it has no separate purge behavior.
 For a pending Host transaction whose installed executable cannot launch, use:
 
 ```sh
-sh scripts/install.sh --recover
-sh scripts/install.sh --recover --release <RECORDED_RELEASE_CID>
+sh scripts/install.sh --recover --timeout-secs N
+sh scripts/install.sh --recover --release <RECORDED_RELEASE_CID> --timeout-secs N
 ```
 
 Recovery requires an existing `host-upgrade.json`. The default locator is the
@@ -165,35 +181,52 @@ when that locator is unavailable. The shell binds the authenticated manifest to
 the requested root and verifies the Host bytes before invoking the native
 recovery-only entry point. The native entry point
 holds the installation lock, reauthenticates the typed release, verifies its own
-executable bytes, and matches the recorded generation before calling `Engine::recover`.
+executable bytes, and matches the recorded generation before calling `UpgradeCoordinator::recover`.
 It never falls through to fresh installation or new-release selection.
 
-The shell uses the configured Kubo CLI for staging. Native reauthentication uses
-`--ipfs-url`, `IPFS_API`, or `http://localhost:5001`, in that order. Configure both
-endpoints when using a nondefault Kubo. The recorded release must contain a Host
+Native recovery supports recorded managed-service transactions. The native
+recovery command does not accept a standalone `run` invocation:
+
+```sh
+/path/to/authenticated/ww upgrade --recover-only --release <RECOVERY_EXECUTABLE_CID> \
+  --timeout-secs N
+```
+
+The CID authenticates the executable running recovery; the journal selects the
+restored generation. Use the installation's HOME and independent trust keys.
+See the [explicit native recovery form](native-upgrades.md#recovery-and-explicit-repair).
+
+Shell staging and native HTTP reauthentication use the separate endpoint scopes
+described above. The recorded release must contain a Host
 with this recovery entry point. Missing, incompatible, or unrelated artifacts
 cause refusal. Recovery preserves the native operational gates below.
 
-## Native upgrade integration gates
+## Native replacement and recovery gates
 
-`upgrade` now consumes authenticated descriptor selection and the #739 engine.
-A new `install --release` stores an untrusted release-CID locator; every upgrade
-reauthenticates that release and verifies the installed bytes. Legacy and local
-bootstrap installations without that locator cannot substitute ownership hashes
-for release authentication.
+Ordinary startup does not read native-upgrade journals or require admission.
+A damaged journal blocks native replacement and remains available for explicit
+repair. FHS capture takes a short shared guard; FHS writers take `MutationLock`
+then the exclusive FHS guard. The capture worker releases its guard before
+network publication and Host execution.
 
-Native replacement remains unavailable: `NativeService` refuses candidate
-compatibility and live restart admission. No CLI flag bypasses those checks.
-Exact authenticated no-ops and permitted recorded recovery can complete without
-replacement. Automatic channel discovery also remains unavailable until an
-independently trusted raw IPNS channel identity is provisioned; explicit
-`--release CID` does not lower a channel freshness floor.
+Changed native upgrade, rollback, recovery, and repair require a positive
+`--timeout-secs N`. `UpgradeCoordinator` retains independent signed release proofs,
+exact staged and rollback bytes, durable before/after records, and journal-last
+cleanup. Automatic replacement supports managed GNU ARM64 Linux/systemd only.
+A running service requires a fixed loopback `/readyz` endpoint. Unsupported
+configuration refuses before mutation; custom configuration remains unchanged.
 
-Retained signed evidence, atomic native-provenance transition, effective-deployment
-compatibility, child-side startup admission, exact running artifact/readiness,
-and measured restart deadlines remain integration gates. See
-[native Host replacement](native-upgrades.md). The installer is not an upgrade
-fallback, and CLI implementation does not authorize a production rollout.
+`ww upgrade --repair-baseline --release INSTALLED_CID --timeout-secs N` authenticates
+current bytes and repairs damaged metadata without replacing the executable or
+restarting the service. Missing historical rollback requires explicit
+`--acknowledge-missing-rollback`. Repair preserves damaged evidence and never
+invents signed provenance. Known valid transactions use ordinary recovery.
+
+Automatic channel discovery still requires independently trusted channel
+freshness. Explicit historic selection does not lower a freshness floor. See
+[native replacement and recovery](native-upgrades.md) for trust, durability,
+service observations, repair, and qualification limits. No operation authorizes
+production activation or publication.
 
 ## Build and container contract
 

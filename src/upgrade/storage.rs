@@ -18,6 +18,8 @@ pub(super) struct Paths {
     pub retained: PathBuf,
     pub receipt: PathBuf,
     pub store: PathBuf,
+    pub locator: PathBuf,
+    pub proofs: PathBuf,
 }
 
 impl Paths {
@@ -44,6 +46,8 @@ impl Paths {
             journal: root.join("host-upgrade.json"),
             retained: root.join("host-upgrade-retained.json"),
             receipt: root.join("installation.json"),
+            locator: root.join("installed-release.json"),
+            proofs: store.join("proofs"),
             store,
         })
     }
@@ -138,6 +142,21 @@ pub fn read_record(path: &Path) -> Result<Option<Vec<u8>>> {
         "{} exceeds the 64 KiB record limit",
         path.display()
     );
+    Ok(Some(bytes))
+}
+
+pub(super) fn read_private_record(path: &Path) -> Result<Option<Vec<u8>>> {
+    if !exists(path)? {
+        return Ok(None);
+    }
+    let file = open_read(path)?;
+    ensure!(
+        file.metadata()?.mode() & 0o177 == 0,
+        "native record must be private and non-executable"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_RECORD, "native record exceeds 64 KiB");
     Ok(Some(bytes))
 }
 
@@ -369,5 +388,257 @@ pub(super) mod faults {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+
+    #[test]
+    fn proof_storage_is_bounded_immutable_and_private() {
+        faults::configure(None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proof");
+        write_proof(&path, b"retained signed envelope").unwrap();
+        assert_eq!(read_proof(&path).unwrap(), b"retained signed envelope");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        write_proof(&path, b"retained signed envelope").unwrap();
+        assert!(write_proof(&path, b"different signed envelope").is_err());
+        assert_eq!(read_proof(&path).unwrap(), b"retained signed envelope");
+        assert!(write_proof(&dir.path().join("too-large"), &vec![0; MAX_PROOF + 1]).is_err());
+        assert!(!dir.path().join("too-large").exists());
+        let large = dir.path().join("oversize-read");
+        std::fs::write(&large, vec![0; MAX_PROOF + 1]).unwrap();
+        std::fs::set_permissions(&large, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_proof(&large).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_proof(&path).is_err());
+    }
+
+    #[test]
+    fn proof_storage_refuses_symlinks_and_hardlinks_without_target_changes() {
+        use std::os::unix::fs::symlink;
+        faults::configure(None);
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        write_proof(&original, b"preserved").unwrap();
+        let link = dir.path().join("link");
+        symlink(&original, &link).unwrap();
+        assert!(write_proof(&link, b"overwrite").is_err());
+        assert!(read_proof(&link).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::hard_link(&original, &link).unwrap();
+        assert!(write_proof(&link, b"overwrite").is_err());
+        assert!(read_proof(&link).is_err());
+        assert_eq!(std::fs::read(original).unwrap(), b"preserved");
+    }
+}
+
+const MAX_PROOF: usize = 8 * 1024 * 1024;
+
+pub(super) fn read_proof(path: &Path) -> Result<Vec<u8>> {
+    let file = open_read(path)?;
+    ensure!(
+        file.metadata()?.mode() & 0o177 == 0,
+        "retained proof must be private and non-executable"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_PROOF as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_PROOF, "retained proof exceeds 8 MiB");
+    Ok(bytes)
+}
+
+/// Persist one immutable authenticated envelope. A staged proof alone cannot
+/// authorize mutation; the coordinator records its association in the journal.
+/// Existing evidence is never overwritten merely because its filename matches.
+pub(super) fn write_proof(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_PROOF,
+        "retained proof must contain at most 8 MiB"
+    );
+    if exists(path)? {
+        ensure!(
+            read_proof(path)? == bytes,
+            "existing retained proof has different bytes"
+        );
+        // A prior process may have died after rename but before parent sync.
+        open_read(path)?.sync_all()?;
+        checkpoint("proof.reuse.sync.after")?;
+        sync_parent(path)?;
+        return Ok(());
+    }
+    let temporary = path.with_file_name(format!(
+        ".{}.pending",
+        path.file_name()
+            .context("proof filename")?
+            .to_string_lossy()
+    ));
+    if exists(&temporary)? {
+        let file = open_read(&temporary)?;
+        ensure!(
+            file.metadata()?.mode() & 0o177 == 0,
+            "pending proof must be private and non-executable"
+        );
+    }
+    checkpoint("proof.open.before")?;
+    let mut file = open_write(&temporary, false)?;
+    checkpoint("proof.open.after")?;
+    file.write_all(bytes)?;
+    checkpoint("proof.write.after")?;
+    file.sync_all()?;
+    checkpoint("proof.sync.after")?;
+    rename(&temporary, path)?;
+    ensure!(read_proof(path)? == bytes, "persisted proof changed");
+    Ok(())
+}
+
+impl Paths {
+    pub(super) fn proof(&self, reference: &super::provenance::ProofReference) -> Result<PathBuf> {
+        reference.validate()?;
+        Ok(self.proofs.join(&reference.root))
+    }
+
+    /// Create storage for independently authenticated evidence. Directory
+    /// creation alone grants no release authority.
+    pub(super) fn create_proof_directory(&self) -> Result<()> {
+        if !exists(&self.proofs)? {
+            checkpoint("proof.directory.before")?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&self.proofs)?;
+            checkpoint("proof.directory.after")?;
+        }
+        directory(&self.proofs)?;
+        ensure!(
+            std::fs::symlink_metadata(&self.proofs)?.mode() & 0o077 == 0,
+            "retained proof directory must be private"
+        );
+        sync_parent(&self.proofs)
+    }
+}
+
+/// Preserve damaged metadata verbatim, without parsing it or changing its source.
+/// Archive creation, file sync, and directory sync precede repair journal writes.
+pub(super) fn archive(source: &Path, target: &Path) -> Result<ArtifactIdentity> {
+    use sha2::Digest;
+    let mut input = open_read(source)?;
+    ensure!(
+        input.metadata()?.len() <= MAX_EXECUTABLE,
+        "damaged evidence exceeds archive bound; preserve and inspect manually"
+    );
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(target)?;
+    let mut hash = sha2::Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        size += count as u64;
+        ensure!(
+            size <= MAX_EXECUTABLE,
+            "damaged evidence exceeds archive bound"
+        );
+        hash.update(&buffer[..count]);
+        output.write_all(&buffer[..count])?;
+    }
+    output.sync_all()?;
+    sync_parent(target)?;
+    Ok(ArtifactIdentity {
+        algorithm: DigestAlgorithm::Sha256,
+        digest: hex::encode(hash.finalize()),
+        size,
+    })
+}
+
+pub(super) fn verify_archive(path: &Path, identity: &ArtifactIdentity) -> Result<()> {
+    use sha2::Digest;
+    let mut file = open_read(path)?;
+    ensure!(
+        file.metadata()?.len() == identity.size,
+        "repair evidence archive size changed"
+    );
+    let mut hash = sha2::Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let size = file.read(&mut buffer)?;
+        if size == 0 {
+            break;
+        }
+        count += size as u64;
+        ensure!(count <= identity.size, "repair evidence archive grew");
+        hash.update(&buffer[..size]);
+    }
+    ensure!(
+        count == identity.size && hex::encode(hash.finalize()) == identity.digest,
+        "repair evidence archive changed"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    #[test]
+    fn artifact_copy_checks_known_sha256_vector_size_and_corruption_at_buffer_boundaries() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let copy = dir.path().join("copy");
+        let known = ArtifactIdentity {
+            algorithm: DigestAlgorithm::Sha256,
+            digest: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size: 3,
+        };
+        stage(&b"abc"[..], &copy, &known).unwrap();
+        for size in [55, 56, 63, 64, 65, 65535, 65536, 65537, 131073] {
+            let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&source, &bytes).unwrap();
+            for algorithm in [DigestAlgorithm::Sha256, DigestAlgorithm::Blake3] {
+                let digest = match algorithm {
+                    DigestAlgorithm::Sha256 => hex::encode(sha2::Sha256::digest(&bytes)),
+                    DigestAlgorithm::Blake3 => blake3::hash(&bytes).to_hex().to_string(),
+                };
+                let identity = ArtifactIdentity {
+                    algorithm,
+                    digest,
+                    size: size as u64,
+                };
+                stage(open_read(&source).unwrap(), &copy, &identity).unwrap();
+                let mut changed = bytes.clone();
+                changed[size - 1] ^= 1;
+                std::fs::write(&copy, &changed).unwrap();
+                assert!(verify(&copy, &identity).is_err());
+                let mut wrong = identity.clone();
+                wrong.size += 1;
+                assert!(stage(open_read(&source).unwrap(), &copy, &wrong).is_err());
+            }
+        }
+    }
+    #[test]
+    fn artifact_open_refuses_symlinks_hardlinks_and_other_user_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"fixture").unwrap();
+        let link = dir.path().join("link");
+        symlink(&source, &link).unwrap();
+        assert!(open_read(&link).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::hard_link(&source, &link).unwrap();
+        assert!(open_read(&source).is_err());
+        std::fs::remove_file(&link).unwrap();
+        for mode in [0o620, 0o602] {
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(open_read(&source).is_err());
+        }
     }
 }

@@ -19,6 +19,9 @@ model running inside the cell.
 
 ## Try it in 60 seconds
 
+Provision the independent release keyring and select `RELEASE_CID` first;
+see [installation](doc/installation.md).
+
 ```sh
 curl -fsSL https://wetware.run/install | sh -s -- --release "$RELEASE_CID"
 # Start in the foreground; query /status from another terminal.
@@ -60,10 +63,14 @@ Set `RELEASE_CID` to the selected signed release and provision the independent
 release keyring first. The installer authenticates and installs the Host,
 baseline FHS, and identity. Automatic channel selection is not yet integrated.
 Installation does not register a daemon or configure name publication. Register
-separately with `ww daemon install`; use native platform tools for activation.
+separately with `ww daemon install`, then start it through the native service manager.
+Ordinary startup requires no native-upgrade admission. Automatic native replacement
+supports managed GNU ARM64 Linux/systemd with a fixed loopback `/readyz` endpoint.
+Qualification and production activation remain separate gates. See
+[native platform limits](doc/native-upgrades.md).
 `ww image update` changes only the baseline and never restarts the Host.
-`ww uninstall` preserves user state. `ww upgrade` uses authenticated native
-selection, but replacement remains gated on native operational admission.
+`ww uninstall` preserves user state. `UpgradeCoordinator` authenticates, stages,
+replaces, and recovers native software under the installation mutation lock.
 See [installation and recovery](doc/installation.md) for ownership, migration,
 service activation, and outstanding upgrade integration gates.
 
@@ -94,9 +101,9 @@ Small archives are not inspected internally. Store build outputs outside Git.
 ### Run a node
 
 ```bash
-ww run                                  # boot the installed FHS
-ww image check                          # validate static PID0 compatibility
-ww run .                                # explicitly overlay the current directory
+ww run                    # boot the installed FHS
+ww image check            # validate static PID0 compatibility
+ww run .                  # explicitly overlay the current directory
 ```
 
 ### Build the example cells

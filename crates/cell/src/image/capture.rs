@@ -99,19 +99,24 @@ impl CaptureBatch {
     /// and worker completion use the existing filesystem transaction lifecycle.
     /// Dropping the future requests cancellation; scope completion still waits
     /// for the worker to close its descriptors. Calling `cancel` while awaiting
-    /// this future returns only after that worker has stopped.
+    /// this future returns only after that worker has stopped. The worker owns
+    /// `capture_guard` until it closes its source descriptors, even if aborted.
     pub async fn capture(
         requests: Vec<CaptureRequest>,
         transaction: &cache::ForegroundTransaction,
         cancellation: CaptureCancellation,
+        capture_guard: impl Send + 'static,
     ) -> Result<Self> {
         ensure!(
             requests.len() <= MAX_OPERATIONS,
             "capture source operation limit exceeded"
         );
-        run_capture(transaction, cancellation, move |cancellation| {
-            capture_sync(requests, cancellation, Limits::default())
-        })
+        run_capture(
+            transaction,
+            cancellation,
+            capture_guard,
+            move |cancellation| capture_sync(requests, cancellation, Limits::default()),
+        )
         .await
     }
 
@@ -129,6 +134,7 @@ impl CaptureBatch {
 async fn run_capture(
     transaction: &cache::ForegroundTransaction,
     cancellation: CaptureCancellation,
+    capture_guard: impl Send + 'static,
     capture: impl FnOnce(CaptureCancellation) -> Result<CaptureBatch> + Send + 'static,
 ) -> Result<CaptureBatch> {
     let mut cancel_on_drop = CancelOnDrop(Some(cancellation.clone()));
@@ -139,6 +145,7 @@ async fn run_capture(
     let result = transaction
         .run_blocking(cache::FilesystemOperation::FileStage, move || {
             let _permit = permit;
+            let _capture_guard = capture_guard;
             capture(cancellation)
         })
         .await?;
@@ -1005,6 +1012,7 @@ pub(super) mod tests {
             vec![request(dir.path(), false)],
             &transaction,
             CaptureCancellation::default(),
+            (),
         )
         .await
         .unwrap();
@@ -1032,8 +1040,16 @@ pub(super) mod tests {
         let worker_cancel = cancellation.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Guard(released.clone());
         let task = tokio::spawn(async move {
-            run_capture(&transaction, worker_cancel, move |cancel| {
+            run_capture(&transaction, worker_cancel, guard, move |cancel| {
                 let fd = fs::openat(CWD, dir.path(), directory_flags(), Mode::empty()).unwrap();
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -1047,6 +1063,10 @@ pub(super) mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(cancellation.check().is_err());
+        assert!(
+            !released.load(std::sync::atomic::Ordering::Acquire),
+            "aborted waiter released capture exclusion before worker exit"
+        );
         assert!(WORKER.try_acquire().is_err());
         drop(scope_owner);
         drop(finalizer);
@@ -1061,6 +1081,7 @@ pub(super) mod tests {
             .unwrap()
             .unwrap();
         assert!(WORKER.try_acquire().is_ok());
+        assert!(released.load(std::sync::atomic::Ordering::Acquire));
         owner.shutdown().await.unwrap();
     }
 

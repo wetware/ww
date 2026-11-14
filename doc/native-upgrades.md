@@ -1,149 +1,193 @@
-# Native Host replacement engine
+# Authenticated native replacement and recovery
 
-`ww upgrade` connects authenticated release selection to the #739 transaction
-engine. `PreverifiedCandidate::from_release` accepts only an authenticated
-release and selects the current platform. Native replacement remains gated by
-`NativeService` compatibility and restart admission. The installer is separate
-and refuses different existing native bytes.
+`ww upgrade` delegates native replacement to `UpgradeCoordinator`, the single
+installation mutation owner. The local administrator and operating-system
+service manager are trusted. The updater checks untrusted release artifacts,
+configuration mistakes, cooperating-operation races, failed restarts, and
+interrupted writes. It makes no protection claim against a malicious local
+administrator.
 
-## Admission boundaries
+The transaction follows this order:
 
-The release selector must authenticate both the installed artifact and the
-selected candidate. Version text and source revision are provenance, not exact
-artifact identity. `ArtifactIdentity` names an explicit digest algorithm, exact
-digest, and executable size. Staging recomputes the selected digest and size
-from the supplied bytes. Supported digest algorithms are SHA-256 and BLAKE3;
-the engine never infers an algorithm from digest length.
+```text
+authenticate → stage → stop and confirm quiescence → replace
+             → restart → check /readyz → commit or recover
+```
 
-Candidate bytes arrive separately from authenticated selection. The CLI checks
-manifest signature, descriptor binding, platform compatibility profile,
-transport-root link, and exact reconstructed digest/size. Artifact download is
-bounded and uses signed artifact CIDs. Independent release keys remain the trust
-root. Explicit `--release CID` permits historical selection without lowering
-freshness state; automatic channel selection awaits trusted channel provisioning.
+Native replacement changes the Host executable and its authenticated provenance.
+It preserves the FHS, identity, namespaces, service definition, enablement, and
+publication authority. Initial automatic replacement supports managed GNU ARM64
+Linux/systemd only. Unsupported platforms and unmanaged replacement refuse.
+Current native qualification results are recorded separately; enabling this
+adapter in source does not authorize production activation or publication.
 
-A new `install --release` records an untrusted CID locator in
-`installed-release.json`. Upgrade reauthenticates that release and verifies the
-installed executable; the locator itself supplies no authentication. Legacy or
-local-payload installs without provenance refuse native replacement.
+## Ordinary startup and FHS capture
 
-`installation.json` accepts legacy version 1 and scoped version 2. BLAKE3
-ownership hashes do not authenticate a release. The native engine changes only
-the executable slot and preserves FHS and legacy namespace/service provenance.
-Incomplete and unknown receipts cause refusal.
+`ww run` requires no transaction-bound admission, launch permit, or instance
+lease. Native-upgrade metadata does not authorize ordinary startup. A damaged or
+unknown native journal blocks further native upgrades while remaining available
+for explicit operator recovery. Ordinary startup still validates its FHS ownership
+and refuses incomplete FHS updates.
 
-## Transaction ownership
+`~/.ww-installation.lock` serializes installation mutation. FHS writers acquire
+that `MutationLock` first, then an exclusive `~/.ww-fhs.lock` guard. Startup takes
+only a shared FHS guard when any local source overlaps the managed FHS. The local
+capture worker owns the guard until its source descriptors close, including
+when its asynchronous caller is cancelled. The guard is released before network
+publication and is never held throughout Host execution.
 
-`Engine::open` holds `~/.ww-installation.lock` until the engine is dropped.
-Installation, existing update/removal callers, and daemon definition writers use
-the same lock. Existing mutators refuse when `host-upgrade.json` exists, even
-after the process that held the lock exits. Service-manager child commands retain
-the lock if their CLI parent exits. Do not unlink the lock to bypass contention.
+The FHS lock contains no lease state or authoritative journal. Native replacement
+holds `MutationLock` without taking the FHS writer guard. Its restarted Host can
+therefore capture the unchanged FHS. Do not unlink lock files to bypass contention.
 
-The engine changes only these installation paths:
+## Independent release authentication
 
-| Path under `~/.ww` | Purpose |
+Select a release with `--release CID` and independently provisioned public keys:
+
+```sh
+ww upgrade --release CID --trusted-release-keys /etc/wetware/release-keys --timeout-secs 300
+ww upgrade --release CID --check
+ww upgrade --rollback --timeout-secs 300
+```
+
+The timeout is an explicit example budget. Changed upgrades, rollback, recovery,
+and baseline repair require a positive `--timeout-secs`. Exact-artifact no-ops and
+read-only checks do not require a restart budget. Checks can download and stage
+candidate bytes in temporary storage but do not replace installed software.
+
+Signed release proofs bind the manifest, descriptor, transport root, target,
+exact executable digest, and size. Downloaded keys cannot establish trust.
+Versions, source revisions, paths, ownership hashes, and manager PIDs do not
+substitute for authenticated release identity. Retained public-key evidence and
+signed proofs authenticate the exact current and previous generations during
+offline rollback and recovery. New candidates use independently supplied trust.
+
+Automatic channel discovery remains unavailable until trusted channel freshness
+is integrated. Explicit historic release selection does not lower a consumer
+freshness floor. Same-version releases with different authenticated executable
+bytes are changed upgrades. Identical executable bytes are a no-op and preserve
+accepted provenance, even when another signed envelope contains those bytes.
+
+## Durable records
+
+| Path under `~/.ww` | Responsibility |
 |---|---|
 | `bin/ww` | Installed native executable |
-| `bin/.ww-host-upgrade/` | Verified staging, replacement, and retained executable bytes |
-| `host-upgrade.json` | One pending transaction, bounded to 64 KiB |
-| `host-upgrade-retained.json` | Current and one previous artifact's recorded provenance |
-| `installation.json` | Existing receipt; only executable ownership changes |
+| `bin/.ww-host-upgrade/` | Verified staged/retained executables, signed proofs, repair archives |
+| `host-upgrade.json` | The single version-3 native transaction or baseline-repair journal |
+| `host-upgrade-retained.json` | Current and one previous authenticated generation |
+| `installation.json` | Local software ownership receipt; not release authority |
+| `installed-release.json` | Compact untrusted release locator |
+| `uninstalled-native-retention-<digest>.json` | Preserved inactive native metadata after uninstall |
 
-Metadata writes sync the temporary file, rename it, and sync the containing
-directory. Executable staging occurs on the destination filesystem. The installed
-executable changes only after the complete staged bytes match the selected
-identity and operational compatibility has passed. Candidate download or staging
-failure leaves the installed executable unchanged.
+Active retention selects current and one previous generation. Physical historical
+executables and proofs remain preserved for operator recovery; disk use can grow
+across upgrades. No automatic garbage collector removes those files.
 
-The transaction records intent before replacement and restart. Previous bytes
-remain available through replacement, restart, readiness checks, and receipt
-commit. After success, the engine retains one previous artifact. Cleanup does not
-prune IPFS content or alter deployment authority.
+Records are bounded to 64 KiB. Signed proof envelopes have a separate 8 MiB
+bound and retain each release-verifier bound. Writes sync temporary file bytes,
+rename the file, then sync the parent directory. Cross-directory moves sync both
+parents. Recovery validates the recorded before/after tuple; journal removal
+occurs last. The metadata files do not change simultaneously.
 
-| Durable phase | Recovery policy |
-|---|---|
-| `Staging`, `Ready` | Abort staging; verify and preserve the original installed executable |
-| `Replacing`, `Installed`, `Restarting`, `Verified` | Restore recorded previous bytes and receipt after service/compatibility checks |
-| `Restoring` | Continue recorded recovery; retain pending state if recovery cannot complete |
-| `Restored` | Verify the restored executable, original receipt, and original retention metadata; finish cleanup without restarting again |
-| `Committed` | Verify the committed executable/receipt and finish cleanup |
+Fresh signed installation completes its ownership receipt and software before
+retaining native proof through a metadata transaction. Existing installations
+without native provenance require explicit authenticated baseline repair before
+a changed upgrade. Interrupted software installation still uses its incomplete
+ownership receipt and exact-package retry. An interruption before native
+initialization can require baseline repair after software installation completes.
 
-`operator_upgrade` resolves a pending transaction before calling its new-release
-selection callback. The recovery result identifies the exact artifact and whether
-recovery aborted staging, restored the previous artifact, or completed a commit.
-The same invocation does not then select a different release. `operator_rollback` uses only the
-previous recorded artifact and retained bytes. Rollback uses the same replacement
-owner and does not lower release freshness or rewind deployment heads.
+Exact-byte reinstall preserves accepted native provenance. Uninstall durably
+archives active native retention before detaching that record. It preserves
+retained executable files, signed proofs, private state, and recovery evidence.
+A later fresh installation can establish its own authenticated generation.
 
-The authenticated shell recovery path uses `Engine::require_pending_recovery`
-before native network selection, then `Engine::recover_authenticated`. The latter
-requires an independently authenticated selection that matches the full recorded
-previous or candidate generation. The CLI also verifies its own executable bytes.
-This recovery-only path cannot start a new transaction. See the shell invocation
-and endpoint requirements in [installation and recovery](installation.md).
+## Managed stop, restart, and readiness
 
-`upgrade --json` reports a structured outcome, selected and observed artifact
-identities, native artifact paths changed, activation, and recovery action.
-Observed identity describes bytes on disk; it does not certify running readiness.
-Changed paths exclude journal and retained-copy metadata. Unknown failure state
-uses null values for activation and changed paths.
+The GNU ARM64 adapter reads effective systemd configuration, including the loaded
+unit, drop-ins, arguments, working directory, and environment. It supports a
+constrained direct `simple`/`exec` service for the installed executable. Unsupported
+indirection, activation, or namespace settings refuse before replacement.
+Configuration must remain unchanged during the transaction.
 
-Records currently depend on the operator's private local filesystem custody.
-Production integration must define retained signed-evidence validation with
-#738; private journal metadata must not become a substitute signature verifier.
+A running service requires a fixed loopback admin address. The adapter uses the
+existing `/readyz` endpoint. `--with-http-admin off`, a non-loopback address, or an
+indeterminate endpoint refuses automatic replacement of a running service before
+transaction mutation. Ordinary Host startup may still disable the admin listener.
 
-## Service and deployment checks
+The adapter requests bounded manager stop, confirms the observed old process
+exited, and confirms the service is stopped before replacement. Restart uses the
+existing service definition. Process observation compares the manager's process
+and `/proc/PID/exe` file identity with the installed executable. It does not hash
+the running executable repeatedly or exchange a parent/child authentication
+protocol. `/readyz` must return HTTP 200 while manager observations remain stable.
+The coordinator checks the ready process again around metadata commit.
 
-Service observations distinguish registration, startup enablement, running PID,
-failed state, executable path, and effective configuration. Unknown or
-contradictory state refuses replacement. Custom service definitions and drop-ins
-are observed without rewriting them.
+An originally stopped service remains stopped and reports `live_ready: false`.
+A successful file restoration does not establish service readiness. A running
+service's readiness failure triggers one bounded attempt to restore the
+authenticated previous generation. The upgrade still returns its original error.
+If rollback fails, the coordinator attempts to stop the service and preserves the
+journal for explicit recovery.
 
-Only a previously running managed service can be restarted. A stopped service,
-including a failed service with no running process, remains stopped. An absent
-service can yield executable installation, never a claim of live readiness.
+## Recovery and explicit repair
 
-Live replacement requires evidence that captured startup configuration, prepared
-FHS/local sources, and publisher target match the next startup. The restarted
-Host must enforce that admission before publishing or activating guests. Admission
-must cover every launch after replacement, including automatic service-manager
-restarts; checking files only before an explicit restart is insufficient. Serving readiness must accompany
-exact native artifact identity and the service manager's matching new process.
-Git SHA, version text, process existence, and `/healthz` alone do not qualify.
+A normal invocation with a pending recognized journal recovers that recorded
+transaction before considering new selection. Recovery aborts untouched staging,
+restores authenticated retained bytes, or finishes terminal metadata cleanup as
+appropriate. A terminal cleanup does not initiate another restart or claim new
+readiness. Corrupt or missing rollback bytes/proofs cause refusal and preserve
+evidence.
 
-Current Hosts do not provide the required captured startup/native identity
-evidence. `NativeService` therefore observes systemd/launchd state but refuses
-live admission, restart, and compatibility certification. A production adapter
-must check the staged candidate against the effective prepared deployment before
-enabling even a stopped-service command. Missing live evidence requires explicit
-service shutdown; it does not authorize guessing or activating pending edits.
+For a damaged installed executable, the authenticated shell recovery entrypoint
+can stage and run a selected recovery Host:
 
-Readiness uses a finite caller-supplied deadline. There is no production default:
-existing Kubo wait/retry, source preparation, and kernel lifecycle bounds can
-exceed the provisional 120 seconds. The service backend must honor its deadline;
-the byte supplier must separately bound download I/O. Deadline checks guard
-executable replacement and receipt commit. An admitted commit finishes durability
-and cleanup even if those filesystem operations outlast the deadline. Recovery failure retains
-the journal and previous bytes and reports the residual state. An incompatible
-previous Host must remain stopped rather than changing the authoritative image.
+```sh
+sh scripts/install.sh --recover --release RECOVERY_EXECUTABLE_CID --timeout-secs 300
+```
 
-## Qualification and production gates
+The selected release must authenticate the helper's exact executable bytes and
+match a generation recorded by the recognized transaction. The helper does not
+fabricate provenance or turn recovery into fresh installation. Historical V1
+recovery remains restricted to its recorded exact generations. Descriptor CIDs
+are not treated as transport roots. Unknown versions, including unpublished V2
+protocol records, require explicit repair.
 
-Unit tests use real temporary filesystem operations and deterministic service
-evidence. They qualify transaction policy separately from native service-manager
-restart behavior. Native observation tests do not establish successful live
-restart, cold-start timing, power-loss durability, or production trust provisioning.
+When native metadata is damaged but installed executable bytes are valid, use:
 
-Before permitting native replacement through the CLI, integrate and qualify:
+```sh
+ww upgrade --repair-baseline --release INSTALLED_CID --timeout-secs 300
+# Add only when historical rollback cannot be authenticated:
+ww upgrade --repair-baseline --release INSTALLED_CID --timeout-secs 300 --acknowledge-missing-rollback
+```
 
-1. Trusted automatic channel selection, retained signed evidence, and atomic
-   installed-release provenance changes during native commit/recovery.
-2. Candidate/effective-deployment compatibility using the prepared FHS machinery.
-3. Captured startup evidence and admission enforced before restarted Host effects.
-4. Exact running native identity and serving readiness on systemd and launchd.
-5. Recovery from real service restart failure and measured bounded cold startup.
+Repair independently authenticates the selected installed bytes and validates the
+complete FHS ownership receipt. It archives damaged records before superseding
+them and retains existing artifacts. A valid known transaction must use its
+normal recovery path; baseline repair cannot discard its obligations. Missing
+historical rollback requires explicit acknowledgement and is reported as
+unavailable. Repair leaves executable bytes and service state unchanged and
+reports no new readiness. Later upgrades retain the newly authenticated current
+executable as their rollback source.
 
-The CLI separates `install`, `image update`, `upgrade`, `uninstall`, and daemon
-registration/removal. The native engine never updates FHS or service defaults,
-publishes IPNS values, or authorizes a production rollout.
+If executable bytes or FHS ownership cannot be verified, restore verified bytes
+or ownership evidence explicitly before repair. Preserving a damaged journal
+never makes its unverified bytes an authenticated release. Manual startup of an
+otherwise valid Host remains independent of native journal integrity.
+
+## Operational responsibility
+
+Wetware authenticates replacements, preserves rollback bytes and durable journal
+state, and verifies executable identity and readiness. It does not change
+operator restart settings or reload the systemd manager. Recovery resets only
+`ww.service` failure counters after restoring authenticated executable bytes.
+Terminal recovery verifies the recorded running or stopped disposition before
+removing the journal.
+
+Systemd may restart a failing candidate after updater death. The operator owns
+availability monitoring, crash-loop diagnosis, and explicit recovery. No
+autonomous recovery or availability guarantee follows from the journal. Explicit
+recovery requests manager stop, confirms quiescence, restores the authenticated
+previous executable, and checks readiness when the service was originally running.
+Operator-configured service dependencies retain their normal systemd semantics;
+Wetware does not rewrite dependencies or manage unrelated services.

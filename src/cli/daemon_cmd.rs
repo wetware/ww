@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use ww::installation_state::{MutationLock, Receipt};
-use ww::upgrade::service::{
-    EnabledState, NativeService, RunningState, ServiceControl, ServiceSnapshot,
-};
+use ww::upgrade::service::{EnabledState, RunningState, ServiceSnapshot};
 
 const MAX_BYTES: u64 = 65536;
 const LABEL: &str = "io.wetware.ww";
@@ -274,7 +272,10 @@ impl NativeManager {
 }
 impl Manager for NativeManager {
     fn snapshot(&mut self) -> Result<ServiceSnapshot> {
-        let snapshot = NativeService::new(&self.home)?.snapshot()?;
+        let snapshot = ww::upgrade::service::lifecycle_snapshot(
+            &self.home,
+            Instant::now() + Duration::from_secs(30),
+        )?;
         if self.platform == Platform::Linux {
             let output = command_output(
                 "/usr/bin/systemctl",
@@ -859,7 +860,7 @@ fn render_service(platform: Platform, binary: &Path, argv: &[String], home: &Pat
         .collect();
     match platform {
         Platform::Macos => format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{LABEL}</string>\n    <key>Disabled</key>\n    <true/>\n    <key>ProgramArguments</key>\n    <array>\n{}\n    </array>\n    <key>StandardOutPath</key>\n    <string>{}</string>\n    <key>StandardErrorPath</key>\n    <string>{}</string>\n    <key>KeepAlive</key>\n    <true/>\n    <key>SoftResourceLimits</key>\n    <dict>\n        <key>NumberOfFiles</key>\n        <integer>4096</integer>\n    </dict>\n</dict>\n</plist>\n", args.iter().map(|arg| format!("        <string>{}</string>", xml_text(arg))).collect::<Vec<_>>().join("\n"), xml_text(&home.join(".ww/logs/ww.log").display().to_string()), xml_text(&home.join(".ww/logs/ww.log").display().to_string())),
-        Platform::Linux => format!("[Unit]\nDescription=Wetware daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n", args.iter().map(|arg| systemd_argument(arg)).collect::<Vec<_>>().join(" ")),
+        Platform::Linux => format!("[Unit]\nDescription=Wetware daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={}\nWorkingDirectory=%h\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n", args.iter().map(|arg| systemd_argument(arg)).collect::<Vec<_>>().join(" ")),
     }
 }
 fn xml_text(value: &str) -> String {

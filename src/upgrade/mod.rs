@@ -2,7 +2,7 @@
 //!
 //! Only an authenticated release can construct [`PreverifiedCandidate`].
 //! A checksum or local receipt is not upgrade authorization. Native operational
-//! compatibility and live restart admission remain separately enforced gates.
+//! readiness are checked separately through the trusted service manager.
 
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,13 +11,18 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::installation_state::{MutationLock, Receipt};
-use service::{EnabledState, RestartAdmission, RunningState, ServiceControl, ServiceSnapshot};
+use service::{
+    EnabledState, LegacyRestartAdmission, RunningState, ServiceControl, ServiceSnapshot,
+};
 use storage::{checkpoint, Paths};
 
-pub mod attestation;
+pub mod native_linux;
+pub mod provenance;
 pub mod service;
 #[doc(hidden)]
 pub mod storage;
+mod transaction;
+pub use transaction::{RepairOutcome, UpgradeRequest};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -61,9 +66,11 @@ impl ArtifactIdentity {
 #[derive(Clone, Debug)]
 pub struct PreverifiedCandidate {
     artifact: ArtifactIdentity,
+    #[cfg(test)]
     release: String,
     version: String,
     revision: String,
+    #[cfg(test)]
     platform: String,
 }
 
@@ -89,9 +96,11 @@ impl PreverifiedCandidate {
                 digest: hex::encode(host.artifact.sha256),
                 size: host.artifact.size,
             },
+            #[cfg(test)]
             release: release.descriptor_cid().to_string(),
             version: release.descriptor().version.clone(),
             revision: host.provenance.revision.clone(),
+            #[cfg(test)]
             platform: host.target.clone(),
         };
         candidate.artifact.validate()?;
@@ -100,7 +109,8 @@ impl PreverifiedCandidate {
 }
 
 /// Both selections are authenticated. The legacy receipt authenticates neither.
-pub struct UpgradeRequest<R: Read> {
+#[cfg(test)]
+struct LegacyUpgradeRequest<R: Read> {
     pub installed: PreverifiedCandidate,
     pub candidate: PreverifiedCandidate,
     pub bytes: R,
@@ -110,6 +120,7 @@ pub struct UpgradeRequest<R: Read> {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Outcome {
     AlreadyInstalled,
+    Checked,
     /// `live_ready` is false for absent/stopped services.
     Installed {
         live_ready: bool,
@@ -145,6 +156,7 @@ struct ArtifactRecord {
     platform: String,
 }
 
+#[cfg(test)]
 impl From<PreverifiedCandidate> for ArtifactRecord {
     fn from(selected: PreverifiedCandidate) -> Self {
         Self {
@@ -203,7 +215,7 @@ struct Journal {
     previous: ArtifactRecord,
     candidate: ArtifactRecord,
     before: ServiceSnapshot,
-    admission: Option<RestartAdmission>,
+    admission: Option<LegacyRestartAdmission>,
     receipt_before: Vec<u8>,
     receipt_after: Option<Vec<u8>>,
     retained_before: Option<Vec<u8>>,
@@ -232,17 +244,27 @@ impl Retained {
 
 /// Holds exclusive installation mutation authority for one operator operation.
 /// The lock also excludes the existing installer and daemon-definition writers.
-pub struct Engine {
+pub struct UpgradeCoordinator {
     _lock: MutationLock,
     paths: Paths,
 }
 
-impl Engine {
+impl UpgradeCoordinator {
     pub fn open(home: &Path) -> Result<Self> {
-        let lock = MutationLock::acquire(home)?;
+        Self::from_lock(MutationLock::acquire(home)?)
+    }
+
+    /// Transfer an existing installation mutation owner without reacquiring its
+    /// stable lock inode. Installers must create private .ww/bin directories
+    /// before this handoff; this method writes no executable bytes.
+    pub fn from_lock(lock: MutationLock) -> Result<Self> {
         lock.reject_pending_image()?;
-        let paths = Paths::open(home)?;
+        let paths = Paths::open(lock.home())?;
         Ok(Self { _lock: lock, paths })
+    }
+
+    pub fn mutation_lock(&self) -> &MutationLock {
+        &self._lock
     }
 
     /// Resolve a pending transaction before calling the release selector.
@@ -252,15 +274,26 @@ impl Engine {
     /// I/O: this synchronous owner cannot cancel an arbitrary blocking `Read` or
     /// in-flight filesystem operation. Once a commit is admitted, required
     /// durability work and terminal cleanup complete even if the budget expires.
-    pub fn operator_upgrade<R: Read>(
+    #[cfg(test)]
+    fn legacy_operator_upgrade<R: Read>(
         &mut self,
         service: &mut impl ServiceControl,
         timeout: Duration,
-        select: impl FnOnce() -> Result<UpgradeRequest<R>>,
+        select: impl FnOnce() -> Result<LegacyUpgradeRequest<R>>,
     ) -> Result<Outcome> {
-        let deadline = deadline(timeout)?;
+        self.legacy_operator_upgrade_until(service, deadline(timeout)?, select)
+    }
+
+    #[cfg(test)]
+    fn legacy_operator_upgrade_until<R: Read>(
+        &mut self,
+        service: &mut impl ServiceControl,
+        deadline: Instant,
+        select: impl FnOnce() -> Result<LegacyUpgradeRequest<R>>,
+    ) -> Result<Outcome> {
+        check_deadline(deadline)?;
         if storage::exists(&self.paths.journal)? {
-            let result = self.recover_until(service, deadline);
+            let result = self.legacy_recover_until(service, deadline);
             return self.with_recovery_context(result);
         }
         let request = select()?;
@@ -277,14 +310,24 @@ impl Engine {
 
     /// Select only the previous authenticated artifact retained by this owner.
     /// No release discovery, freshness watermark, or deployment head is changed.
-    pub fn operator_rollback(
+    #[cfg(test)]
+    fn legacy_operator_rollback(
         &mut self,
         service: &mut impl ServiceControl,
         timeout: Duration,
     ) -> Result<Outcome> {
-        let deadline = deadline(timeout)?;
+        self.legacy_operator_rollback_until(service, deadline(timeout)?)
+    }
+
+    #[cfg(test)]
+    fn legacy_operator_rollback_until(
+        &mut self,
+        service: &mut impl ServiceControl,
+        deadline: Instant,
+    ) -> Result<Outcome> {
+        check_deadline(deadline)?;
         if storage::exists(&self.paths.journal)? {
-            let result = self.recover_until(service, deadline);
+            let result = self.legacy_recover_until(service, deadline);
             return self.with_recovery_context(result);
         }
         let bytes = storage::read_record(&self.paths.retained)?
@@ -307,34 +350,47 @@ impl Engine {
     }
 
     /// Recover the recorded operation without selecting another release.
-    pub fn recover(
+    #[cfg(test)]
+    fn legacy_recover(
         &mut self,
         service: &mut impl ServiceControl,
         timeout: Duration,
     ) -> Result<Outcome> {
-        let result = self.recover_until(service, deadline(timeout)?);
-        self.with_recovery_context(result)
+        self.legacy_recover_before(service, deadline(timeout)?)
     }
 
-    /// Check recorded recovery ownership before a bootstrap transport fetches
-    /// an executable. This engine retains the mutation lock throughout selection.
-    pub fn require_pending_recovery(&self) -> Result<()> {
-        ensure!(
-            self.pending_recovery()?.is_some(),
-            "no pending Host transaction; recovery-only operation cannot select a new release"
-        );
-        Ok(())
+    #[cfg(test)]
+    fn legacy_recover_before(
+        &mut self,
+        service: &mut impl ServiceControl,
+        deadline: Instant,
+    ) -> Result<Outcome> {
+        check_deadline(deadline)?;
+        let result = self.legacy_recover_until(service, deadline);
+        self.with_recovery_context(result)
     }
 
     /// Recover only through an independently authenticated recorded generation.
     /// The caller must verify that its running recovery executable has the exact
     /// selected bytes. A local journal supplies scope, never release authority.
-    pub fn recover_authenticated(
+    #[cfg(test)]
+    fn legacy_recover_authenticated(
         &mut self,
         service: &mut impl ServiceControl,
         timeout: Duration,
         executable: PreverifiedCandidate,
     ) -> Result<Outcome> {
+        self.legacy_recover_authenticated_until(service, deadline(timeout)?, executable)
+    }
+
+    #[cfg(test)]
+    fn legacy_recover_authenticated_until(
+        &mut self,
+        service: &mut impl ServiceControl,
+        deadline: Instant,
+        executable: PreverifiedCandidate,
+    ) -> Result<Outcome> {
+        check_deadline(deadline)?;
         let journal = self.pending_recovery()?.context(
             "no pending Host transaction; recovery-only operation cannot select a new release",
         )?;
@@ -344,7 +400,7 @@ impl Engine {
             executable == journal.previous || executable == journal.candidate,
             "authenticated recovery executable is not a recorded Host generation; preserve the pending transaction and select its exact release"
         );
-        self.recover(service, timeout)
+        self.legacy_recover_before(service, deadline)
     }
 
     fn pending_recovery(&self) -> Result<Option<Journal>> {
@@ -360,6 +416,7 @@ impl Engine {
         Ok(Some(journal))
     }
 
+    #[cfg(test)]
     fn start(
         &mut self,
         service: &mut impl ServiceControl,
@@ -393,12 +450,12 @@ impl Engine {
             return Ok(Outcome::AlreadyInstalled);
         }
         let before = service
-            .snapshot()
+            .snapshot(deadline)
             .context("observe managed service before replacement")?;
         validate_snapshot(&before, &self.paths.executable)?;
         check_deadline(deadline)?;
         let admission = if matches!(before.running, RunningState::Running { .. }) {
-            let admitted = service.admit_restart(&before).context("running startup inputs are unavailable or pending; explicitly stop the managed service before upgrading")?;
+            let admitted = service.legacy_admit_restart(&before).context("running startup inputs are unavailable or pending; explicitly stop the managed service before upgrading")?;
             admitted.validate(&before)?;
             Some(admitted)
         } else {
@@ -425,7 +482,7 @@ impl Engine {
         let stage = self.paths.store.join("stage");
         let candidate_blake3 = storage::stage(bytes, &stage, &journal.candidate.artifact)?;
         storage::rename(&stage, &self.paths.artifact(&journal.candidate.artifact))?;
-        service.compatible(&journal.candidate.artifact, &self.paths.artifact(&journal.candidate.artifact))
+        service.legacy_compatible(&journal.candidate.artifact, &self.paths.artifact(&journal.candidate.artifact))
             .context("selected Host is incompatible with effective deployment; Host/FHS combined changes require separate authorization")?;
         storage::stage(
             storage::open_read(&self.paths.executable)?,
@@ -439,11 +496,11 @@ impl Engine {
         // Recheck immediately before replacement. For a live service, admission
         // additionally binds child consumption before publication/guest effects.
         ensure!(
-            service.snapshot()? == journal.before,
+            service.snapshot(deadline)? == journal.before,
             "managed service state changed before replacement; recover the pending transaction"
         );
         self.readmit(service, &journal)?;
-        service.compatible(
+        service.legacy_compatible(
             &journal.candidate.artifact,
             &self.paths.artifact(&journal.candidate.artifact),
         )?;
@@ -459,7 +516,7 @@ impl Engine {
             self.restart(service, &journal, &journal.candidate.artifact, deadline)?;
             true
         } else {
-            ensure!(service.snapshot()? == journal.before, "service state changed during stopped-service upgrade; installed candidate retained, recovery required");
+            ensure!(service.snapshot(deadline)? == journal.before, "service state changed during stopped-service upgrade; installed candidate retained, recovery required");
             false
         };
         storage::verify(&self.paths.executable, &journal.candidate.artifact)?;
@@ -484,14 +541,16 @@ impl Engine {
         Ok(Outcome::Installed { live_ready })
     }
 
+    #[cfg(test)]
     fn readmit(&self, service: &mut impl ServiceControl, journal: &Journal) -> Result<()> {
         if let Some(expected) = &journal.admission {
-            service.revalidate_restart(expected).context(
+            service.legacy_revalidate_restart(expected).context(
                 "startup inputs or publisher target changed; explicitly stop and activate separately")?;
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn restart(
         &self,
         service: &mut impl ServiceControl,
@@ -505,13 +564,13 @@ impl Engine {
             .context("restart was not admitted")?;
         check_deadline(deadline)?;
         checkpoint("service.restart.before")?;
-        let result = service.restart(admission, expected, deadline);
+        let result = service.legacy_restart(admission, expected, deadline);
         checkpoint("service.restart.after")?;
         let verified = result.and_then(|evidence| {
             check_deadline(deadline)?;
             evidence.verify(admission, expected)?;
             storage::verify(&self.paths.executable, expected)?;
-            let after = service.snapshot()?;
+            let after = service.snapshot(deadline)?;
             validate_snapshot(&after, &self.paths.executable)?;
             same_configuration(&journal.before, &after)?;
             ensure!(
@@ -519,7 +578,7 @@ impl Engine {
                 "service manager PID differs from the verified running Host"
             );
             service
-                .compatible(expected, &self.paths.artifact(expected))
+                .legacy_compatible(expected, &self.paths.artifact(expected))
                 .context("current deployment became incompatible during restart")?;
             check_deadline(deadline)?;
             Ok(())
@@ -538,13 +597,14 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn stop_and_confirm(&self, service: &mut impl ServiceControl, deadline: Instant) -> Result<()> {
         checkpoint("service.stop.before")?;
-        service.stop(deadline)?;
+        service.legacy_stop(deadline)?;
         checkpoint("service.stop.after")?;
         check_deadline(deadline)?;
         ensure!(
-            service.snapshot()?.running == RunningState::Stopped,
+            service.snapshot(deadline)?.running == RunningState::Stopped,
             "service manager did not confirm a stopped Host"
         );
         Ok(())
@@ -552,9 +612,6 @@ impl Engine {
 
     fn install_cached(&self, artifact: &ArtifactIdentity, deadline: Instant) -> Result<()> {
         let source = self.paths.artifact(artifact);
-        storage::verify(&source, artifact).context(
-            "recovery artifact is missing or corrupt; restore authenticated bytes before recovery",
-        )?;
         let replacement = self.paths.store.join("replacement");
         storage::stage(storage::open_read(&source)?, &replacement, artifact)?;
         check_deadline(deadline)?;
@@ -562,7 +619,8 @@ impl Engine {
         Ok(())
     }
 
-    fn recover_until(
+    #[cfg(test)]
+    fn legacy_recover_until(
         &mut self,
         service: &mut impl ServiceControl,
         deadline: Instant,
@@ -628,7 +686,7 @@ impl Engine {
         }
 
         let current = service
-            .snapshot()
+            .snapshot(deadline)
             .context("cannot establish service state during recovery")?;
         validate_snapshot(&current, &self.paths.executable)?;
         same_configuration(&journal.before, &current)?;
@@ -644,7 +702,7 @@ impl Engine {
         }
         // Compatibility is checked again against the authoritative deployment.
         // An incompatible previous Host remains stopped; no head is rewound.
-        service.compatible(&journal.previous.artifact, &self.paths.artifact(&journal.previous.artifact)).context("previous Host is incompatible with the current deployment; service remains stopped, recovery pending")?;
+        service.legacy_compatible(&journal.previous.artifact, &self.paths.artifact(&journal.previous.artifact)).context("previous Host is incompatible with the current deployment; service remains stopped, recovery pending")?;
         self.readmit(service, &journal)?;
         check_deadline(deadline)?;
         self.install_cached(&journal.previous.artifact, deadline)?;
@@ -753,6 +811,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn with_recovery_context(&self, result: Result<Outcome>) -> Result<Outcome> {
         result.map_err(|error| {
             if storage::exists(&self.paths.journal).unwrap_or(true) {
@@ -770,6 +829,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn set_phase(&self, journal: &mut Journal, phase: Phase) -> Result<()> {
         checkpoint(&format!("phase.{phase:?}.before"))?;
         journal.phase = phase;
@@ -778,10 +838,12 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn save(&self, journal: &Journal) -> Result<()> {
         storage::write_record(&self.paths.journal, &serde_json::to_vec(journal)?)
     }
 
+    #[cfg(test)]
     fn finish_committed(&self, journal: &Journal) -> Result<()> {
         storage::verify(
             &self.paths.artifact(&journal.previous.artifact),
@@ -897,18 +959,66 @@ fn deadline(timeout: Duration) -> Result<Instant> {
         !timeout.is_zero(),
         "Host operation timeout must be positive"
     );
-    Instant::now()
+    monotonic_now()
         .checked_add(timeout)
         .context("Host operation timeout is out of range")
 }
 
 fn check_deadline(deadline: Instant) -> Result<()> {
+    ensure!(
+        monotonic_now() < deadline,
+        "Host operation/readiness deadline expired"
+    );
+    Ok(())
+}
+
+fn monotonic_now() -> Instant {
     let now = Instant::now();
     #[cfg(test)]
     let now = storage::faults::clock_now(now);
-    ensure!(now < deadline, "Host operation/readiness deadline expired");
-    Ok(())
+    now
 }
 
 #[cfg(test)]
 mod tests;
+
+fn verify_fhs_receipt(home: &Path, receipt: &Receipt) -> Result<()> {
+    for (relative, slot) in [("fhs/boot/kernel.wasm", 1), ("fhs/bin/status.wasm", 2)] {
+        let path = home.join(".ww").join(relative);
+        let file = storage::open_read(&path)?;
+        let size = file.metadata()?.len();
+        ensure!(
+            size > 0 && size <= 256 * 1024 * 1024,
+            "installed FHS artifact exceeds bound"
+        );
+        storage::verify(
+            &path,
+            &ArtifactIdentity {
+                algorithm: DigestAlgorithm::Blake3,
+                digest: receipt.hashes[slot].clone(),
+                size,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+// Keyring contents are verification evidence, not release identity. Current
+// independent key rotation can authenticate the same signed root/proof again.
+fn same_generation_identity(
+    a: &provenance::GenerationRecord,
+    b: &provenance::GenerationRecord,
+) -> bool {
+    let mut comparable = a.clone();
+    comparable.verification_keys = b.verification_keys.clone();
+    comparable == *b
+}
+
+#[cfg(test)]
+mod reduced_tests;
+
+#[cfg(test)]
+mod explicit_recovery_regression_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod genuine_recovery_tests;

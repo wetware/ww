@@ -14,32 +14,45 @@ import native_release_integration as lane
 
 
 CHECKS = [
-    'authenticated fresh A remains unbound',
-    'stopped admission check preserves native acceptance files',
-    'actual systemd A starts with HTTP admin disabled',
+    'authenticated current R1 installs without startup admission',
+    'ordinary systemd R1 starts with loopback serving readiness',
     'missing and zero changed-upgrade budgets refuse without native or service mutation',
-    'actual changed A to B commits matching provenance and readiness',
-    'actual retained rollback restores A with measured readiness',
-    'enabled A to B to A preserves enablement and custom unit bytes',
-    'readiness-timeout: exact candidate signaled through pidfd; blocked intent retained; installed CLI recovery restored ready A',
-    'failed-start: exact candidate signaled through pidfd; blocked intent retained; installed CLI recovery restored ready A',
+    'current R1 to R0 commits matching provenance and readiness',
+    'retained rollback restores R1 with measured readiness',
+    'enabled R1 to R0 to R1 preserves enablement and custom unit bytes',
+    *[fault + (': exact candidate signaled through pidfd; V3 intent retained; installed CLI recovery restored ready R1' if fault == 'updater-interrupted' else ': exact candidate signaled through pidfd; bounded live rollback restored ready R1')
+      for fault in ('readiness-timeout', 'failed-start', 'updater-interrupted')],
+    'recovery retry without pending transaction preserves state',
     'exact-artifact no-op preserves provenance',
     'disabled stopped upgrade and rollback remain disabled and stopped',
     'custom configuration, identity, FHS and private bytes preserved',
+    'corrupt retained bytes refuse rollback without replacement',
+    'ordinary startup ignores damaged native journal and mutation refuses',
+    'acknowledged baseline repair archives evidence without activation or invented rollback',
+    'next upgrade after repair retains authenticated current bytes for rollback',
 ]
+# Readiness probes may repeat; all operations must appear once in this order.
 COMMANDS = '''initial-service install-a daemon-register daemon-reload fault-stop-policy
-enable-before-admission enabled-before-admission admit-a-check admit-a start-a enabled-a
-budget-before-manager missing-upgrade-budget zero-upgrade-budget budget-after-manager
-upgrade-a-b enabled-b rollback-b-a enabled-restored-a noop-before-manager exact-noop
-noop-after-manager readiness-timeout-original-manager readiness-timeout
-readiness-timeout-contained-pid readiness-timeout-enabled-after-fault
-readiness-timeout-recover readiness-timeout-enabled-after-recovery
-failed-start-original-manager failed-start failed-start-contained-pid
-failed-start-enabled-after-fault failed-start-recover failed-start-enabled-after-recovery
-stop-before-stopped-upgrade disable-before-stopped-admission disabled-before-stopped-admission
-admit-stopped-disabled-a stopped-upgrade stopped-pid disabled-after-stopped-upgrade
-stopped-rollback stopped-rollback-pid disabled-after-stopped-rollback
-cleanup-stop cleanup-disable cleanup-reload'''.split()
+ enable-before-startup enabled-before-startup start-a enabled-a upgrade-check
+ budget-before-manager missing-upgrade-budget zero-upgrade-budget budget-after-manager
+ upgrade-a-b enabled-b rollback-b-a enabled-restored-a noop-before-manager exact-noop
+ noop-after-manager readiness-timeout-original-manager readiness-timeout
+ readiness-timeout-enabled-after-fault
+ readiness-timeout-recover readiness-timeout-enabled-after-recovery
+ failed-start-original-manager failed-start
+ failed-start-enabled-after-fault failed-start-recover failed-start-enabled-after-recovery
+ updater-interrupted-original-manager updater-interrupted updater-interrupted-enabled-after-fault
+ updater-interrupted-recover updater-interrupted-enabled-after-recovery recovery-idempotent
+ stop-before-stopped-upgrade disable-before-stopped-upgrade disabled-before-stopped-upgrade
+ stopped-upgrade stopped-pid disabled-after-stopped-upgrade
+ stopped-rollback stopped-rollback-pid disabled-after-stopped-rollback
+ corrupt-rollback-service-before corrupt-rollback corrupt-rollback-service-after ordinary-damaged-start ordinary-damaged-stop damaged-mutation-refusal
+ repair-missing-ack repair-baseline repair-stopped-pid repair-disabled
+ post-repair-upgrade post-repair-rollback cleanup-stop cleanup-disable cleanup-reload'''.split()
+COMMAND_EXITS = {'initial-service': (0, 4), 'missing-upgrade-budget': (1,),
+                 'zero-upgrade-budget': (2,), 'readiness-timeout': (1,), 'failed-start': (1,),
+                 'updater-interrupted': (-9,), 'readiness-timeout-recover': (1,), 'failed-start-recover': (1,), 'recovery-idempotent': (1,), 'corrupt-rollback': (1,),
+                 'damaged-mutation-refusal': (1,), 'repair-missing-ack': (1,)}
 
 
 class NativeContract(unittest.TestCase):
@@ -51,20 +64,20 @@ class NativeContract(unittest.TestCase):
                              'revision': '1' * 40},
                        'b': {'sha256': 'b' * 64, 'archive_sha256': 'd' * 64,
                              'revision': '2' * 40}}
-        self.report = {'version': 1, 'platform': 'linux-aarch64', 'status': 'PARTIAL',
-                       'checks': list(CHECKS), 'executed_checks': 12,
+        self.report = {'version': 2, 'platform': 'linux-aarch64', 'status': 'PARTIAL',
+                       'checks': list(CHECKS), 'executed_checks': len(CHECKS),
                        'producer_receipts': copy.deepcopy(self.marker),
-                       'trust_sha256': 'e' * 64, 'production_activation': False,
-                       'remaining': ['wrong executable, PID reuse and same-PID exec refusal'],
+                       'trust_sha256': 'e' * 64, 'production_activation': False, 'native_acceptance': False,
+                       'remaining': ['exhaustive native crash boundaries'],
+                       'wrong_executable_interception': 'UNQUALIFIED; not attempted',
                        'cleanup': 'fixture service stopped and removed; installation evidence retained'}
         self.commands = []
         readiness_commands = [stage + suffix
                               for stage in ('a', 'b', 'restored-a', 'readiness-timeout-restored-a',
-                                            'failed-start-restored-a')
+                                            'failed-start-restored-a', 'updater-interrupted-restored-a', 'damaged-ordinary')
                               for suffix in ('-process', '-process-after')]
         for index, name in enumerate(COMMANDS + readiness_commands):
-            code = {'missing-upgrade-budget': 1, 'zero-upgrade-budget': 2,
-                    'readiness-timeout': 1, 'failed-start': 1}.get(name, 0)
+            code = COMMAND_EXITS.get(name, (0,))[0]
             receipt = {'name': name, 'argv': ['/fixture/ww', name], 'exit': code,
                        'elapsed_seconds': 0.1,
                        'stdout': f'{index:04d}-{name}.stdout',
@@ -72,23 +85,39 @@ class NativeContract(unittest.TestCase):
             self.commands.append(receipt)
             for stream in ('stdout', 'stderr'):
                 (self.output / receipt[stream]).write_text('')
+        self.write_json('upgrade-a-b-initiator.json', {
+            'pid': 456, 'uid': os.geteuid(), 'pidfd_live': True,
+            'process_start': ['boot', 2], 'artifact_size': 1234,
+            'argv': ['/fixture/ww', 'upgrade-a-b'],
+            'sha256': self.marker['a']['sha256'], 'revision': self.marker['a']['revision']})
         self.write_json('original-producer-verification.json', {
             key: {'sha256': value['sha256'], 'archive_sha256': value['archive_sha256'],
                   'embedded_revision_bytes': value['revision']}
             for key, value in self.marker.items()})
-        for name, producer in [('a', 'a'), ('b', 'b'), ('restored-a', 'a'),
-                               ('readiness-timeout-restored-a', 'a'),
-                               ('failed-start-restored-a', 'a')]:
+        for name, producer in lane.READINESS_STAGES:
             self.write_json(name + '-readiness.json', {
                 'pid': 123, 'invocation': 'f' * 32, 'process_start': ['boot', 1],
-                'response': {'serving_ready': True,
-                             'artifact': {'digest': self.marker[producer]['sha256']}}})
-        for fault in ('readiness-timeout', 'failed-start'):
+                'installed_file': [2, 3], 'artifact': {'digest': self.marker[producer]['sha256']},
+                'response': {'status': 200, 'body': {'ready': True, 'phase': 'ready'}}})
+        for fault in ('readiness-timeout', 'failed-start', 'updater-interrupted'):
             watcher = self.output / (fault + '-watcher')
             watcher.mkdir()
-            self.write_json(fault + '-watcher/result.json', {'injected': True})
-            self.write_json(fault + '-state.json', {'state': {'disposition': {'kind': 'blocked'}},
-                'journal': {'phase': 'containing', 'disposition': {'stop_intent': True}}})
+            self.write_json(fault + '-watcher/result.json', {'injected': True, 'transaction_id': [1] * 32,
+                'updater_pid': 456, 'updater_signal': 'SIGKILL'})
+            self.write_json(fault + '-state.json', {'installed_sha256': self.marker['b' if fault == 'updater-interrupted' else 'a']['sha256'],
+                'journal': {'phase': 'Starting' if fault == 'updater-interrupted' else 'Containing',
+                            'operation': 'Upgrade', 'stop_intent': True, 'transaction_id': [1] * 32} if fault == 'updater-interrupted' else None})
+        self.write_json('corrupt-rollback.json', {'before_sha256': self.marker['b']['sha256'],
+            'after_sha256': '9' * 64, 'installed_sha256': self.marker['a']['sha256'],
+            'result': {'status': 'failed'}, 'source_size': 104,
+            'scratch_stage': {'size': 104, 'sha256': '9' * 64},
+            'service_before': {'MainPID': '0', 'InvocationID': '', 'ActiveState': 'inactive', 'SubState': 'dead', 'UnitFileState': 'disabled'},
+            'service_after': {'MainPID': '0', 'InvocationID': '', 'ActiveState': 'inactive', 'SubState': 'dead', 'UnitFileState': 'disabled'}})
+        self.write_json('repair-baseline.json', {'result': {'status': 'completed',
+            'outcome': {'kind': 'repaired-baseline', 'historical_rollback_available': False, 'live_ready': False},
+            'activation': False, 'changed_paths': []}, 'manifest': {'committed': True, 'historical_rollback_available': False},
+            'archived_journal_sha256': '8' * 64, 'damaged_journal_sha256': '8' * 64,
+            'retained_corruption_sha256': '9' * 64})
 
     def write_json(self, name, value):
         (self.output / name).write_text(json.dumps(value))
@@ -98,9 +127,31 @@ class NativeContract(unittest.TestCase):
         self.write_json('commands.json', self.commands)
         return lane.validate_native_result(self.output, code, self.marker, 'e' * 64)
 
+    def test_initiator_evidence_is_required_and_bound_to_command_and_current_slot(self):
+        path = self.output / 'upgrade-a-b-initiator.json'
+        original = json.loads(path.read_text())
+        for key, value in [('pidfd_live', False), ('sha256', self.marker['b']['sha256']),
+                           ('revision', self.marker['b']['revision']), ('argv', ['unrelated'])]:
+            with self.subTest(key=key):
+                self.write_json(path.name, dict(original, **{key: value}))
+                with self.assertRaisesRegex(RuntimeError, 'initiating executable'):
+                    self.validate()
+        path.unlink()
+        with self.assertRaises((FileNotFoundError, RuntimeError)):
+            self.validate()
+
     def test_complete_partial_is_accepted_without_rewriting_native_status(self):
-        self.assertEqual(self.validate(), 12)
+        self.assertEqual(self.validate(), len(CHECKS))
         self.assertEqual(json.loads((self.output / 'report.json').read_text())['status'], 'PARTIAL')
+
+    def test_diagnostic_report_cannot_omit_or_claim_native_acceptance(self):
+        for value in (True, None, 'false'):
+            self.report['native_acceptance'] = value
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                self.validate()
+        del self.report['native_acceptance']
+        with self.assertRaises(RuntimeError):
+            self.validate()
 
     def test_generic_exit_two_or_failed_report_is_refused(self):
         for status in ('RUNNING', 'FAILED', 'PASS'):
@@ -142,7 +193,7 @@ class NativeContract(unittest.TestCase):
                 self.validate()
 
     def test_wrong_command_exit_is_refused(self):
-        next(item for item in self.commands if item['name'] == 'failed-start-recover')['exit'] = 1
+        next(item for item in self.commands if item['name'] == 'failed-start-recover')['exit'] = 0
         with self.assertRaisesRegex(RuntimeError, 'command exit'):
             self.validate()
 
@@ -164,6 +215,32 @@ class NativeContract(unittest.TestCase):
         self.write_json('failed-start-watcher/result.json', {'injected': False})
         with self.assertRaisesRegex(RuntimeError, 'injection'):
             self.validate()
+
+    def test_live_rollback_requires_restored_bytes_and_absent_journal(self):
+        path = self.output / 'failed-start-state.json'
+        original = json.loads(path.read_text())
+        for change in ({'journal': {'phase': 'Containing'}},
+                       {'installed_sha256': self.marker['b']['sha256']}):
+            self.write_json(path.name, dict(original, **change))
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, 'live rollback'):
+                self.validate()
+
+    def test_repair_cannot_claim_readiness_or_discard_damaged_evidence(self):
+        path = self.output / 'repair-baseline.json'
+        original = json.loads(path.read_text())
+        for kind in ('ready', 'archive', 'history', 'corruption'):
+            value = copy.deepcopy(original)
+            if kind == 'ready':
+                value['result']['outcome']['live_ready'] = True
+            elif kind == 'history':
+                value['result']['outcome']['historical_rollback_available'] = True
+            elif kind == 'archive':
+                value['archived_journal_sha256'] = 'changed'
+            else:
+                value['retained_corruption_sha256'] = 'changed'
+            self.write_json(path.name, value)
+            with self.subTest(kind=kind), self.assertRaisesRegex(RuntimeError, 'repair evidence'):
+                self.validate()
 
     def test_unknown_extra_command_is_refused(self):
         extra = dict(self.commands[0], name='wrong-executable')
@@ -206,16 +283,16 @@ class SuiteContract(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             lane.validate_boot_output(output.replace('explicit-root', 'configured'))
 
-    def test_boot_receipt_requires_admission_readiness_and_private_cleanup(self):
+    def test_boot_receipt_requires_direct_launch_readiness_and_metadata_preservation(self):
         modes = ('configured', 'bare', 'local-target', 'immutable-target', 'explicit-root')
         record = {'status': 'completed', 'modes': {name: {
                     'status': 'completed', 'private_paths_absent': True, 'service_files': [],
                     'host_returncode': 0,
-                    'admission': {'status': 'completed', 'activation': False,
-                                  'result': {'kind': 'admitted'}},
+                    'launch': {'argv': ['/fixture/ww', 'run'], 'stdin': 'DEVNULL'},
+                    'native_metadata_before': {}, 'native_metadata_after': {},
                     'ready': {'ready': True, 'phase': 'ready'}, 'http_status': {'status': 'ok'}}
                   for name in modes}, 'commands': [{'name': name, 'status': 'completed', 'returncode': 0}
-                  for name in ('install', *(f'admit-{mode}' for mode in modes))]}
+                  for name in ('install',)]}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'report.json'
             path.write_text(json.dumps(record))

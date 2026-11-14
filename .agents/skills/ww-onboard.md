@@ -29,7 +29,7 @@ Run `ww --version` to see if the binary is installed.
 
 Tell them how to get started:
 
-**Linux or macOS (authenticated release):**
+**Linux GNU ARM64 qualification candidate (authenticated release):**
 Provision the release keyring independently. Set `RELEASE_CID` to the selected
 signed release and use an independently obtained installer:
 
@@ -41,19 +41,21 @@ The installer requires Kubo and OpenSSL 3.x or 4.x. It validates the Host and
 kernel/status FHS, preserves existing identity, and creates no daemon or namespace.
 Automatic channel selection remains gated. Source builds can run with explicit
 FHS and identity; they do not bypass authenticated installation.
-See `doc/installation.md` for prerequisites and current release activation gates.
-
-Register a service only when requested, using `ww daemon install` and the same
-startup options as `ww run`. Fresh registration is disabled. Activation uses
-native systemd or launchd commands and requires separate operator intent.
+Automatic native replacement supports managed GNU ARM64 Linux/systemd only;
+qualification and production activation remain separate gates. Ordinary startup
+requires no native-upgrade admission on any supported Host platform. Register a
+service only when requested, then use the native manager for explicit activation.
+See `doc/installation.md` for prerequisites and recovery.
 
 ### If installed
 
 Check if setup is complete: `ww doctor`
 
 Look at the "Install state" section. Missing daemon registration is valid for a
-foreground installation. `ww install` repairs only the exact recorded package;
-it cannot upgrade the Host or FHS. A missing recorded identity requires restoring
+foreground installation. Use `ww install --release <RECORDED_ROOT>` to authenticate
+the exact recorded package and restore missing owned software. Bare `ww install`
+requires the running executable and existing FHS to match the ownership receipt.
+Neither repair upgrades the Host or FHS. A missing recorded identity requires restoring
 the original identity from backup. Do not regenerate identity during repair.
 
 If everything is OK, hand off to the quickstart.
