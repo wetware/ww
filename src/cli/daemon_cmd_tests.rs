@@ -411,6 +411,8 @@ fn renderers_keep_argument_boundaries_and_launchd_disabled_property() {
     );
     assert!(unit.contains("ExecStart=\"/home/a b%%$$/ww\" run --identity \"/home/a b&c/identity\""));
     assert!(unit.contains("--ipfs-url \"http://127.0.0.1:45001/?x=%%20&y=$$v\""));
+    // A required working directory avoids systemd's optional-home fallback.
+    assert!(unit.contains("\nWorkingDirectory=%h\n"));
 }
 
 #[test]

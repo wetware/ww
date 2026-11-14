@@ -8,6 +8,10 @@ Source: https://github.com/wetware/ww
 
 ## Quick reference
 
+Ordinary startup requires no native-upgrade admission. Automatic native replacement
+supports managed GNU ARM64 Linux/systemd with loopback `/readyz`; qualification
+and production activation remain separate gates. See [installation](../doc/installation.md).
+
 ```
 ww run                            # boot the installed FHS, independently of CWD
 ww run .                          # explicitly overlay the current directory
@@ -34,7 +38,7 @@ ww run . --stem 0xAddr --rpc-url http://... --ws-url ws://...
 | `ww doctor` | Check dev environment (Rust, wasm target, Kubo) |
 | `ww install --release CID` | Install signed Host, baseline FHS, and identity; no daemon or publication |
 | `ww image update --release CID` | Update the managed FHS without restarting the Host |
-| `ww upgrade --release CID` | Authenticate native selection through the upgrade engine; operational admission remains gated |
+| `ww upgrade --release CID --timeout-secs N` | Authenticate, stage, stop, replace, restart, check readiness, and commit through `UpgradeCoordinator` |
 | `ww uninstall` | Remove managed software and service registration; preserve user state |
 | `ww daemon install/uninstall` | Register a disabled service, or stop/disable/remove owned registration |
 | `ww ns add NAME --ipns KEY` | Add a namespace (IPFS mount layer) |

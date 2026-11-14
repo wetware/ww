@@ -68,8 +68,9 @@ The shell stages no FHS payloads. The native recovery
 entry point independently authenticates the typed release and checks that its
 own executable matches a recorded transaction generation before recovery.
 
-`ww upgrade` authenticates descriptor selection and delegates to #739. Native
-replacement still refuses until compatibility and startup-admission gates pass;
+`ww upgrade` authenticates descriptor selection and delegates to `UpgradeCoordinator`.
+Automatic native replacement requires the supported managed GNU ARM64
+Linux/systemd configuration and preserves durable rollback and recovery;
 see [native upgrades](native-upgrades.md). `ww image update` authenticates the
 selected FHS and never replaces the native Host or restarts services.
 

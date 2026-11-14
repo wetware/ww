@@ -27,10 +27,7 @@ pub use capture::{
     CaptureBatch, CaptureCancellation, CaptureRequest, CaptureStats, CapturedSource,
 };
 pub use operation::{CompositionError, FrozenMount, FrozenSource, GuestTarget, SourceKind};
-pub use resolution::{
-    capture_frozen_mounts_with_cancel, resolve_frozen_mounts_with_cancel, CapturedMounts,
-    MountResolutionFailure, ResolvedMounts,
-};
+pub use resolution::{resolve_frozen_mounts_with_cancel, MountResolutionFailure, ResolvedMounts};
 pub use selection::{select_kernel_file, KernelFileError, KernelFileFailure, VerifiedKernelFile};
 pub use snapshot::{PublishedSources, SnapshotPublicationFailure};
 
@@ -259,7 +256,7 @@ pub async fn resolve_mounts_virtual_with_cancel(
 ) -> Result<(String, Vec<String>)> {
     anyhow::ensure!(!mounts.is_empty(), "No mounts provided");
     let resolved =
-        resolve_frozen_mounts_with_cancel(mounts, client, transaction, false, cancel).await?;
+        resolve_frozen_mounts_with_cancel(mounts, client, transaction, false, cancel, ()).await?;
     let root = compose_mounts(None, &resolved.mounts, client, cancel).await?;
     Ok((
         root.to_string(),

@@ -1390,7 +1390,6 @@ system::export!({iface_name}Guest);
             .transpose()
             .context("parse --ipns-stem")?;
         let authoritative_source = stem_contract.is_some() || ipns_stem_name.is_some();
-        let baseline_guard = installation::startup_guard(installed_baseline.as_ref())?;
         let ns_configs = Self::startup_namespaces(
             &mounts,
             &namespace_roots,
@@ -1632,12 +1631,14 @@ system::export!({iface_name}Guest);
             &[&deployment_scope],
         )?;
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let baseline_guard = installation::startup_guard(&all_mounts)?;
         let mut mount_resolution = Box::pin(image::resolve_frozen_mounts_with_cancel(
             &all_mounts,
             &boot_ipfs_client,
             &mount_transaction,
             authoritative_source,
             &mut cancel_rx,
+            baseline_guard,
         ));
         let resolved_mounts = tokio::select! {
             result = &mut mount_resolution => result?,
@@ -1651,7 +1652,6 @@ system::export!({iface_name}Guest);
         };
         drop(mount_resolution);
         drop(mount_transaction);
-        drop(baseline_guard);
         let mut frozen_mounts = resolved_mounts.mounts;
         let installed_baseline = has_baseline.then(|| frozen_mounts.remove(0));
         let retained_source_roots = resolved_mounts.retained_roots;

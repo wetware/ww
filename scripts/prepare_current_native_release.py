@@ -17,14 +17,16 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import zipfile
 
 import native_release_inputs as inputs
-from qualify_native_upgrade import custody
+from qualify_native_upgrade import custody, verify_producer_files
 
 TARGET = "aarch64-unknown-linux-gnu"
+PAIR_POLICY = "pr739-reduced-current-pair-native-diagnostic-v1"
 BUILD_POLICY = "same-job-native-build-v1"
 PROFILE = {
     "release": {"dependency_opt_level": "z", "host_opt_level": 2, "lto": True,
@@ -56,6 +58,65 @@ def userspace_description():
     return {"path": str(path), "contents": inputs.read_file(path, inputs.MAX_SIDECAR).decode()}
 
 
+BASELINE_PIN = ".github/native-upgrade-baseline.json"
+# These files neither compile nor stage the canonical FHS. Everything else,
+# including Cargo locks, all crates, std, build scripts and component fixtures,
+# is compared by Git mode/object. The component workflow job is compared below.
+COMPONENT_EXCLUSIONS = {BASELINE_PIN, ".github/workflows/rust.yml",
+    "tests/test_release_workflow.sh",
+    "README.md", "CHANGELOG.md", "doc/deployment.md", "doc/release-authentication.md",
+    "doc/cli.md", "doc/installation.md", "doc/native-upgrades.md", "doc/ai-context.md",
+    ".agents/prompt.md", ".agents/skills/ww-onboard.md",
+    # Retain exact retired paths while R0 still contains these qualification inputs.
+    # Removing an exclusion would compare the retired R0 path with its deletion.
+    "tests/fixtures/native-release-originals/README.md",
+    "tests/fixtures/native-release-originals/.gitattributes",
+    ".github/native-release-integration.json", "scripts/fetch_native_release_inputs.py",
+    *["tests/fixtures/native-release-originals/inputs/" + name for name in (
+        "a.zip", "b.zip", "a-artifact.json", "b-artifact.json", "a-run.json", "b-run.json",
+        "a-build-job.json", "b-build-job.json", "a-jobs.json", "b-jobs.json",
+        "a-build.log", "b-build.log", "capture-manifest.json", "retention.json")],
+    *["scripts/" + name + ".py" for name in (
+        "prepare_current_native_release", "native_release_inputs", "verify_native_release_inputs",
+        "check_repository_artifacts",
+        "qualify_native_upgrade", "run_native_release_integration", "run_native_development_boot")],
+    *["tests/" + name + ".py" for name in (
+        "native_release_integration", "test_installed_boot", "test_guarded_boot_fixture", "test_prepare_current_native_release",
+        "test_qualify_native_upgrade", "test_native_release_integration", "test_native_release_provisioner",
+        "test_native_development_boot", "test_native_qualification_boundary", "test_install",
+        "test_native_release_inputs", "test_verify_native_release_inputs", "test_fetch_native_release_inputs",
+        "test_repository_artifacts")]}
+
+
+def baseline_pin(checkout):
+    path = checkout / BASELINE_PIN
+    value = inputs.read_json(path)
+    require(set(value) == {"schema", "repository", "revision", "contract"}
+            and value["schema"] == 1 and value["repository"] == "wetware/ww"
+            and value["contract"] == "managed-systemd-v3"
+            and isinstance(value["revision"], str) and re.fullmatch(r"[0-9a-f]{40}", value["revision"]),
+            "reviewed reduced baseline pin is unresolved or invalid")
+    return value
+
+
+def component_manifest(checkout, revision):
+    entries = {}
+    for entry in inputs.git(checkout, "ls-tree", "-rz", revision).split(b"\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        name = name.decode()
+        if name in COMPONENT_EXCLUSIONS:
+            continue
+        entries[name] = metadata.decode()
+    workflow = inputs.git(checkout, "show", revision + ":.github/workflows/rust.yml").decode()
+    match = re.search(r"(?m)^  build-wasm:\n(?:^ {4}.*\n|^\n)*", workflow)
+    require(match is not None, "component build workflow is missing")
+    entries[".github/workflows/rust.yml:build-wasm"] = inputs.digest((match.group().rstrip() + "\n").encode())
+    entries[".github/workflows/rust.yml:header"] = inputs.digest(inputs.workflow_header(workflow.encode()))
+    return inputs.digest(json.dumps(entries, sort_keys=True).encode())
+
+
 def source_snapshot(checkout, revision, component_revision):
     require(re.fullmatch(r"[0-9a-f]{40}", revision) is not None
             and re.fullmatch(r"[0-9a-f]{40}", component_revision) is not None,
@@ -63,12 +124,25 @@ def source_snapshot(checkout, revision, component_revision):
     require(inputs.git(checkout, "rev-parse", "HEAD").decode().strip() == revision,
             "checkout HEAD differs from requested revision")
     tree = inputs.git(checkout, "rev-parse", revision + "^{tree}").decode().strip()
-    require(inputs.git(checkout, "rev-parse", component_revision + "^{tree}").decode().strip() == tree,
-            "component artifact source tree differs from current Host source")
+    component_tree = inputs.git(checkout, "rev-parse", component_revision + "^{tree}").decode().strip()
+    component = {"component_tree_equal": component_tree == tree}
+    if component_tree != tree:
+        manifest = component_manifest(checkout, revision)
+        require(manifest == component_manifest(checkout, component_revision),
+                "component artifact source differs from current Host source")
+        component.update(component_source_equal=True, component_manifest_sha256=manifest,
+                         component_source_tree=component_tree)
     result = inputs.verify_source(checkout, revision, ".github/workflows/rust.yml")
-    result.update(component_revision=component_revision, source_tree=tree,
-                  component_tree_equal=True)
+    result.update(component_revision=component_revision, source_tree=tree, **component)
     return result
+
+
+def verify_component_binding(source):
+    if source.get("component_tree_equal") is True:
+        return True
+    return (source.get("component_tree_equal") is False and source.get("component_source_equal") is True
+            and re.fullmatch(r"[0-9a-f]{64}", source.get("component_manifest_sha256", "")) is not None
+            and re.fullmatch(r"[0-9a-f]{40}", source.get("component_source_tree", "")) is not None)
 
 
 def build_command(profile):
@@ -108,11 +182,22 @@ def ci_context(revision, profile, run_id, attempt, job):
         head_repository = head["repo"]["full_name"]
         require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", head_repository), "invalid PR source repository")
         is_head = head["sha"] == revision
-        require(is_head or (profile == "development" and os.environ.get("GITHUB_SHA") == revision),
+        pin = None
+        if not is_head and profile == "release":
+            harness = Path(__file__).resolve().parents[1]
+            pin = baseline_pin(harness)
+            require(pin["revision"] == revision and head_repository == "wetware/ww",
+                    "baseline source does not match the reviewed repository pin")
+            require(inputs.git(harness, "rev-parse", "HEAD").decode().strip() == head["sha"]
+                    and inputs.git(harness, "show", head["sha"] + ":" + BASELINE_PIN)
+                    == inputs.read_file(harness / BASELINE_PIN, inputs.MAX_JSON),
+                    "baseline pin is not the exact PR-head repository content")
+        require(is_head or pin is not None or (profile == "development" and os.environ.get("GITHUB_SHA") == revision),
                 "PR source revision is neither the exact head nor the current development merge")
         source_repository = head_repository if is_head else "wetware/ww"
         pr_source = {"head_revision": head["sha"], "head_repository": head_repository,
-                     "revision_kind": "pull-request-head" if is_head else "pull-request-merge"}
+                     "revision_kind": "pull-request-head" if is_head else "pinned-reduced-baseline" if pin else "pull-request-merge",
+                     **({"baseline_pin": pin} if pin else {})}
         branch = head["ref"]
     else:
         require(profile == "development" and event_name in ("push", "workflow_dispatch")
@@ -139,6 +224,7 @@ def build(checkout, output, revision, component_revision, profile, run_id=None, 
     require(not output.exists() and output.parent.resolve(strict=True) == output.parent,
             "current output must be absent below a canonical parent")
     if local_diagnostic:
+        require(os.environ.get("GITHUB_ACTIONS") != "true", "local diagnostic cannot replace actual CI source authority")
         require(run_id is None and attempt is None and job is None,
                 "local diagnostic must not assert CI identity")
         context = {"kind": "local-native-diagnostic", "revision": revision,
@@ -266,7 +352,16 @@ def verify_build_files(directory, profile, owner=None):
         require(ci["workflow_sha"] == receipt["source"]["component_revision"], "current component source differs from workflow")
         if ci["event"] == "pull_request":
             is_head = ci["revision_kind"] == "pull-request-head"
+            pinned = ci["revision_kind"] == "pinned-reduced-baseline"
+            if pinned:
+                pin = ci.get("baseline_pin", {})
+                require(set(pin) == {"schema", "repository", "revision", "contract"}
+                        and pin == {"schema": 1, "repository": "wetware/ww", "revision": revision,
+                                    "contract": "managed-systemd-v3"}
+                        and profile == "release" and ci["head_repository"] == "wetware/ww"
+                        and revision != ci["head_revision"], "invalid pinned baseline CI source")
             require((is_head and revision == ci["head_revision"] and ci["source_repository"] == ci["head_repository"])
+                    or pinned
                     or (profile == "development" and ci["revision_kind"] == "pull-request-merge"
                         and revision == ci["workflow_sha"] and ci["source_repository"] == "wetware/ww"),
                     "current PR source identity differs")
@@ -281,7 +376,7 @@ def verify_build_files(directory, profile, owner=None):
     require(receipt["source"]["checkout_revision"] == revision
             and receipt["source"]["artifact_revision"] == revision
             and receipt["source"]["runtime_source_equal"] is True
-            and receipt["source"]["component_tree_equal"] is True, "current source binding differs")
+            and verify_component_binding(receipt["source"]), "current source binding differs")
     require(receipt["environment"] == {"WW_BUILD_GIT_SHA": revision, "CARGO_INCREMENTAL": "0", "CARGO_BUILD_JOBS": "2", "RUSTUP_TOOLCHAIN": "1.99.1",
              "CARGO_TARGET_DIR": receipt["environment"]["CARGO_TARGET_DIR"],
              **({"CARGO_PROFILE_DEV_DEBUG": "0"} if profile == "development" else {})},
@@ -322,10 +417,100 @@ def verify_build_files(directory, profile, owner=None):
 def verify_candidate(checkout, directory, revision, profile, owner=None):
     receipt = verify_build_files(directory, profile, owner=owner)
     require(receipt["ci"]["revision"] == revision, "candidate revision differs")
+    if receipt["ci"].get("revision_kind") == "pinned-reduced-baseline":
+        require(receipt["ci"]["baseline_pin"] == baseline_pin(Path(__file__).resolve().parents[1]),
+                "candidate baseline differs from reviewed repository pin")
     require(source_snapshot(checkout.resolve(strict=True), revision, receipt["source"]["component_revision"])
             == receipt["source"], "current source changed after build")
     verify_profile(checkout, profile)
     return receipt
+
+
+def pair_source_roles(checkout=None):
+    """Bind both local and CI fixture slots to this actual reviewed harness."""
+    checkout = (Path(__file__).resolve().parents[1] if checkout is None else checkout).resolve(strict=True)
+    head = inputs.git(checkout, "rev-parse", "HEAD").decode().strip()
+    pin = baseline_pin(checkout)
+    raw = inputs.read_file(checkout / BASELINE_PIN, inputs.MAX_JSON)
+    require(inputs.git(checkout, "show", head + ":" + BASELINE_PIN) == raw,
+            "pair baseline pin is not committed in the actual final harness HEAD")
+    require(head != pin["revision"], "final harness and baseline must be distinct reviewed revisions")
+    return {"harness_revision": head, "baseline_pin": pin, "baseline_pin_sha256": inputs.digest(raw)}
+
+
+def validate_pair_roles(builds, roles):
+    require(set(builds) == {"a", "b"}
+            and set(roles) == {"harness_revision", "baseline_pin", "baseline_pin_sha256"},
+            "current pair source roles are incomplete")
+    pin = roles["baseline_pin"]
+    require(set(pin) == {"schema", "repository", "revision", "contract"}
+            and pin["schema"] == 1 and pin["repository"] == "wetware/ww"
+            and pin["contract"] == "managed-systemd-v3"
+            and re.fullmatch(r"[0-9a-f]{40}", pin["revision"])
+            and re.fullmatch(r"[0-9a-f]{40}", roles["harness_revision"])
+            and re.fullmatch(r"[0-9a-f]{64}", roles["baseline_pin_sha256"])
+            and roles["harness_revision"] != pin["revision"], "invalid current pair source roles")
+    a, b = builds["a"]["ci"], builds["b"]["ci"]
+    require(a["revision"] == roles["harness_revision"] and b["revision"] == pin["revision"],
+            "pair slots must be actual final harness HEAD and exact reviewed baseline")
+    local_a, local_b = a.get("kind") == "local-native-diagnostic", b.get("kind") == "local-native-diagnostic"
+    require(local_a == local_b, "pair cannot mix local and CI source authority")
+    if not local_a:
+        require(a["revision_kind"] == "pull-request-head" and b["revision_kind"] == "pinned-reduced-baseline"
+                and b["baseline_pin"] == pin and a["head_revision"] == roles["harness_revision"],
+                "CI pair must use exact head and pinned baseline source roles")
+        shared = ("repository", "source_repository", "event", "run_id", "attempt", "job",
+                  "workflow_sha", "workflow_ref", "head_revision", "head_repository")
+        require(all(key in a and key in b and a[key] == b[key] for key in shared)
+                and a["repository"] == a["source_repository"] == a["head_repository"] == "wetware/ww"
+                and a["event"] == "pull_request", "CI pair comes from different run/job/head/component context")
+
+
+def combine_current(checkout_a, candidate_a, revision_a, checkout_b, candidate_b, revision_b, output):
+    """Freeze two current-contract release builds; a is the final-head initiator.
+
+    Fixture sequence order is independent of Git ancestry. Original historical
+    A/B evidence is never used as either reduced-contract executable.
+    """
+    builds = {label: verify_candidate(checkout, candidate, revision, "release")
+              for label, checkout, candidate, revision in
+              (("a", checkout_a, candidate_a, revision_a), ("b", checkout_b, candidate_b, revision_b))}
+    roles = pair_source_roles()
+    validate_pair_roles(builds, roles)
+    require(builds["a"]["host"]["sha256"] != builds["b"]["host"]["sha256"],
+            "changed native qualification requires distinct executable bytes")
+    output = output.absolute()
+    require(not output.exists() and output.parent.resolve(strict=True) == output.parent,
+            "combined output must be absent below a canonical parent")
+    with tempfile.TemporaryDirectory(prefix=".current-inputs-", dir=output.parent) as temporary:
+        stage = Path(temporary) / "verified"
+        stage.mkdir(mode=0o755)
+        markers = {}
+        for label, candidate in (("a", candidate_a), ("b", candidate_b)):
+            receipt = builds[label]
+            shutil.copytree(candidate, stage / label)
+            verify_build_files(stage / label, "release")
+            shutil.copyfile(candidate / "candidate.zip", stage / (label + ".zip"))
+            (stage / (label + ".zip")).chmod(0o644)
+            marker = {"path": str(stage / label / "ww"), "archive_path": str(stage / (label + ".zip")),
+                "sha256": receipt["host"]["sha256"],
+                "archive_sha256": file_binding(stage / (label + ".zip"), 1024 ** 3)["sha256"],
+                "revision": receipt["ci"]["revision"], "run_id": receipt["ci"].get("run_id"),
+                "attempt": receipt["ci"].get("attempt"), "builder": receipt["builder"]}
+            verify_producer_files(marker, TARGET, os.geteuid())
+            marker.update(path=str(output / label / "ww"), archive_path=str(output / (label + ".zip")))
+            markers[label] = marker
+        result = {"schema": 2, "policy": PAIR_POLICY, "status": "VERIFIED_DIAGNOSTIC_INPUTS",
+                  "native_acceptance": False, "publication_allowed": False, "required_checks_success": False,
+                  "slot_identities": {"a": "reduced-current-R1", "b": "reduced-current-R0"},
+                  "current_builds": builds, "source_roles": roles,
+                  "producer_evidence": {label: {"kind": "same-job-current-native-build", "fhs": build["fhs"],
+                      "completed_job_receipt": False, "required_checks_success": False}
+                      for label, build in builds.items()}, **markers}
+        write_json(stage / "verified-inputs.json", result)
+        require(not output.exists(), "combined output appeared during verification")
+        stage.rename(output)
+    return result
 
 
 def main():
@@ -341,10 +526,20 @@ def main():
         producer.add_argument("--" + name, type=int)
     producer.add_argument("--local-diagnostic", action="store_true")
     producer.add_argument("--profile", choices=PROFILE, required=True)
+    consumer = modes.add_parser("verify-current-pair")
+    for label in ("a", "b"):
+        for name in ("checkout", "candidate"):
+            consumer.add_argument("--" + name + "-" + label, required=True, type=Path)
+        consumer.add_argument("--revision-" + label, required=True)
+    consumer.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:
-        build(args.checkout, args.output, args.revision, args.component_revision,
-              args.profile, args.run_id, args.attempt, args.job, local_diagnostic=args.local_diagnostic)
+        if args.mode == "build":
+            build(args.checkout, args.output, args.revision, args.component_revision,
+                  args.profile, args.run_id, args.attempt, args.job, local_diagnostic=args.local_diagnostic)
+        else:
+            combine_current(args.checkout_a, args.candidate_a, args.revision_a,
+                            args.checkout_b, args.candidate_b, args.revision_b, args.output)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(json.dumps({"status": "REFUSED", "error": str(error)}), file=sys.stderr)
         return 1

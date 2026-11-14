@@ -4,7 +4,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use ww::installation_state::{MutationLock, Receipt};
+use ww::installation_state::{FhsGuard, MutationLock, Receipt};
 use ww::upgrade::storage as durable;
 
 use super::upgrade_cmd::{self, ReleaseArgs, Scope};
@@ -260,46 +260,51 @@ pub(super) fn installed_fhs(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Hold through source capture. The running Host releases this guard after it
-/// owns a frozen baseline; FHS updates never change that captured generation.
+/// Exclude FHS writers until the local capture worker owns immutable bytes.
+/// Check every local mount, including explicit overlays and ancestor directories.
 pub(super) fn startup_guard(
-    baseline: Option<&ww::cell::mount::Mount>,
-) -> Result<Option<MutationLock>> {
+    mounts: &[ww::cell::mount::Mount],
+) -> Result<Option<FhsGuard<'static>>> {
     let Some(home) = dirs::home_dir() else {
         return Ok(None);
     };
-    startup_guard_at(&home, baseline)
+    startup_guard_at(&home, mounts)
 }
 
 fn startup_guard_at(
     home: &Path,
-    baseline: Option<&ww::cell::mount::Mount>,
-) -> Result<Option<MutationLock>> {
+    mounts: &[ww::cell::mount::Mount],
+) -> Result<Option<FhsGuard<'static>>> {
+    use ww::cell::mount::{classify_source, MountSource};
     let root = home.join(".ww");
-    let Some(baseline) = baseline else {
-        return Ok(None);
-    };
-    let selected = Path::new(&baseline.source)
-        .canonicalize()
-        .context("resolve selected FHS")?;
     let managed = match root.join("fhs").canonicalize() {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("resolve managed FHS"),
     };
-    if selected != managed {
+    let mut overlaps = false;
+    for mount in mounts {
+        if matches!(classify_source(&mount.source)?, MountSource::Local) {
+            let source = Path::new(&mount.source)
+                .canonicalize()
+                .context("resolve local capture source")?;
+            overlaps |= source.starts_with(&managed) || managed.starts_with(&source);
+        }
+    }
+    if !overlaps {
         return Ok(None);
     }
-    if !durable::exists(&root.join("installation.json"))?
-        && !durable::exists(&root.join("image-update.json"))?
-        && !durable::exists(&root.join("host-upgrade.json"))?
+    let guard = FhsGuard::shared(home)?;
+    ensure!(
+        managed == root.join("fhs").canonicalize()?,
+        "managed FHS changed before capture; retry startup"
+    );
+    if durable::exists(&root.join("installation.json"))?
+        || durable::exists(&root.join("image-update.json"))?
     {
-        return Ok(None);
+        installed_fhs(&root)?;
     }
-    let lock = MutationLock::acquire(home)?;
-    lock.reject_pending()?;
-    installed_fhs(&root)?;
-    Ok(Some(lock))
+    Ok(Some(guard))
 }
 
 pub(super) async fn install(args: InstallArgs) -> Result<()> {
@@ -309,17 +314,27 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
     let root = home.join(".ww");
     let selected = if args.release.release.is_some() {
         Some(upgrade_cmd::select_release(&args.release, Scope::Both).await?)
+    } else if let Some(root) = &args.bootstrap_release {
+        let mut release = args.release.clone();
+        release.release = Some(root.clone());
+        Some(upgrade_cmd::select_release(&release, Scope::Metadata).await?)
     } else {
         None
     };
     let state = Receipt::read(&root)?;
+    let _fhs = lock.exclusive_fhs()?;
     ensure!(selected.is_some() || args.payload.is_some() || state.is_some(), "automatic release discovery awaits trusted channel provisioning; use ww install --release <CID> or the authenticated shell bootstrap");
     let current = std::env::current_exe()?.canonicalize()?;
-    let native = match &selected {
-        Some(s) => s.host.clone().context("selected Host bytes missing")?,
-        None => std::fs::read(&current)?,
+    let native = if args.release.release.is_some() {
+        selected
+            .as_ref()
+            .and_then(|s| s.host.clone())
+            .context("selected Host bytes missing")?
+    } else {
+        std::fs::read(&current)?
     };
-    let (kernel, status) = if let Some(s) = &selected {
+    let (kernel, status) = if args.release.release.is_some() {
+        let s = selected.as_ref().context("selected release missing")?;
         (
             s.kernel.clone().context("selected kernel missing")?,
             s.status.clone().context("selected status missing")?,
@@ -341,6 +356,10 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         )
     };
     let bytes = [native, kernel, status];
+    if let Some(selected) = &selected {
+        selected.selection.verify_host(&bytes[0])?;
+        selected.selection.verify_deployment(&bytes[1], &bytes[2])?;
+    }
     if args.payload.is_some() {
         let keys = ww::release::auth::TrustedKeys::from_bytes(&upgrade_cmd::read_bounded(
             &args.release.trusted_release_keys,
@@ -446,12 +465,14 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
         })
         .chain(key.is_none().then_some(identity.clone()))
         .collect();
-    let release = selected
-        .as_ref()
-        .map(|s| s.root.to_string())
-        .or(args.bootstrap_release)
-        .map(|value| upgrade_cmd::release_cid(&value).map(|cid| cid.to_string()))
-        .transpose()?;
+    let release = installation_release(
+        &root,
+        state.is_some(),
+        selected
+            .as_ref()
+            .map(|s| s.root.to_string())
+            .or(args.bootstrap_release),
+    )?;
     if !args.check {
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -491,17 +512,51 @@ pub(super) async fn install(args: InstallArgs) -> Result<()> {
             durable::write_record(&root.join("installation.json"), &migrated.encode()?)?;
         }
         if let Some(release) = &release {
-            durable::write_record(
-                &root.join("installed-release.json"),
-                &serde_json::to_vec(&upgrade_cmd::InstalledRelease {
-                    version: 1,
-                    release: release.clone(),
-                })?,
-            )?;
+            // Reinstalling identical bytes cannot select a different native
+            // generation. Keep the accepted locator and retained proof together.
+            if state.is_none() {
+                durable::write_record(
+                    &root.join("installed-release.json"),
+                    &serde_json::to_vec(&upgrade_cmd::InstalledRelease {
+                        version: 1,
+                        release: release.clone(),
+                    })?,
+                )?;
+            }
+        }
+    }
+    drop(_fhs);
+    // Fresh signed installations retain proofs for offline native recovery.
+    // Existing installations with missing provenance require explicit repair.
+    if !args.check && state.is_none() {
+        if let Some(selected) = &selected {
+            ww::upgrade::UpgradeCoordinator::from_lock(lock)?
+                .initialize_completed_installation(&selected.generation)?;
         }
     }
     Report { version: 1, operation: "install", changed_paths, target: root, release, fhs: Some(FhsDigests {kernel_blake3: digest(&bytes[1]), status_blake3: digest(&bytes[2])}), previous_fhs: state.as_ref().map(FhsDigests::from), activation: false, check: args.check, recovery: None,
         warnings: vec!["Host, baseline FHS, and identity only. Register a daemon separately with ww daemon install.".into()], service: None }.print(args.json)
+}
+
+fn installation_release(
+    root: &Path,
+    installed: bool,
+    selected: Option<String>,
+) -> Result<Option<String>> {
+    let release = if installed {
+        read_regular(&root.join("installed-release.json"))?
+            .map(|bytes| -> Result<String> {
+                let locator: upgrade_cmd::InstalledRelease = serde_json::from_slice(&bytes)
+                    .context("invalid installed release locator; preserve evidence and explicitly repair baseline")?;
+                ensure!(locator.version == 1, "unsupported installed release locator");
+                Ok(locator.release)
+            }).transpose()?
+    } else {
+        selected
+    };
+    release
+        .map(|value| upgrade_cmd::release_cid(&value).map(|cid| cid.to_string()))
+        .transpose()
 }
 
 fn service_path(home: &Path) -> PathBuf {
@@ -600,6 +655,7 @@ fn recover_image(root: &Path, check: bool) -> Result<Option<ImageRecovery>> {
 pub(super) async fn image_update(args: UpdateArgs) -> Result<()> {
     let home = dirs::home_dir().context("cannot determine HOME")?;
     let lock = MutationLock::acquire(&home)?;
+    let _fhs = lock.exclusive_fhs()?;
     let root = home.join(".ww");
     parents(&home, &root.join("image-update.json"))?;
     ensure!(
@@ -716,6 +772,7 @@ fn uninstall_with(
     remove_service: impl FnOnce(&MutationLock, bool) -> Result<super::daemon_cmd::RemovalReport>,
 ) -> Result<Report> {
     lock.reject_pending()?;
+    let _fhs = lock.exclusive_fhs()?;
     let home = lock.home();
     let root = home.join(".ww");
     parents(home, &root.join("installation.json"))?;
@@ -745,6 +802,7 @@ fn uninstall_with(
     for name in [
         "installation.json",
         "installed-release.json",
+        "host-upgrade-retained.json",
         "uninstalled-software.json",
     ] {
         durable::read_record(&root.join(name))?;
@@ -753,6 +811,7 @@ fn uninstall_with(
     if !check {
         let _ = migrate(&root, &state)?;
         durable::write_record(&root.join("uninstalled-software.json"), &state.encode()?)?;
+        archive_uninstalled_native_retention(&root)?;
         for index in (1..3).rev() {
             let path = root.join(SOFTWARE[index]);
             if let Some(bytes) = read_regular(&path)? {
@@ -779,6 +838,27 @@ fn uninstall_with(
         }
     }
     Ok(Report { version:1,operation:"uninstall",changed_paths:paths,target:root,release:None,fhs:None,previous_fhs:None,activation:false,check,recovery:None,warnings:vec!["Identity, namespaces, keys, application data, logs, signed state, and recovery evidence were preserved.".into()],service:Some(service) })
+}
+
+fn archive_uninstalled_native_retention(root: &Path) -> Result<()> {
+    let active = root.join("host-upgrade-retained.json");
+    let Some(bytes) = durable::read_record(&active)? else {
+        return Ok(());
+    };
+    let archive = root.join(format!(
+        "uninstalled-native-retention-{}.json",
+        digest(&bytes)
+    ));
+    match durable::read_record(&archive)? {
+        Some(previous) => ensure!(
+            previous == bytes,
+            "uninstalled native evidence archive differs"
+        ),
+        None => durable::write_record(&archive, &bytes)?,
+    }
+    // The archive is durable before detaching the old installation's active
+    // record. Retained executables and proofs remain available to the operator.
+    durable::remove(&active)
 }
 
 #[cfg(test)]
@@ -943,6 +1023,41 @@ mod tests {
     }
 
     #[test]
+    fn native_journal_damage_does_not_block_valid_fhs_capture() {
+        let (home, _, _) = fixture();
+        let root = home.path().join(".ww");
+        recover_image(&root, false).unwrap();
+        durable::write_record(&root.join("host-upgrade.json"), b"damaged native journal").unwrap();
+        let baseline = ww::cell::mount::Mount {
+            source: root.join("fhs").to_str().unwrap().into(),
+            target: ww::cell::image::GuestTarget::root(),
+        };
+        let captured = startup_guard_at(home.path(), std::slice::from_ref(&baseline));
+        assert!(
+            captured.is_ok(),
+            "native journal vetoed ordinary startup: {:?}",
+            captured.as_ref().err()
+        );
+        assert_eq!(
+            std::fs::read(root.join("host-upgrade.json")).unwrap(),
+            b"damaged native journal"
+        );
+    }
+
+    #[test]
+    fn updater_mutation_lock_does_not_block_valid_fhs_capture() {
+        let (home, _, _) = fixture();
+        let root = home.path().join(".ww");
+        recover_image(&root, false).unwrap();
+        let _updater = MutationLock::acquire(home.path()).unwrap();
+        let baseline = ww::cell::mount::Mount {
+            source: root.join("fhs").to_str().unwrap().into(),
+            target: ww::cell::image::GuestTarget::root(),
+        };
+        assert!(startup_guard_at(home.path(), std::slice::from_ref(&baseline)).is_ok());
+    }
+
+    #[test]
     fn startup_guard_excludes_updates_until_capture_finishes() {
         let (home, _, _) = fixture();
         let root = home.path().join(".ww");
@@ -950,22 +1065,28 @@ mod tests {
             source: root.join("fhs").to_str().unwrap().into(),
             target: ww::cell::image::GuestTarget::root(),
         };
-        assert!(startup_guard_at(home.path(), Some(&baseline)).is_err());
+        assert!(startup_guard_at(home.path(), std::slice::from_ref(&baseline)).is_err());
         let mut alias = baseline.clone();
         alias.source = root.join("fhs/../fhs").to_str().unwrap().into();
-        assert!(startup_guard_at(home.path(), Some(&alias)).is_err());
+        assert!(startup_guard_at(home.path(), std::slice::from_ref(&alias)).is_err());
         recover_image(&root, false).unwrap();
-        let guard = startup_guard_at(home.path(), Some(&baseline))
+        let guard = startup_guard_at(home.path(), std::slice::from_ref(&baseline))
             .unwrap()
             .unwrap();
-        assert!(MutationLock::acquire(home.path()).is_err());
-        assert!(startup_guard_at(home.path(), Some(&alias)).is_err());
+        let mutation = MutationLock::acquire(home.path()).unwrap();
+        assert!(mutation.exclusive_fhs().is_err());
+        let second_reader = startup_guard_at(home.path(), std::slice::from_ref(&baseline)).unwrap();
         drop(guard);
-        assert!(MutationLock::acquire(home.path()).is_ok());
+        assert!(mutation.exclusive_fhs().is_err());
+        drop(second_reader);
+        let writer = mutation.exclusive_fhs().unwrap();
+        assert!(startup_guard_at(home.path(), std::slice::from_ref(&baseline)).is_err());
+        drop(writer);
+        assert!(startup_guard_at(home.path(), std::slice::from_ref(&baseline)).is_ok());
     }
 
     #[test]
-    fn managed_startup_rejects_pending_recovery_without_receipt() {
+    fn managed_startup_rejects_pending_image_but_ignores_native_journal_without_receipt() {
         let (home, _, _) = fixture();
         let root = home.path().join(".ww");
         durable::remove(&root.join("installation.json")).unwrap();
@@ -973,11 +1094,37 @@ mod tests {
             source: root.join("fhs").to_str().unwrap().into(),
             target: ww::cell::image::GuestTarget::root(),
         };
-        assert!(startup_guard_at(home.path(), Some(&baseline)).is_err());
+        assert!(startup_guard_at(home.path(), std::slice::from_ref(&baseline)).is_err());
         assert!(recover_image(&root, false).is_err());
         durable::remove(&root.join("image-update.json")).unwrap();
         durable::write_record(&root.join("host-upgrade.json"), b"pending").unwrap();
-        assert!(startup_guard_at(home.path(), Some(&baseline)).is_err());
+        assert!(
+            startup_guard_at(home.path(), std::slice::from_ref(&baseline))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn explicit_local_mounts_and_ancestors_hold_managed_fhs_capture_guard() {
+        let (home, _, _) = fixture();
+        let root = home.path().join(".ww");
+        recover_image(&root, false).unwrap();
+        for source in [
+            root.clone(),
+            root.join("fhs"),
+            root.join("fhs/boot/kernel.wasm"),
+        ] {
+            let mounts = [ww::cell::mount::Mount {
+                source: source.to_str().unwrap().into(),
+                target: ww::cell::image::GuestTarget::root(),
+            }];
+            let reader = startup_guard_at(home.path(), &mounts).unwrap().unwrap();
+            let mutation = MutationLock::acquire(home.path()).unwrap();
+            assert!(mutation.exclusive_fhs().is_err());
+            drop(reader);
+            assert!(mutation.exclusive_fhs().is_ok());
+        }
     }
 
     #[test]
@@ -990,9 +1137,11 @@ mod tests {
             source: external.to_str().unwrap().into(),
             target: ww::cell::image::GuestTarget::root(),
         };
-        assert!(startup_guard_at(home.path(), Some(&baseline))
-            .unwrap()
-            .is_none());
+        assert!(
+            startup_guard_at(home.path(), std::slice::from_ref(&baseline))
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn absent_service(
@@ -1008,6 +1157,38 @@ mod tests {
             running: false,
             enabled: false,
         })
+    }
+
+    #[test]
+    fn uninstall_archives_old_native_generation_before_reinstallation() {
+        let (home, _, _) = fixture();
+        let root = home.path().join(".ww");
+        recover_image(&root, false).unwrap();
+        atomic_write(&root.join(SOFTWARE[0]), b"legacy", true).unwrap();
+        let retained = b"retained historical native generation";
+        durable::write_record(&root.join("host-upgrade-retained.json"), retained).unwrap();
+        let store = root.join("bin/.ww-host-upgrade");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("retained-executable"), b"preserved rollback").unwrap();
+        let lock = MutationLock::acquire(home.path()).unwrap();
+        uninstall_with(&lock, false, absent_service).unwrap();
+        assert!(!root.join("host-upgrade-retained.json").exists());
+        assert_eq!(
+            std::fs::read(root.join(format!(
+                "uninstalled-native-retention-{}.json",
+                digest(retained)
+            )))
+            .unwrap(),
+            retained
+        );
+        assert_eq!(
+            std::fs::read(store.join("retained-executable")).unwrap(),
+            b"preserved rollback"
+        );
+        assert!(Receipt::read(&root).unwrap().is_none());
+        // Retry cannot replace the archived evidence or restore active metadata.
+        uninstall_with(&lock, false, absent_service).unwrap();
+        assert!(!root.join("host-upgrade-retained.json").exists());
     }
 
     #[test]
@@ -1089,6 +1270,43 @@ mod tests {
         ))
         .is_err());
         assert!(root.join(SOFTWARE[0]).exists());
+    }
+
+    #[test]
+    fn repeat_install_preserves_accepted_locator_for_equivalent_release() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let release = |byte| {
+            cid::Cid::new_v1(
+                0x70,
+                cid::multihash::Multihash::wrap(0x12, &[byte; 32]).unwrap(),
+            )
+            .to_string()
+        };
+        let accepted = release(1);
+        let selected = release(2);
+        let bytes = serde_json::to_vec(&upgrade_cmd::InstalledRelease {
+            version: 1,
+            release: accepted.clone(),
+        })
+        .unwrap();
+        std::fs::write(root.join("installed-release.json"), &bytes).unwrap();
+        assert_eq!(
+            installation_release(root, true, Some(selected.clone())).unwrap(),
+            Some(accepted)
+        );
+        assert_eq!(
+            std::fs::read(root.join("installed-release.json")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            installation_release(root, false, Some(selected.clone())).unwrap(),
+            Some(selected)
+        );
+        std::fs::remove_file(root.join("installed-release.json")).unwrap();
+        assert!(installation_release(root, true, Some(release(3)))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

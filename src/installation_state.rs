@@ -15,9 +15,74 @@ pub struct MutationLock {
     home: PathBuf,
 }
 
+/// Short-lived exclusion between managed FHS capture and FHS modification.
+///
+/// Readers take only the shared guard and release it after source capture.
+/// Writers must first acquire `MutationLock`, then call `exclusive_fhs`.
+/// A native upgrade holds `MutationLock` but does not modify the FHS, so its
+/// replacement Host can capture the FHS without inheriting updater authority.
+pub struct FhsGuard<'a> {
+    _file: File,
+    // An exclusive guard cannot outlive the mutation owner that acquired it.
+    _mutation: Option<&'a MutationLock>,
+}
+
+impl FhsGuard<'static> {
+    pub fn shared(home: &Path) -> Result<Self> {
+        Ok(Self {
+            _file: fhs_lock(home, libc::LOCK_SH)?,
+            _mutation: None,
+        })
+    }
+}
+
+fn fhs_lock(home: &Path, operation: libc::c_int) -> Result<File> {
+    ensure!(home.is_absolute(), "installation HOME must be absolute");
+    ensure!(
+        std::fs::symlink_metadata(home)?.is_dir(),
+        "installation HOME must be a directory without symlink traversal"
+    );
+    // Keep the inode outside the removable installation, just like MutationLock.
+    // This file contains no persistent lease or transaction state.
+    let path = home.join(".ww-fhs.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)
+        .with_context(|| format!("open FHS capture lock {}", path.display()))?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid takes no pointers.
+    let uid = unsafe { libc::geteuid() };
+    ensure!(
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.uid() == uid
+            && metadata.mode() & 0o022 == 0,
+        "FHS capture lock must be a private regular file owned by this user"
+    );
+    // SAFETY: file owns the descriptor and flock retains no pointer.
+    if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("FHS capture or modification is in progress; retry after it completes");
+    }
+    Ok(file)
+}
+
 impl MutationLock {
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// Writer order is always MutationLock → exclusive FHS guard.
+    pub fn exclusive_fhs(&self) -> Result<FhsGuard<'_>> {
+        Ok(FhsGuard {
+            _file: fhs_lock(&self.home, libc::LOCK_EX)?,
+            _mutation: Some(self),
+        })
     }
 
     /// Retain exclusion while an existing lifecycle command executes.
@@ -125,7 +190,7 @@ pub struct Receipt {
 }
 
 /// Version 2 separates owned software from preserved legacy provenance.
-/// The in-memory slots remain compatible with the native upgrade engine.
+/// The in-memory slots remain compatible with `UpgradeCoordinator`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopedReceipt {
@@ -251,6 +316,44 @@ impl Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fhs_readers_allow_native_owner_but_exclude_fhs_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let first = FhsGuard::shared(home.path()).unwrap();
+        let second = FhsGuard::shared(home.path()).unwrap();
+        let mutation = MutationLock::acquire(home.path()).unwrap();
+        assert!(mutation.exclusive_fhs().is_err());
+        drop(first);
+        assert!(mutation.exclusive_fhs().is_err());
+        drop(second);
+        let writer = mutation.exclusive_fhs().unwrap();
+        assert!(FhsGuard::shared(home.path()).is_err());
+        // The inode stays outside the removable FHS and contains no lease state.
+        std::fs::create_dir(home.path().join(".ww")).unwrap();
+        std::fs::remove_dir(home.path().join(".ww")).unwrap();
+        assert!(FhsGuard::shared(home.path()).is_err());
+        assert_eq!(
+            std::fs::metadata(home.path().join(".ww-fhs.lock"))
+                .unwrap()
+                .len(),
+            0
+        );
+        drop(writer);
+        assert!(FhsGuard::shared(home.path()).is_ok());
+    }
+
+    #[test]
+    fn fhs_lock_refuses_symlink_without_touching_target() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("identity");
+        std::fs::write(&target, b"private sentinel").unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join(".ww-fhs.lock")).unwrap();
+        assert!(FhsGuard::shared(home.path()).is_err());
+        let mutation = MutationLock::acquire(home.path()).unwrap();
+        assert!(mutation.exclusive_fhs().is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"private sentinel");
+    }
 
     fn reacquire_after_drop(home: &Path) -> Result<MutationLock> {
         // Another parallel test can fork between close and reacquire. CLOEXEC

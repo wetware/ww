@@ -2,6 +2,7 @@
 """Refusal and bounded-command controls; these are not native qualification."""
 
 import importlib.util
+import hashlib
 import json
 import os
 import signal
@@ -185,6 +186,76 @@ class Inputs(unittest.TestCase):
             self.assertNotEqual(before, MODULE.durable_snapshot(home))
 
 
+class RollbackScratch(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name)
+        self.store = self.home / '.ww/bin/.ww-host-upgrade'
+        (self.store / 'proofs').mkdir(parents=True)
+        self.source = b'corrupt retained executable'
+        self.retained = self.store / 'retained.ww'
+        self.retained.write_bytes(self.source)
+        (self.home / '.ww/bin/ww').write_bytes(b'installed current executable')
+        (self.home / '.ww/host-upgrade-retained.json').write_bytes(b'original tuple')
+        (self.store / 'proofs/proof').write_bytes(b'original signed proof')
+        self.stage = self.store / 'stage'
+        self.before = MODULE.durable_snapshot(self.home)
+
+    def validate(self):
+        return MODULE.rollback_refusal_evidence(self.home, self.before,
+            hashlib.sha256(self.source).hexdigest(), len(self.source))
+
+    def test_only_exact_bounded_scratch_is_allowed_after_corrupt_copy_refusal(self):
+        self.assertIsNone(self.validate())
+        self.stage.write_bytes(self.source)
+        observed = self.validate()
+        self.assertEqual(observed['size'], len(self.source))
+        self.assertEqual(observed['sha256'], hashlib.sha256(self.source).hexdigest())
+        self.stage.write_bytes(self.source + b'extra')
+        with self.assertRaisesRegex(RuntimeError, 'bounded corrupt source'):
+            self.validate()
+        self.stage.write_bytes(b'x' * len(self.source))
+        with self.assertRaisesRegex(RuntimeError, 'bounded corrupt source'):
+            self.validate()
+
+    def test_scratch_permission_never_allows_retained_proof_journal_or_extra_changes(self):
+        self.stage.write_bytes(self.source)
+        for relative in ('bin/ww', 'host-upgrade-retained.json', 'host-upgrade.json',
+                         'bin/.ww-host-upgrade/retained.ww', 'bin/.ww-host-upgrade/proofs/proof',
+                         'bin/.ww-host-upgrade/unexpected'):
+            with self.subTest(path=relative):
+                path = self.home / '.ww' / relative
+                saved = path.read_bytes() if path.exists() else None
+                path.write_bytes(b'changed evidence')
+                with self.assertRaisesRegex(RuntimeError, 'installed state or discarded evidence'):
+                    self.validate()
+                if saved is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(saved)
+                # Restoring test input bytes changes its inode metadata. Start a
+                # fresh before snapshot for the next independent corruption.
+                self.stage.unlink()
+                self.before = MODULE.durable_snapshot(self.home)
+                self.stage.write_bytes(self.source)
+
+    def test_stage_alias_hardlink_or_preexisting_scratch_is_refused(self):
+        self.stage.symlink_to(self.retained)
+        with self.assertRaises(RuntimeError): self.validate()
+        self.stage.unlink()
+        self.stage.symlink_to(self.store / 'proofs', target_is_directory=True)
+        with self.assertRaises(RuntimeError): self.validate()
+        self.stage.unlink()
+        os.link(self.retained, self.stage)
+        with self.assertRaises(RuntimeError): self.validate()
+        self.stage.unlink()
+        self.stage.write_bytes(self.source)
+        self.before = MODULE.durable_snapshot(self.home)
+        with self.assertRaisesRegex(RuntimeError, 'unexpected scratch'):
+            self.validate()
+
+
 class Commands(unittest.TestCase):
     def test_timeout_cleans_descendants_after_the_command_leader_exits(self):
         import fcntl
@@ -338,25 +409,56 @@ class Commands(unittest.TestCase):
                 child.kill()
             child.wait(timeout=2)
 
-    def test_reply_acknowledgement_requires_live_peer_without_extra_bytes(self):
-        for state in ("live", "closed", "extra"):
-            with self.subTest(state=state):
-                # Create and close both descriptors explicitly for each case.
-                left, right = socket.socketpair()
-                try:
-                    if state == "closed":
-                        right.close()
-                    elif state == "extra":
-                        right.sendall(b"unexpected")
-                    if state == "live":
-                        MODULE.acknowledge_live_reply(left)
-                        self.assertEqual(right.recv(1), b"\x06")
+    def test_readiness_requires_http_success_ready_body_and_bounded_output(self):
+        class Stream:
+            def __init__(self, raw): self.raw = raw
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def settimeout(self, value): pass
+            def sendall(self, data):
+                self.request = data
+            def recv(self, count):
+                part, self.raw = self.raw[:count], self.raw[count:]
+                return part
+        for status, body, accepted in [(200, b'{"ready":true,"phase":"ready"}', True),
+                                      (503, b'{"ready":true,"phase":"ready"}', False),
+                                      (200, b'{"ready":false,"phase":"starting"}', False),
+                                      (200, b'x' * (MODULE.MAX_RECORD + 1), False)]:
+            with self.subTest(status=status, body=body[:60]):
+                stream = Stream(f'HTTP/1.1 {status} Test\r\nContent-Length: {len(body)}\r\n\r\n'.encode() + body)
+                with patch.object(MODULE.socket, 'create_connection', return_value=stream):
+                    if accepted:
+                        value = MODULE.probe_ready('http://127.0.0.1:1234', time.monotonic() + 1)
+                        self.assertTrue(value['body']['ready'])
+                        self.assertIn(b'GET /readyz HTTP/1.1', stream.request)
                     else:
-                        with self.assertRaisesRegex(RuntimeError, "closed or sent extra"):
-                            MODULE.acknowledge_live_reply(left)
-                finally:
-                    left.close()
-                    right.close()
+                        with self.assertRaises(RuntimeError):
+                            MODULE.probe_ready('http://127.0.0.1:1234', time.monotonic() + 1)
+        class Drip(Stream):
+            def recv(self, count):
+                time.sleep(0.02)
+                return b'x'
+        start = time.monotonic()
+        with patch.object(MODULE.socket, 'create_connection', return_value=Drip(b'')):
+            with self.assertRaisesRegex(RuntimeError, 'readiness deadline'):
+                MODULE.probe_ready('http://127.0.0.1:1234', start + 0.05)
+        self.assertLess(time.monotonic() - start, 0.15)
+
+    def test_v3_journal_requires_explicit_native_discriminator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / '.ww').mkdir()
+            path = home / '.ww/host-upgrade.json'
+            transaction = {'phase': 'Starting', 'operation': 'Upgrade'}
+            for value, accepted in [({'version': 3, 'work': {'kind': 'native', 'transaction': transaction}}, True),
+                                    ({'version': 2, 'work': {'kind': 'native', 'transaction': transaction}}, False),
+                                    ({'version': 3, 'work': {'kind': 'baseline', 'transaction': transaction}}, False)]:
+                path.write_text(json.dumps(value))
+                if accepted:
+                    self.assertEqual(MODULE.pending_native(home), transaction)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        MODULE.pending_native(home)
 
     def test_command_failure_and_output_overflow_preserve_non_success_ledger(self):
         with tempfile.TemporaryDirectory() as temporary:

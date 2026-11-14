@@ -3083,10 +3083,18 @@ async fn superseded_selected_kernel_read_never_launches_obsolete_pid0() {
         let (_, identity_path, peer) = persistent_identity(home.path());
         let admin = unused_addr().await;
         let http = unused_addr().await;
-        let options = epoch_node_options(&initial, http, unused_addr().await, identity_path, &atom);
+        let options = epoch_node_options(&initial, http, "127.0.0.1:0".parse().unwrap(), identity_path, &atom);
         let mut node = RunningNode::spawn(home.path(), admin, proxy_addr, &options);
         let ready = format!("http://{admin}/readyz");
         wait_for_ready(&client, &ready, &mut node).await;
+        // Discover the OS-assigned swarm port; no released reservation is reused.
+        let swarm_addrs = client.get(format!("http://{admin}/host/addrs"))
+            .send().await.unwrap().error_for_status().unwrap().text().await.unwrap();
+        let swarm_addr = swarm_addrs.lines()
+            .find(|addr| addr.starts_with("/ip4/127.0.0.1/tcp/"))
+            .unwrap_or_else(|| panic!("missing swarm listen address: {swarm_addrs:?}\n{}", node.logs()));
+        let swarm_port: u16 = swarm_addr.strip_prefix("/ip4/127.0.0.1/tcp/").unwrap().parse().unwrap();
+        assert_ne!(swarm_port, 0, "swarm port was not assigned\n{}", node.logs());
         wait_for_log(&mut node, "kernel-A readiness!", "").await;
         atom.set_head(&obsolete.cid).await;
         wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
@@ -3106,7 +3114,7 @@ async fn superseded_selected_kernel_read_never_launches_obsolete_pid0() {
         assert!(!logs.contains("kernel-B readiness!"), "obsolete guest executed\n{logs}");
         assert_eq!(count_log_lines_with(&logs, "Deployment root activated", "seq=1"), 0);
         assert_eq!(version(&client, admin).await["kernel_epoch_seq"], 2);
-        println!("LANDING3_G={}", serde_json::json!({"blocked_leaf": block.to_string(), "obsolete": obsolete.cid.to_string(), "accepted": identity, "peer_id": peer.to_string()}));
+        println!("LANDING3_G={}", serde_json::json!({"blocked_leaf": block.to_string(), "obsolete": obsolete.cid.to_string(), "accepted": identity, "peer_id": peer.to_string(), "swarm_listen": swarm_addr}));
         proxy.abort();
     }).await;
 }

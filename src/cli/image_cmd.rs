@@ -221,7 +221,6 @@ impl Check {
             authoritative,
         )
         .context("source configuration")?;
-        let _baseline_guard = super::installation::startup_guard(baseline.as_ref())?;
         let namespaces = super::Commands::startup_namespaces(
             &mounts,
             &self.namespace_root,
@@ -289,8 +288,9 @@ impl Check {
             }));
             all_mounts.extend(mounts);
             let transaction = resources.try_foreground_transaction(resources.try_logical_io()?, &[&scope])?;
+            let baseline_guard = super::installation::startup_guard(&all_mounts)?;
             let resolved = image::resolve_frozen_mounts_with_cancel(
-                &all_mounts, &boot, &transaction, head.is_some(), cancel,
+                &all_mounts, &boot, &transaction, head.is_some(), cancel, baseline_guard,
             ).await.context("source capture and retention")?;
             drop(transaction);
             retained.extend(resolved.retained_roots);

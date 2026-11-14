@@ -62,6 +62,10 @@ Boot a wetware node.
 ww run [OPTIONS] [MOUNT...]
 ```
 
+Ordinary startup requires no native-upgrade admission and does not depend on
+native journal integrity. Managed FHS capture still validates ownership and
+excludes concurrent FHS writes until local capture completes.
+
 Every positional argument is a mount: `source[:target]`.
 Without `:target`, the source is mounted at `/` (image layer).
 With `:target`, the source is overlaid at that guest path.
@@ -178,6 +182,7 @@ RPC listener and does not serve this path. Wetware does not fall back to Kubo's
 | `IPFS_API` | user | Default IPFS HTTP API endpoint |
 | `IPFS_ROUTING_API` | user | Kubo Gateway listener for HTTP Routing V1. Default: `http://localhost:8080`. |
 | `WW_HTTP_ADMIN` | user | Admin listener address, or `off` to disable it |
+| `WW_COMPILE_WORKERS` | operator | Positive compiler worker count. Missing or invalid values use half the available CPUs, clamped to 1–4 workers. |
 | `WW_CWASM_DIR` | operator | Optional directory for Wasmtime's native compilation cache. Wasmtime owns artifact compatibility; an unavailable directory falls back to uncached compilation. |
 | `WW_CWASM_CACHE_MAX_BYTES` | operator | Wasmtime cache cleanup threshold in bytes (default: `335544320`). This is a soft limit, so leave filesystem headroom. |
 | `WW_OCI_IMAGE_ID` | operator | Optional immutable OCI image identity reported by `/version`. Deployment verification uses Kubernetes `pod.status.imageID` as the authority. |
@@ -445,9 +450,13 @@ Different native bytes require `upgrade`; different FHS bytes require `image upd
 ww install [--release CID] [--check] [--json]
 ```
 
-Without `--release`, an existing installation permits exact-artifact repair.
-Fresh installation requires an authenticated release or signed bootstrap handoff;
-automatic channel discovery awaits provisioning. `--trusted-release-keys` supplies
+Use `ww install --release <RECORDED_ROOT>` to authenticate the exact recorded
+package and restore missing owned software. Bare `install` uses the running
+executable and existing FHS; their bytes must match the ownership receipt.
+Neither path changes accepted native provenance. Missing native proof requires
+explicit baseline repair before a changed upgrade. Fresh installation requires
+an authenticated release or signed bootstrap handoff. Automatic channel discovery
+awaits provisioning. `--trusted-release-keys` supplies
 the independent keyring. See [installation](installation.md).
 
 ## ww image update
@@ -469,23 +478,43 @@ trusted channel provisioning.
 
 ## ww upgrade
 
-Request explicit authenticated native Host replacement through #739:
+Request explicit authenticated native Host replacement through `UpgradeCoordinator`:
 
 ```sh
-ww upgrade --release CID [--check] [--json]
-ww upgrade --rollback [--json]
+ww upgrade --release CID --timeout-secs N [--json]
+ww upgrade --rollback --timeout-secs N [--json]
+ww upgrade --release CID --check [--json]
+ww upgrade --repair-baseline --release INSTALLED_CID --timeout-secs N [--acknowledge-missing-rollback] [--json]
 ```
 
-The command authenticates installed and selected native identities. It preserves
-FHS, namespace, identity, service configuration, and deployment authority.
-`--release` explicitly permits an authenticated historic selection; it does not
-lower freshness state. Recovery precedes new selection.
+Automatic replacement supports managed GNU ARM64 Linux/systemd only. The adapter
+uses the effective service definition, confirmed old-process exit, bounded restart,
+and the existing loopback `/readyz` endpoint. An originally stopped service stays
+stopped. Unsupported configuration refuses before mutation. Unmanaged automatic
+replacement is disabled; there is no `upgrade run` subcommand.
 
-Native replacement is still gated: the native adapter cannot yet certify
-candidate compatibility or live startup admission. Exact authenticated no-ops
-can succeed. Rollback preflight (`--rollback --check`) remains unavailable.
-Missing installed-release provenance causes refusal. Neither the
-installer nor any flag bypasses these gates. See [native upgrades](native-upgrades.md).
+Changed operations require a positive explicit timeout. Exact-artifact no-ops
+preserve accepted provenance and need no restart budget. `--check` authenticates
+and verifies candidate bytes without replacing installed software. Rollback
+preflight (`--rollback --check`) remains unavailable.
+
+A pending recognized journal takes precedence over new selection. Recovery
+preserves authenticated before/after obligations, rollback bytes, and durable
+journal-last cleanup. For authenticated bootstrap recovery, the shell uses the
+internal `--recover-only --release RECOVERY_EXECUTABLE_CID --timeout-secs N` form.
+The CID authenticates the helper's exact executable; the journal determines the
+recorded recovery generation.
+
+`--repair-baseline` authenticates installed bytes and archives damaged native
+metadata without replacement or service restart. A known valid transaction must
+use ordinary recovery. If historical rollback cannot be authenticated, explicit
+`--acknowledge-missing-rollback` is required. The result reports the archive,
+historical rollback availability, and `live_ready: false`. Damaged records and
+retained artifacts remain available to the operator.
+
+Ordinary startup does not require a startup contract or consult the native journal.
+Missing signed provenance still blocks native replacement. No repair invents release
+authentication from an ownership hash or locator. See [native upgrades](native-upgrades.md).
 
 ## ww uninstall
 
