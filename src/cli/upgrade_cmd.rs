@@ -30,14 +30,14 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Args, Clone, Debug)]
 pub(super) struct ReleaseArgs {
     /// Select an immutable signed release CID, including an historic release.
-    #[arg(long, value_name = "CID")]
+    #[arg(long, visible_alias = "release-cid", value_name = "CID")]
     pub release: Option<String>,
 
     /// Kubo HTTP API endpoint used only to fetch release content.
     #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
     pub ipfs_url: String,
 
-    /// Routing V1 endpoint. Automatic release discovery awaits channel provisioning.
+    /// Routing V1 endpoint for raw authenticated release IPNS discovery.
     #[arg(
         long,
         default_value = "http://localhost:8080",
@@ -54,6 +54,9 @@ pub(super) struct ReleaseArgs {
 pub(super) struct UpgradeArgs {
     #[command(flatten)]
     pub release: ReleaseArgs,
+    /// Independently configured ww-release IPNS identity used without --release.
+    #[arg(long, env = "WW_RELEASE_IPNS", value_name = "NAME")]
+    pub release_ipns: Option<String>,
     /// Restore the previous authenticated artifact retained by UpgradeCoordinator.
     #[arg(long, conflicts_with = "release", requires = "timeout_secs")]
     pub rollback: bool,
@@ -61,7 +64,7 @@ pub(super) struct UpgradeArgs {
     #[arg(long, hide = true, requires_all = ["release", "timeout_secs"], conflicts_with_all = ["rollback", "check"])]
     pub recover_only: bool,
     /// Positive operation budget for changed upgrades, rollback and recovery.
-    /// Exact-artifact no-ops and read-only checks do not require this option.
+    /// Exact-artifact no-ops and checks do not require this option.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub timeout_secs: Option<u32>,
     /// Authenticate and inspect without replacing installed files or restarting.
@@ -198,9 +201,73 @@ async fn artifact(
     Ok(bytes)
 }
 
-/// Authenticate the immutable release before downloading selected artifact bytes.
-/// Explicit historic selection never opens or rewrites a Consumer freshness floor.
+/// Discover only for an operator's upgrade request; selection never replaces files.
+async fn select_upgrade_release(
+    args: &ReleaseArgs,
+    scope: Scope,
+    home: &Path,
+    name: Option<&str>,
+) -> Result<SelectedRelease> {
+    if args.release.is_some() {
+        return select_release(args, scope).await;
+    }
+    let name = ww::ipns::parse_name(name.context(
+        "no release IPNS identity configured; set --release-ipns or WW_RELEASE_IPNS, or use --release-cid <CID>"
+    )?).context("invalid release IPNS identity")?;
+    let trust = IndependentTrustSource::from_path(&args.trusted_release_keys)?;
+    let routing = ww::ipns::RoutingClient::new(&args.ipns_routing_url)?;
+    let raw = match routing
+        .get(name)
+        .await
+        .context("fetch release IPNS record")?
+    {
+        ww::ipns::Fetch::Record(raw) => raw,
+        ww::ipns::Fetch::NotFound => {
+            bail!("release IPNS record unavailable at configured Routing V1 endpoint")
+        }
+    };
+    let record = ww::ipns::SignedRecord::decode(name, raw.clone())
+        .context("authenticate release IPNS record")?;
+    ensure!(
+        !record.is_expired_at(chrono::Utc::now()),
+        "release IPNS record is expired"
+    );
+    let root = record
+        .deployment_cid()
+        .context("release IPNS value must be one /ipfs/<cid>")?;
+    let mut immutable = args.clone();
+    immutable.release = Some(root.to_string());
+    // Reuse the existing Consumer proof format and private-state integrity boundary.
+    // No installed executable or service is touched by selection.
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let directory = home.join(".ww/release-consumer");
+    ww::upgrade::storage::directory(home)?;
+    for path in [home.join(".ww"), directory.clone()] {
+        if !ww::upgrade::storage::exists(&path)? {
+            std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        }
+        ww::upgrade::storage::directory(&path)?;
+        std::fs::File::open(path.parent().context("consumer directory has no parent")?)?
+            .sync_all()?;
+    }
+    ensure!(
+        std::fs::metadata(&directory)?.permissions().mode() & 0o077 == 0,
+        "release consumer directory must be private (mode 0700)"
+    );
+    let mut consumer = ww::release::descriptor::Consumer::open(&directory, name, trust.keyring())?;
+    select_release_with_consumer(&immutable, scope, Some((&mut consumer, &raw))).await
+}
+
+/// Explicit historical selection never opens or rewrites a Consumer freshness floor.
 pub(super) async fn select_release(args: &ReleaseArgs, scope: Scope) -> Result<SelectedRelease> {
+    select_release_with_consumer(args, scope, None).await
+}
+
+async fn select_release_with_consumer(
+    args: &ReleaseArgs,
+    scope: Scope,
+    consumer: Option<(&mut ww::release::descriptor::Consumer, &[u8])>,
+) -> Result<SelectedRelease> {
     let selected = args.release.as_deref().with_context(|| {
         format!(
             "automatic release selection is unavailable: no trusted raw IPNS channel is provisioned for {}; use --release <CID> with independently provisioned release keys",
@@ -252,7 +319,17 @@ pub(super) async fn select_release(args: &ReleaseArgs, scope: Scope) -> Result<S
         let root_bytes = ipfs.block_get(&root, MAX_ROOT_BYTES).await?;
         let proof = SignedReleaseProof::capture(root, &root_bytes, &authenticated)?;
         let generation = AuthenticatedGeneration::from_proof(proof, trust.keyring(), platform()?)?;
-        let selection = authenticated.select(platform()?, COMPATIBILITY_PROFILE)?;
+        let selection = if let Some((consumer, raw)) = consumer {
+            consumer.accept(
+                raw,
+                &root_bytes,
+                &authenticated,
+                platform()?,
+                COMPATIBILITY_PROFILE,
+            )?
+        } else {
+            authenticated.select(platform()?, COMPATIBILITY_PROFILE)?
+        };
         let host = if matches!(scope, Scope::Host | Scope::Both) {
             Some(
                 artifact(
@@ -523,8 +600,16 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
             receipt.executable_digest() == blake3::hash(&installed_bytes).to_hex().as_str(),
             "installed Host does not match ownership receipt"
         );
-        let candidate =
-            within_budget(deadline, select_release(&args.release, Scope::Metadata)).await?;
+        let candidate = within_budget(
+            deadline,
+            select_upgrade_release(
+                &args.release,
+                Scope::Metadata,
+                home,
+                args.release_ipns.as_deref(),
+            ),
+        )
+        .await?;
         if installed.generation.artifact() == candidate.generation.artifact() {
             return completed(
                 Outcome::AlreadyInstalled,
@@ -545,7 +630,16 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
             coordinator.operator_rollback_until(&mut service, require_deadline(deadline)?)?;
         return completed(outcome, None, target, before);
     }
-    let candidate = within_budget(deadline, select_release(&args.release, Scope::Metadata)).await?;
+    let candidate = within_budget(
+        deadline,
+        select_upgrade_release(
+            &args.release,
+            Scope::Metadata,
+            home,
+            args.release_ipns.as_deref(),
+        ),
+    )
+    .await?;
     if installed.artifact() == candidate.generation.artifact() {
         return completed(
             Outcome::AlreadyInstalled,
@@ -559,8 +653,10 @@ async fn execute_at(args: &UpgradeArgs, home: &Path) -> Result<ExecutionReport> 
     } else {
         require_deadline(deadline)?
     };
-    let candidate =
-        within_budget(Some(deadline), select_release(&args.release, Scope::Host)).await?;
+    // Download exactly the release whose metadata passed the consumer floor.
+    let mut immutable = args.release.clone();
+    immutable.release = Some(candidate.root.to_string());
+    let candidate = within_budget(Some(deadline), select_release(&immutable, Scope::Host)).await?;
     let selected_artifact = Some(candidate.generation.artifact().clone());
     let request = UpgradeRequest {
         installed,
@@ -677,10 +773,14 @@ mod tests {
         }
 
         fn with_host(target: &str, host_bytes: &[u8]) -> Self {
-            let key = SigningKey::from_bytes(&[7; 32]);
             let name = libp2p::identity::Keypair::generate_ed25519()
                 .public()
                 .to_peer_id();
+            Self::channel(target, host_bytes, name, 3)
+        }
+
+        fn channel(target: &str, host_bytes: &[u8], name: libp2p::PeerId, sequence: u64) -> Self {
+            let key = SigningKey::from_bytes(&[7; 32]);
             let provenance = Provenance {
                 repository: SOURCE_REPOSITORY.into(),
                 revision: "a".repeat(40),
@@ -691,7 +791,7 @@ mod tests {
             let status = file("fhs/bin/status.wasm", b"authenticated status");
             let descriptor = Descriptor {
                 channel: ww::ipns::canonical_name(name),
-                sequence: 3,
+                sequence,
                 version: "0.1.1".into(),
                 source: provenance.clone(),
                 hosts: vec![HostArtifact {
@@ -799,19 +899,23 @@ mod tests {
                         .nth(1)
                         .unwrap();
                     let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
-                    let arg = url
-                        .query_pairs()
-                        .find(|(key, _)| key == "arg")
-                        .unwrap()
-                        .1
-                        .into_owned();
-                    let key = format!("{}:{arg}", url.path().strip_prefix("/api/v0/").unwrap());
+                    let key = if url.path().starts_with("/routing/v1/ipns/") {
+                        url.path().to_owned()
+                    } else {
+                        let arg = url
+                            .query_pairs()
+                            .find(|(key, _)| key == "arg")
+                            .unwrap()
+                            .1
+                            .into_owned();
+                        format!("{}:{arg}", url.path().strip_prefix("/api/v0/").unwrap())
+                    };
                     recorded.lock().unwrap().push(key.clone());
                     let (status, body) = match routes.get(&key) {
                         Some(body) => ("200 OK", body.as_slice()),
                         None => ("404 Not Found", &b"missing"[..]),
                     };
-                    socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/vnd.ipfs.ipns-record\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
                     socket.write_all(body).await.unwrap();
                 }
             });
@@ -834,8 +938,13 @@ mod tests {
         }
     }
 
+    include!("upgrade_cmd/channel_tests.rs");
+
     #[test]
     fn upgrade_rejects_standalone_capture_and_requires_explicit_repair_options() {
+        assert!(
+            super::super::Cli::try_parse_from(["ww", "upgrade", "--release-cid", "CID"]).is_ok()
+        );
         assert!(
             super::super::Cli::try_parse_from(["ww", "upgrade", "--release", "CID", "run"])
                 .is_err()
@@ -979,6 +1088,7 @@ mod tests {
                 std::io::Write::write_all(&mut journal, b"invalid journal").unwrap();
             }
             let args = UpgradeArgs {
+                release_ipns: None,
                 release: args(&fixture, &server, home.path()),
                 rollback: false,
                 recover_only: true,
@@ -1250,6 +1360,7 @@ mod tests {
         let locator = home.path().join(".ww/installed-release.json");
         let before = std::fs::read(&locator).unwrap();
         let args = UpgradeArgs {
+            release_ipns: None,
             release: args(&candidate, &server, home.path()),
             rollback: false,
             recover_only: false,
@@ -1284,6 +1395,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         installed_fixture(home.path(), &installed, b"authenticated Host");
         let args = UpgradeArgs {
+            release_ipns: None,
             release: args(&candidate, &server, home.path()),
             rollback: false,
             recover_only: false,
@@ -1313,6 +1425,7 @@ mod tests {
             let server = Server::start(fixture.routes.clone()).await;
             let home = tempfile::tempdir().unwrap();
             let args = UpgradeArgs {
+                release_ipns: None,
                 release: args(&fixture, &server, home.path()),
                 rollback: !recovery_only,
                 recover_only: recovery_only,

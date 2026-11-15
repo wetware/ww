@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Authenticated IPNS release selection (#742).** Let explicit `ww upgrade`
+  resolve a configured release IPNS identity through existing signed-proof and
+  persistent freshness validation. Preserve historical immutable-CID selection.
+  Genuine signed R1/R2 end-to-end acceptance remains pending; signing,
+  publication, and production activation remain held.
 - **Recoverable native Host-upgrade integration (#739).** Authenticate native
   replacement, retain bounded rollback, and support explicit authenticated
   recovery after updater interruption. Operators own unattended supervision;
