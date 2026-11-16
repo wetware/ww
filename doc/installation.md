@@ -69,6 +69,7 @@ sh scripts/install.sh --release <CID> --ipfs-url http://127.0.0.1:55001
 | `ww install --release <CID>` | Create the authenticated Host/FHS package and identity, or repair the exact recorded package. No service registration or publication. |
 | `ww image update --release <CID>` | Authenticate and update only the owned baseline FHS. No Host replacement or restart. |
 | `ww upgrade --release <CID>` | Authenticate native selection through `UpgradeCoordinator`; changed operations require an explicit timeout and supported managed service. |
+| `ww upgrade` | Resolve the configured release IPNS identity, authenticate selection and persist freshness floors, then use the same native coordinator. |
 | `ww upgrade --rollback` | Restore the authenticated retained native generation through the same coordinator. |
 | `ww uninstall` | Remove owned software and daemon registration; preserve user state and recovery evidence. |
 | `ww daemon install [RUN OPTIONS] [MOUNT...]` | Register a disabled service using existing identity and startup paths. No image import or identity generation. |
@@ -77,6 +78,27 @@ sh scripts/install.sh --release <CID> --ipfs-url http://127.0.0.1:55001
 `perform` and all four former subcommands are removed without aliases. There is
 no top-level `update`. Deployment following remains `run --stem` or
 `run --ipns-stem`; publishers retain authority to advance those sources.
+
+For release discovery, independently configure the `ww-release` IPNS identity with
+`WW_RELEASE_IPNS` or `--release-ipns <NAME>`. No production identity is embedded.
+The signing keyring remains independently provisioned through
+`--trusted-release-keys` (default `/etc/wetware/release-keys`). Raw signed records
+come from `--ipns-routing-url` / `IPFS_ROUTING_API`; Kubo must expose Routing V1.
+Release content comes from `--ipfs-url` / `IPFS_API`.
+
+`ww upgrade --check` authenticates and inspects without replacing the Host or
+starting services. Channel checks can advance the existing `Consumer` watermark
+in the private `~/.ww/release-consumer` directory. Both IPNS and signed-release
+sequence floors survive process restarts, expiry, and artifact-download failures.
+Discovery accepts authenticated observations under those floors; it cannot prove
+the globally latest release. There is no background polling or automatic upgrade.
+
+`--release-cid <CID>` aliases `--release <CID>` for deliberate immutable selection,
+including historical releases. Explicit selection bypasses discovery without
+opening or lowering the channel watermark. Recovery and baseline repair continue
+to require explicit immutable selection. Changing the configured IPNS identity
+selects a different trust identity with its own watermark; do not use identity
+changes or watermark deletion to recover an old release. Use explicit CID selection.
 
 Register a service separately, then use the native service manager to start it.
 Installation and registration do not start the Host or enable login activation.

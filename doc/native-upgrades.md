@@ -52,8 +52,12 @@ ww upgrade --rollback --timeout-secs 300
 
 The timeout is an explicit example budget. Changed upgrades, rollback, recovery,
 and baseline repair require a positive `--timeout-secs`. Exact-artifact no-ops and
-read-only checks do not require a restart budget. Checks can download and stage
+checks do not require a restart budget. Checks can download and stage
 candidate bytes in temporary storage but do not replace installed software.
+Without `--release`, upgrade resolves the independently configured `WW_RELEASE_IPNS`
+identity (or `--release-ipns NAME`). Channel checks persist authenticated freshness
+floors in `~/.ww/release-consumer`; explicit `--release` / `--release-cid` selection
+does not change those floors. See [release discovery configuration](installation.md#separate-software-and-service-operations).
 
 Signed release proofs bind the manifest, descriptor, transport root, target,
 exact executable digest, and size. Downloaded keys cannot establish trust.
