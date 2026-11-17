@@ -17,13 +17,16 @@ resource-level filtering remain separate, application-level designs. Least
 privilege is enforced by the runtime, not delegated to a prompt or to the
 model running inside the cell.
 
-## Try it in 60 seconds
+## Run an authenticated release
 
-Provision the independent release keyring and select `RELEASE_CID` first;
-see [installation](doc/installation.md).
+Production signing, IPFS publication, DNSLink and `/install` activation remain
+held. The public `/install` endpoint is in maintenance; it is not a working
+bootstrap path. The commands below use `scripts/install.sh` from a reviewed
+checkout and require an available signed release CID, independently provisioned
+public trust, and running Kubo. See [installation](doc/installation.md).
 
 ```sh
-curl -fsSL https://wetware.run/install | sh -s -- --release "$RELEASE_CID"
+sh scripts/install.sh --release "$RELEASE_CID"
 # Start in the foreground; query /status from another terminal.
 ww run --http-listen 127.0.0.1:2080
 # In another terminal: curl http://localhost:2080/status
@@ -55,13 +58,18 @@ narrow `Membrane` containing only `peerId` and `Stat`.
 
 ### Install
 
+Use a reviewed checkout and the signed-release prerequisites above. Production
+activation remains held; these commands do not supply a release or trust anchor.
+
 ```bash
-curl -fsSL https://wetware.run/install | sh -s -- --release "$RELEASE_CID"
+sh scripts/install.sh --release "$RELEASE_CID"
 ```
 
 Set `RELEASE_CID` to the selected signed release and provision the independent
 release keyring first. The installer authenticates and installs the Host,
-baseline FHS, and identity. Automatic channel selection is not yet integrated.
+baseline FHS, and identity. The shell installer requires an explicit release CID.
+For existing installations, `ww upgrade` supports authenticated IPNS selection
+with an independently configured release identity and public keyring.
 Installation does not register a daemon or configure name publication. Register
 separately with `ww daemon install`, then start it through the native service manager.
 Ordinary startup requires no native-upgrade admission. Automatic native replacement

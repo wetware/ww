@@ -1,8 +1,19 @@
 # Deployment
 
-`wetware/ww` publishes immutable artifacts. The separate `wetware/infra`
-repository decides which image digest runs in the cluster. A merge to `ww`
-master is therefore a release build, not a production deployment.
+`wetware/ww` CI builds immutable Host/FHS artifacts and container images.
+Private `wetware/infra` owns official authenticated software releases. A merge
+to `ww` master does not deploy production or authorize release publication.
+
+The accepted Epiphyte infrastructure runs Debian 13, native Caddy, and Kubo
+under Podman/Quadlet and systemd. Kubernetes/k3s and the `ww-master` cluster
+deployment are retired. See [infra steady-state operations](https://github.com/wetware/infra/blob/master/ops/vps/steady-state.md).
+
+The tag-driven release pipeline is implemented, but production signing, IPFS
+publication, DNSLink changes and `/install` activation remain held. The
+[operator runbook](https://github.com/wetware/infra/blob/9f0815f8555e1b00d00f063837bf0f806bed4963/ops/vps/official-release.md)
+is the reviewed draft in [infra#50](https://github.com/wetware/infra/pull/50).
+The [publication transition](https://github.com/wetware/infra/blob/master/ops/vps/publication-transition.md)
+defines the remaining activation gates.
 
 ## Runtime deployment lifecycle
 
@@ -142,39 +153,46 @@ multiprocess coordination or secure monotonic storage.
 
 ## Artifact publication
 
-```text
-ww master commit
-       |
-       +--> host build matrix ----------> downloadable host binaries
-       |
-       +--> WASM build -----------------> kernel/status artifacts
-       |                                      |
-       +--> deploy image assembly <------------+
-       |        |
-       |        +--> ghcr.io/wetware/ww:master-<git-sha>
-       |        +--> ghcr.io/wetware/ww@sha256:<digest>
-       |
-       +--> offline release package ---> immutable CID
+Public CI builds and validates Host binaries, the canonical FHS, and container
+images. It exports unsigned release input as `release-input.car`, preserving
+original producer receipts. An unsigned input CAR is not an authenticated release.
 
-private publication owner (activation held)
-       +--> retained signed release ---> ww-release IPNS
-```
+After separately approved production activation, the implemented official path is:
 
-The SHA-tagged GHCR image and its immutable digest identify the same image.
-IPNS is mutable discovery for an otherwise content-addressed release tree.
-Private `wetware/infra` owns official publication. The public IPFS publication
-job remains unconditionally held. Delayed older writes can temporarily supersede
-newer discovery values; Git ancestry checks do not establish network compare-and-set.
-See [release publication](release-publication.md) for the reproduced limitation,
-consumer freshness policy, and activation gates.
+1. An operator selects a `v`-prefixed SemVer tag on `wetware/ww` master history
+   and manually dispatches the private Official release workflow once.
+2. `wetware/infra` independently admits the exact successful CI build and
+   artifacts, rechecks the tag, and automatically signs with separate release
+   authority. Verification uses independently provisioned public trust.
+3. Restricted `acquire-v1` transfers the signed CAR. `publish-v1` invokes the
+   publisher, whose durable Owner retains the graph in Epiphyte's Kubo before
+   committing the release and requesting announcement through the existing
+   `ww-release` IPNS identity.
+4. Operators explicitly install or upgrade authenticated releases. Publication
+   does not install software or restart consumer Hosts.
 
-The release name is
-`k51qzi5uqu5dg9eci41ad4b1wyf9kocngntfviq12qjuvusra3nt94xlx98me1`.
+The Owner's durable commitment, Kubo delivery acknowledgement, independent IPNS
+discovery and successful installation are distinct results. Delayed older writes
+can temporarily supersede newer discovery values. See
+[release publication](release-publication.md) for consumer freshness and the
+reproduced IPNS limitation.
 
-IPFS remains a required distribution path: `scripts/install.sh` requires an
-explicit immutable `--release CID`; automatic channel discovery is unavailable.
-It must not be made non-blocking until a GitHub Release has been
-published and the installer has migrated to that distribution path.
+GHCR container images remain supported build artifacts, including
+`ghcr.io/wetware/ww:master-<git-sha>` and immutable digest references.
+They are not the official authenticated IPFS software-release distribution path.
+The public `release_image` job still publishes tested images; its legacy display
+name, “Build and publish ww-master image,” does not imply cluster deployment.
+The public IPFS publication job and all private official release jobs remain held.
+
+Provision the current release IPNS identity independently from infra's accepted
+identity record; do not reuse the retired hardcoded name or initialize a new key.
+`scripts/install.sh` and fresh `ww install` require an explicit authenticated
+release selection. The shell installer does not discover releases automatically.
+For an existing installation, `ww upgrade` supports authenticated IPNS selection
+with `WW_RELEASE_IPNS` or `--release-ipns`, while `--release CID` selects an
+immutable release explicitly. Channel checks persist freshness floors without
+replacing the Host. See [installation](installation.md) and
+[native upgrades](native-upgrades.md) for trust, platform and recovery requirements.
 
 ## Default host IPNS publication
 
@@ -250,12 +268,9 @@ make -C k8s/ww-master up
        +--> public /status check
 ```
 
-The `images[].digest` field in the infra Kustomization is the sole promotion
-field. Never promote the mutable `:master` tag. Merging an infra PR records the
-desired deployment in Git; an operator must still run the guarded `make up`
-target to apply it.
-
-After rollout, verify the runtime identity from a `wetware/ww` checkout:
+The historical `images[].digest` field selected the deployed image. The retired
+procedure required a reviewed digest and a separate guarded `make up` invocation.
+Its post-rollout verification command was:
 
 ```sh
 WW_EXPECTED_IMAGE_DIGEST=sha256:<digest> \
@@ -263,7 +278,7 @@ WW_EXPECTED_GIT_SHA=<40-character-sha> \
 scripts/deploy_verify.sh
 ```
 
-The verifier checks the selected Ready pod's Kubernetes
+The retained legacy verifier checks the selected Ready pod's Kubernetes
 `status.containerStatuses[].imageID` against the immutable digest. It then
 executes `ww healthcheck --ready --expect-git-sha ...` inside the distroless
 container. The image check deliberately uses Kubernetes as the authority:
@@ -289,14 +304,14 @@ The Rust pid0 directly installs the image-owned `/status` composition.
 
 ## HTTP request path
 
+This is the Host's configured WAGI listener, not the production website path.
+Epiphyte's Caddy serves the static website; no replacement cluster route is implied.
+
 ```text
 client
   |
   v
-Traefik / Ingress
-  |
-  v
-ww-master :2080 (WAGI adapter)
+Host HTTP listener :2080 (WAGI adapter)
   |
   v
 longest registered route prefix
@@ -498,8 +513,8 @@ than a readiness interval.
 
 `ww run` uses a 120-second Kubo wait by default so a local development
 invocation fails clearly when Kubo is absent. A production deployment that
-must survive a sustained Kubo outage must set `WW_KUBO_WAIT_MAX_SECS=0`; the
-reviewed `ww-master` manifest does so. This keeps `/healthz` available while
+must keep waiting through a sustained Kubo outage can set
+`WW_KUBO_WAIT_MAX_SECS=0`. This keeps `/healthz` available while
 `/readyz` remains closed after the enabled admin listener has bound. Ordinary
 startup requires no native-upgrade admission and does not consult native journals.
 `/readyz` stays closed until trusted PID0 commits the current generation after
