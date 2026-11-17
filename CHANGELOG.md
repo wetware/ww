@@ -52,6 +52,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pending authenticated selection, compatibility, and native restart admission.
 
 ### Fixed
+- Correct required timeouts and align optional release consumer rehearsal refusal
+  and journal assertions with the current upgrade CLI. Production upgrade behavior
+  and native recovery guarantees are unchanged.
 - Pin the host Rust toolchain and CI selectors to 1.99.1. Preserve the separate
   nightly requirements and defer Rust/Cargo 1.100 compatibility changes.
 - Create private installation and daemon directories under group-writable umasks.
