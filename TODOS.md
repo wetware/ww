@@ -1,5 +1,10 @@
 # TODOs
 
+Superseded cluster-promotion, distribution and `ww perform upgrade` proposals
+remain in [the historical backlog](https://github.com/wetware/ww/blob/97ebf974855c799faf4c53ae0fa7dae260c6fb4a/TODOS.md).
+Use [current release operations](doc/deployment.md#artifact-publication) for
+release authority and activation holds.
+
 ## Custom domain for the architecture map
 **What:** Serve the GitHub Pages architecture map at `map.wetware.run`.
 **Why:** The default project URL, `https://wetware.github.io/ww/`, is suitable for
@@ -46,20 +51,6 @@ The status Cell applies one 500 ms timeout to the snapshot and degrades both
 mutable fields to `null` on failure.
 **Priority:** —
 
-## Revisit automated release promotion after the manual-promotion POC
-
-**Status:** Superseded cluster-promotion proposal; retained below as historical
-context, not current operational guidance. Kubernetes deployment is retired.
-Use [current release operations](doc/deployment.md#artifact-publication) and
-[publication holds](doc/legacy-publication-hold.md).
-
-**What:** Consider bot-created promotion PRs, artifact attestations, a restricted deploy identity, drift detection, and deliberate auto-merge/rollback criteria only after the manual POC has generated real operational signal.
-**Why:** The POC intentionally favors a small, legible manual digest promotion and Git revert for a personal VPS. The automation would add credentials and failure modes without current product value.
-**Context:** Start from `~/.gstack/projects/wetware-ww/lthibault-gitops-release-promotion-design-20260723.md`, especially "Final Scope Reset: Manual Promotion POC" and "Future Hardening." Do not describe the POC as a security boundary: ww retains its existing VPS/IPFS credential, and IPNS may lead or lag the manually deployed digest. Reassess after a successful promotion/revert plus users, collaborators, multiple services/clusters, or a real drift/security incident.
-**Effort:** M
-**Priority:** P3
-**Depends on:** Manual promotion POC complete
-
 ## Snap v1 — JFS verify + POST + viewer-aware (separate follow-up branch)
 **What:** The deferred half of the Farcaster Snap protocol. Parse
 `X-Snap-Payload`, JFS-verify the Ed25519 signature over canonical JSON, extract
@@ -79,21 +70,6 @@ and includes that bytecode CID in `X-Wetware-Cell`. The value identifies the
 Executor's loaded WASM bytes, not a deployment/image root, execution environment,
 or Process instance. The header alone does not prove execution independently
 of the operator. Broader provenance semantics remain a separate design question.
-
-## IPFS primary distribution (release pipeline follow-up)
-
-**Status:** Superseded distribution proposal; retained below as historical
-context. Authenticated IPFS packaging and the private publication pipeline are
-implemented, with production activation held. The proposed public publisher
-and credential are not current instructions. See
-[release publication](doc/release-publication.md).
-
-**What:** After the GitHub-based release pipeline ships, add IPFS as the primary distribution channel. Includes: `publish-ipfs` CI job (ipfs add release dir, pin on persistent node, ipns publish), `oci-export` WASM cell (`std/oci-export/`) that reads OCI layout from VFS and tars to stdout, IPNS release tracking, and IPFS-first path in `scripts/install.sh`.
-**Why:** The p2p runtime should distribute itself via p2p. Eliminates GHCR as single point of failure. Content-addressed distribution. Dogfoods IPFS.
-**Context:** Full design in CEO plan at `~/.gstack/projects/wetware-ww/ceo-plans/2026-04-06-release-pipeline.md`. Key decisions: IPNS points directly to latest release dir, older releases accessible by immutable CID. Need `skopeo copy --format oci` or `crane export` for OCI layout (not `docker save`, which produces legacy Docker format). Persistent IPFS node connectivity from CI is TBD (user to configure `IPFS_PIN_API_URL` secret).
-**Effort:** M (human) -> S-M (CC)
-**Priority:** P2
-**Depends on:** Release pipeline (feat/release-pipeline), persistent IPFS node setup
 
 ## Cache: bloom filter for mutex contention reduction
 **What:** Add a lock-free bloom filter in front of `Mutex<ArcInner>` in `PinsetCache`. Definite-miss CIDs skip the mutex entirely.
@@ -224,20 +200,6 @@ listener APIs propagate one `Membrane` capability.
 **Effort:** L
 **Priority:** P2
 **Depends on:** issue #509 design approval, cross-crate capnp migration plan, compatibility decision for schema/type IDs
-
-## `ww perform upgrade` — self-update from GitHub Releases
-
-**Status:** Superseded updater proposal; retained below as historical context.
-`perform` is removed. Current `ww upgrade` authenticates IPFS releases and
-supports independently configured IPNS discovery. See
-[native upgrades](doc/native-upgrades.md) for platform and recovery limits.
-
-**What:** `ww perform upgrade` hits the GitHub Releases API, compares semver against the running binary version, downloads the latest release binary, verifies SHA256 checksum, atomically replaces the binary, clears macOS quarantine, and restarts the daemon.
-**Why:** Cohort testers shouldn't have to manually re-download and replace the binary on every release. Self-update is table stakes for CLI tools.
-**Context:** Deferred from the Phase 1 DX pass. Complexity areas: SHA256 verification relies on checksums.txt in the release (no binary signing yet), atomic replacement via rename(2) is safe on Unix but needs macOS quarantine clearing, and daemon restart must handle in-flight connections. `reqwest` and `serde_json` are already in Cargo.toml. Consider adding binary signing (Apple notarization, GPG) before enabling auto-update for a broader audience.
-**Effort:** M
-**Priority:** P2
-**Depends on:** DX pass Phase 1, GitHub Releases with consistent tag naming
 
 ## macOS binary notarization
 **What:** Sign and notarize the macOS binary with an Apple Developer certificate so Gatekeeper doesn't block it on download.

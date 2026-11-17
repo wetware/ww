@@ -142,7 +142,8 @@ retrieval is retrying. Deployment advances its local epoch, publishes
 valid record can recover through the ordinary deployment path.
 
 A Routing V1 `404` means that no record exists. Unsupported routes fail with
-the Gateway configuration guidance above. Transport and server failures retry.
+the [Gateway configuration guidance](cli.md#ww-run). Transport and server
+failures retry.
 Unexpected media types, oversized bodies, cryptographic failures, and rejected
 `PUT` responses remain distinct errors. Wetware does not select them as
 authority.
@@ -223,67 +224,12 @@ four hours. Failed publication retries after five minutes. Records use a
 host identity receives this lifecycle. Following a third-party IPNS Stem does
 not publish that name.
 
-The default publisher no longer creates or uses Kubo's `"ww"` signing key.
-An old `"ww"` key can remain in the Kubo keystore, but Wetware ignores it.
-Kubo never needs `~/.ww/identity`. Provider `Finder` and `Announcer` capabilities
-do not resolve or publish IPNS records and do not receive host signing authority.
-
-Kubo 0.33 requires this one-time operator configuration:
-
-```sh
-ipfs config --json Gateway.ExposeRoutingAPI true
-# Restart Kubo after changing its configuration.
-```
-
-Wetware uses `http://localhost:8080` by default. Set `IPFS_ROUTING_API` or
-`--ipns-routing-url` when the Gateway listener uses another address. Do not
-point this option at the administrative RPC listener on port 5001. Wetware
-fails with an actionable error when the listener does not expose Routing V1;
-it does not fall back to Kubo `name/resolve`, `name/publish`, or key management.
-
-## Historical Kubernetes image promotion
-
-The following procedure describes the retired Kubernetes deployment. It is not
-a current production instruction. Epiphyte now uses Debian 13 and systemd;
-publication remains held. See [current production operations](https://github.com/wetware/infra/blob/master/ops/vps/steady-state.md)
-and [release activation gates](https://github.com/wetware/infra/blob/master/ops/vps/publication-transition.md).
-
-The historical promotion path was declarative:
-
-```text
-GHCR immutable digest
-       |
-       v
-wetware/infra k8s/ww-master/kustomization.yaml
-       |
-       v
-review + merge release-labelled infra PR
-       |
-       v
-make -C k8s/ww-master up
-       |
-       +--> capacity/storage preflight
-       +--> kubectl apply -k
-       +--> rollout status
-       +--> public /status check
-```
-
-The historical `images[].digest` field selected the deployed image. The retired
-procedure required a reviewed digest and a separate guarded `make up` invocation.
-Its post-rollout verification command was:
-
-```sh
-WW_EXPECTED_IMAGE_DIGEST=sha256:<digest> \
-WW_EXPECTED_GIT_SHA=<40-character-sha> \
-scripts/deploy_verify.sh
-```
-
-The retained legacy verifier checks the selected Ready pod's Kubernetes
-`status.containerStatuses[].imageID` against the immutable digest. It then
-executes `ww healthcheck --ready --expect-git-sha ...` inside the distroless
-container. The image check deliberately uses Kubernetes as the authority:
-containers cannot intrinsically discover the registry digest selected by the
-runtime.
+The [default IPNS identity contract](keys.md#default-ipns-identity) defines
+key ownership and storage. Kubo never needs `~/.ww/identity`; an old Kubo `"ww"`
+key can remain but is ignored. Provider `Finder` and `Announcer` capabilities
+do not resolve or publish IPNS records and receive no Host signing authority.
+Configure the Gateway listener as described in the [CLI reference](cli.md#ww-run).
+Wetware does not fall back to Kubo key management.
 
 ## Runtime layers
 
@@ -328,179 +274,23 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 - `/version` reports source and current generation kernel provenance plus degraded
   cache state.
 - `/metrics` exposes live Wasmtime cache and lifecycle, ExecutorPool, applied fuel decisions,
-  settled fuel consumption, worker liveness, and telemetry export/loss. See the collection
-  policy below for measurements that are not yet available.
+  settled fuel consumption, worker liveness, and telemetry export/loss. See the
+  [metrics contract](observability.md#metrics-collection-contract) for
+  unavailable measurements.
 
 Keep the admin listener on loopback unless an authenticated network boundary
 is added; these endpoints are intentionally unauthenticated.
 
 ### Metrics collection policy
 
-`GET /metrics` serves Prometheus text format 0.0.4. Eight metric families
-use the process-wide Wasmtime engine factory:
-
-| Family | Meaning |
-| --- | --- |
-| `ww_wasmtime_cache_state` | Three Boolean samples with `state` labels `enabled`, `disabled`, and `fallback`; exactly one is 1. State records cache initialization, not ongoing filesystem health. |
-| `ww_wasmtime_cache_hits_total` | Successful loads from the persistent compilation cache. |
-| `ww_wasmtime_cache_stores_total` | Successful stores to that cache, not lookup misses or compilation attempts. |
-| `ww_wasmtime_component_compilations_total` | Calls to the canonical component compilation API, including cache hits and failed attempts. |
-| `ww_wasmtime_component_compile_total` | Completed canonical compilations, including persistent-cache loads, with `outcome="success"` or `"error"`. |
-| `ww_wasmtime_component_compile_duration_seconds` | Histogram of wall time inside canonical `Component::from_binary` calls, including errors. |
-| `ww_wasmtime_instantiations_total` | Observed executable `CommandPre::instantiate_async` results in `Proc::run`, with `outcome="success"`, `"error"`, or `"timeout"`. |
-| `ww_wasmtime_instantiation_duration_seconds` | Histogram of wall time through executable instantiation's result or cooperative five-second timeout, including failures. |
-
-The counters cover canonical engines in this process and reset when the process
-restarts. Scraping reads atomic counters without metric registry locks; it does
-not compile components or scan the cache directory. The snapshot reads counters
-separately and is not a transaction across concurrent compilations. Disabled and
-fallback cache states legitimately report zero hits and stores. A later write
-failure can leave the initialization state `enabled`;
-[#609](https://github.com/wetware/ww/issues/609) owns reporting those failures.
-
-Lifecycle observations exclude preparation and command execution; dropped pending
-instantiation futures record neither an outcome nor a duration. Histogram buckets
-are fixed and cumulative, with duration sums in seconds. The
-[lifecycle contract](measurements/wasmtime-lifecycle.md#metrics-contract) defines
-the boundaries, buckets, and snapshot limits. The separate
-[#777 requalification report](measurements/wasmtime-lifecycle-requalification.md)
-records the local release qualification without changing the historical failed
-campaign. Required GitHub CI and final PR review remain release gates.
-
-Three additional families use the Host's live ExecutorPool collector:
-
-| Family | Type and meaning |
-| --- | --- |
-| `ww_executor_cell_slots` | Gauge: current admitted task slots, including queued requests and running executor futures, summed across workers. |
-| `ww_executor_spawn_admissions_total` | Counter with `outcome="accepted"`, `"full"`, or `"closed"`: successful admission or rejection by the selected worker's bounded channel. |
-| `ww_executor_cell_terminations_total` | Counter with `outcome="completed"`, `"cancelled"`, or `"panicked"`: one terminal outcome per admitted task slot. |
-
-The Host creates the collector before starting its admin endpoint. Executor
-samples start at zero before the pool exists. The same collector receives live
-pool events. Counters accumulate for that Host instance, survive pool teardown,
-and reset with a new Host instance. Occupancy returns to zero after all pool
-workers join. A scrape reads separate atomics; concurrent operations can make
-samples disagree temporarily. Scraping does not mutate collection state.
-
-`completed` means the factory future returned `()`. The future can handle a guest
-error internally, so this outcome does not establish guest success. `cancelled`
-means an admitted request or future was dropped before completion, including
-queued requests discarded during shutdown. `panicked` means the started task
-unwound. These outcomes do not change guest cancellation or result delivery.
-Only executor-admitted root tasks occupy these slots. Child Cells launched
-locally through `OwnedChildLifecycle` do not submit a new pool admission.
-
-Admission failure describes the selected worker's channel. A full channel does
-not establish that every worker is full. Occupancy does not distinguish runnable
-work, guest I/O waits, or one-shot epoch suspension. Separate
-[worker liveness metrics](worker-liveness.md) detect missing event-loop progress
-with a 250 ms heartbeat and five-second threshold. They identify workers with
-bounded numeric labels and preserve the existing health/readiness contracts.
-
-Metric slot guards track queue and task ownership independently of the scheduler's
-existing `cell_counts`. Those counters can retain stale values after immediate
-completion or discarded queued requests. This landing preserves worker assignment;
-it does not use those counters as a public gauge.
-
-`ww_fuel_decisions_total{policy,decision}` counts applied fuel decisions over the
-Host collector lifetime. `policy` is exactly `scheduled` or `oneshot`, and
-`decision` is exactly `grant`, `suspend`, or `exhausted`. All six combinations
-appear even when zero. The Host creates this collector before admin startup and
-shares it through its runtime engine with PID0 and every locally spawned Cell.
-Counts survive Cell and pool teardown; a new Host receives a fresh collector.
-
-A grant counts only after both Wasmtime fuel configuration calls succeed,
-including initial grants and grants following one-shot epoch resumption. A
-suspension counts once when a one-shot Cell enters the wait for new epoch
-authority. Exhaustion counts once when execution commits to terminal total
-authority exhaustion, including a zero budget before guest instantiation.
-Provisional or superseded decisions, failed installations, and cancellation
-while suspended do not invent applied outcomes. Physical `YIELD_RESERVE` fuel
-does not constitute guest authority. Snapshots read separate relaxed atomics
-and are not transactional across concurrent decisions.
-
-`ww_fuel_settled_units_total{policy}` counts physical fuel units accounted for
-at authoritative settlement boundaries. Its two fixed policy labels are
-`scheduled` and `oneshot`; both series appear at zero before execution. The
-counter shares the Host's `FuelMetrics` collector and retains counts after
-Cell and executor teardown. Each Store accumulates settled amounts locally.
-Publication occurs every 256 settlements, at epoch openings, before suspension
-or exhaustion, at command completion, and on actual Store destruction.
-
-Scrapes include published amounts only. After recording, each live Store can
-hold up to 255 unpublished settlement events. This bounds events, not fuel
-units or elapsed time. An idle Store below the threshold has no wall-clock
-publication deadline. Totals are exact modulo 2^64 after all relevant Stores
-flush or complete destruction; quiescent live Stores can still hold pending
-values. Cancellation requests alone do not establish completed destruction.
-Exits without Rust destruction can lose pending values.
-
-Settlement occurs at marked host returns, confirmed fuel returns that end
-authority or open a later epoch, and successful instantiation with unsettled
-start-function work. Recording precedes decision application, so subsequent
-suspension, supersession, or application failure does not discard consumption.
-Grant installation, physical reserve installation, epoch notification, and
-intermediate cooperative yields do not add consumption.
-
-The counter includes physical reserve consumed by inter-checkpoint overshoot.
-It does not equal the decrease in either one-shot ledger, because each ledger
-uses saturating subtraction. No separate overshoot counter is exported;
-aggregate consumption cannot reconstruct per-Cell ledger saturation.
-
-Settled fuel is not CPU time, wall-clock time, or all executed fuel. Successful
-command tails, command errors or traps, instantiation errors or timeouts,
-cancellation, and Store teardown can leave physical consumption unsettled.
-The runtime adds no termination settlement. Initial zero-budget rejection
-adds no consumption.
-
-The endpoint exports 62 fixed series: 35 Wasmtime samples, seven executor
-samples, six fuel-decision samples, two settled-consumption samples, and two
-worker-liveness policy samples, plus ten telemetry samples. The telemetry
-samples use fixed labels to report sampling, export, and loss; see
-[local observability](observability.md). Each configured executor worker adds five
-lifecycle/stall samples and one age sample after its first confirmed progress.
-Metric names and HELP text are static. Worker indices are bounded by the
-configured worker count; other label values are fixed. The renderer accepts
-no dynamic label or HELP text that requires escaping. Cell identifiers, task names,
-RPC methods, paths, peer IDs, and CIDs do not become metric labels. Response size
-is bounded by configured worker count and bounded numeric representations,
-regardless of Cell churn.
-
-Collection adds atomic updates at completed Wasmtime lifecycle boundaries,
-at executor admission and terminal boundaries,
-at applied fuel decisions, and when Stores publish pending settled fuel. Worker
-liveness adds one clock read and atomic publication per heartbeat, with no
-additional instrumentation on Wasmtime Host returns.
-Settlements between publications update only Store-owned ordinary integers.
-Epoch notification alone does not record a fuel decision or consumption.
-The existing test-only
-`FuelObserver` remains separate from production metrics. See the
-[executor measurement report](measurements/executor-metrics.md) for the baseline,
-performance budget, and operation-to-HTTP evidence for executor collection.
-The [fuel scheduling reference](designs/fuel-scheduling.md#applied-decision-metrics)
-defines applied fuel outcomes and
-[settled-consumption semantics](designs/fuel-scheduling.md#settled-fuel-consumption-metrics);
-the [decision measurement report](measurements/fuel-decisions.md) and
-[settlement measurement report](measurements/fuel-settlement.md)
-record their performance budgets, results, and reproduction commands.
-The settlement candidate exceeded its four-worker hot-path budget and remains
-unpublished pending resolution of that regression.
-
-Fuel quantum/distribution, RPC, ARC cache, and stream metrics have no production collectors. The
-endpoint omits their samples and HELP/TYPE declarations, and the runtime contains
-no placeholder registries for these metrics. Their absence means unavailable
-measurements, not zero activity. Producer-specific work owns future collection:
-
-- [#260](https://github.com/wetware/ww/issues/260): live `PinsetCache` hits,
-  misses, evictions, cached weight, and entry count.
-- [#752](https://github.com/wetware/ww/issues/752): authority ledgers,
-  desired-versus-applied quantum and physical fuel visibility, latency, and
-  sampled diagnostics.
-- [#754](https://github.com/wetware/ww/issues/754): RPC durations and outcomes,
-  stream activity, and other protocol/host metrics with bounded labels.
-
-Those implementations must establish producer semantics, counter lifetimes,
-label bounds, and operation-to-HTTP coverage before exposing new families.
+`/metrics` exposes Prometheus samples for Wasmtime cache and lifecycle,
+ExecutorPool, applied fuel decisions, settled fuel, worker liveness and telemetry.
+Missing families represent unavailable measurements, not zero activity.
+See the [metrics collection contract](observability.md#metrics-collection-contract)
+for counter meanings, lifetimes, label bounds and producer measurement references.
+Use the [local observability workflow](observability.md) to collect and correlate
+metrics, Host logs and sampled traces. Collection does not establish runtime
+readiness or production qualification.
 
 ### Kubo startup availability
 

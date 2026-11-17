@@ -116,6 +116,12 @@ A compromised signing runner or authorized signing code remains in the threat
 model's trusted computing base. Abrupt runner termination might bypass cleanup;
 use ephemeral runners and restrict access to runner storage.
 
+Operational release execution belongs to the private infra
+[operator runbook](https://github.com/wetware/infra/blob/9f0815f8555e1b00d00f063837bf0f806bed4963/ops/vps/official-release.md),
+the reviewed draft in [infra#50](https://github.com/wetware/infra/pull/50).
+The provisioning procedure below defines key creation and independent trust;
+it does not authorize release execution or production activation.
+
 ## Provisioning runbook — requires separate approval
 
 1. Approve the release-key custodian, independent public-key distribution channel,
