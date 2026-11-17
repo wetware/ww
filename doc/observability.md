@@ -241,3 +241,113 @@ The pinned configurations follow the official
 and [Alloy file ingestion](https://grafana.com/docs/alloy/latest/tutorials/send-logs-to-loki/).
 Validate configuration against the pinned container binaries before changing
 versions; current documentation can describe newer fields.
+
+## Metrics collection contract
+
+`GET /metrics` serves Prometheus text format 0.0.4. Cache metrics use the
+process-wide Wasmtime engine factory:
+
+| Family | Meaning |
+| --- | --- |
+| `ww_wasmtime_cache_state` | Three Boolean samples with `state` labels `enabled`, `disabled`, and `fallback`; exactly one is 1. State records cache initialization, not ongoing filesystem health. |
+| `ww_wasmtime_cache_hits_total` | Successful loads from the persistent compilation cache. |
+| `ww_wasmtime_cache_stores_total` | Successful stores to that cache, not lookup misses or compilation attempts. |
+| `ww_wasmtime_component_compilations_total` | Calls to the canonical component compilation API, including cache hits and failed attempts. |
+
+The counters cover canonical engines in this process and reset when the process
+restarts. Scraping reads atomic counters without metric registry locks; it does
+not compile components or scan the cache directory. The snapshot reads counters
+separately and is not a transaction across concurrent compilations. Disabled and
+fallback cache states legitimately report zero hits and stores. A later write
+failure can leave the initialization state `enabled`;
+[#609](https://github.com/wetware/ww/issues/609) owns reporting those failures.
+
+### ExecutorPool outcomes
+
+Three additional families use the Host's live ExecutorPool collector:
+
+| Family | Type and meaning |
+| --- | --- |
+| `ww_executor_cell_slots` | Gauge: current admitted task slots, including queued requests and running executor futures, summed across workers. |
+| `ww_executor_spawn_admissions_total` | Counter with `outcome="accepted"`, `"full"`, or `"closed"`: successful admission or rejection by the selected worker's bounded channel. |
+| `ww_executor_cell_terminations_total` | Counter with `outcome="completed"`, `"cancelled"`, or `"panicked"`: one terminal outcome per admitted task slot. |
+
+The Host creates the collector before starting its admin endpoint. Executor
+samples start at zero before the pool exists. The same collector receives live
+pool events. Counters accumulate for that Host instance, survive pool teardown,
+and reset with a new Host instance. Occupancy returns to zero after all pool
+workers join. A scrape reads separate atomics; concurrent operations can make
+samples disagree temporarily. Scraping does not mutate collection state.
+
+`completed` means the factory future returned `()`. The future can handle a guest
+error internally, so this outcome does not establish guest success. `cancelled`
+means an admitted request or future was dropped before completion, including
+queued requests discarded during shutdown. `panicked` means the started task
+unwound. These outcomes do not change guest cancellation or result delivery.
+Only executor-admitted root tasks occupy these slots. Child Cells launched
+locally through `OwnedChildLifecycle` do not submit a new pool admission.
+
+Admission failure describes the selected worker's channel. A full channel does
+not establish that every worker is full. Occupancy does not distinguish runnable
+work, guest I/O waits, or one-shot epoch suspension. Separate
+[worker liveness metrics](worker-liveness.md) detect missing event-loop progress
+with a 250 ms heartbeat and five-second threshold. They identify workers with
+bounded numeric labels and preserve the existing health/readiness contracts.
+
+Metric slot guards track queue and task ownership independently of the scheduler's
+existing `cell_counts`. Those counters can retain stale values after immediate
+completion or discarded queued requests. This landing preserves worker assignment;
+it does not use those counters as a public gauge.
+
+### Endpoint bounds
+
+The endpoint exports 62 fixed series: 35 Wasmtime samples, seven executor
+samples, six fuel-decision samples, two settled-consumption samples, and two
+worker-liveness policy samples, plus ten telemetry samples. The telemetry
+samples use fixed labels to report sampling, export, and loss; see
+[runtime configuration](#runtime-configuration). Each configured executor worker
+adds five
+lifecycle/stall samples and one age sample after its first confirmed progress.
+Metric names and HELP text are static. Worker indices are bounded by the
+configured worker count; other label values are fixed. The renderer accepts
+no dynamic label or HELP text that requires escaping. Cell identifiers, task names,
+RPC methods, paths, peer IDs, and CIDs do not become metric labels. Response size
+is bounded by configured worker count and bounded numeric representations,
+regardless of Cell churn.
+
+### Producer contracts and qualification
+
+- [Wasmtime lifecycle](measurements/wasmtime-lifecycle.md#metrics-contract)
+  defines compilation and instantiation boundaries, buckets and snapshot limits.
+  [Requalification](measurements/wasmtime-lifecycle-requalification.md) retains
+  the later evidence separately from the historical failed campaign.
+- [Executor measurements](measurements/executor-metrics.md) record collection
+  cost and operation-to-HTTP evidence.
+- [Applied fuel decisions](designs/fuel-scheduling.md#applied-decision-metrics)
+  and [settled fuel](designs/fuel-scheduling.md#settled-fuel-consumption-metrics)
+  define collector lifetimes, settlement boundaries, publication delays,
+  exclusions and instrumentation costs. See the
+  [decision](measurements/fuel-decisions.md) and
+  [settlement](measurements/fuel-settlement.md) measurement reports for budgets
+  and qualification limits. Metrics availability does not establish qualification.
+- [Worker liveness](worker-liveness.md) defines heartbeat collection and stall
+  detection without adding instrumentation to Wasmtime Host returns.
+
+### Unavailable measurements
+
+Fuel quantum/distribution, RPC, ARC cache, and stream metrics have no production
+collectors. The
+endpoint omits their samples and HELP/TYPE declarations, and the runtime contains
+no placeholder registries for these metrics. Their absence means unavailable
+measurements, not zero activity. Producer-specific work owns future collection:
+
+- [#260](https://github.com/wetware/ww/issues/260): live `PinsetCache` hits,
+  misses, evictions, cached weight, and entry count.
+- [#752](https://github.com/wetware/ww/issues/752): authority ledgers,
+  desired-versus-applied quantum and physical fuel visibility, latency, and
+  sampled diagnostics.
+- [#754](https://github.com/wetware/ww/issues/754): RPC durations and outcomes,
+  stream activity, and other protocol/host metrics with bounded labels.
+
+Those implementations must establish producer semantics, counter lifetimes,
+label bounds, and operation-to-HTTP coverage before exposing new families.

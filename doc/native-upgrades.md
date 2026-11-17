@@ -66,10 +66,11 @@ substitute for authenticated release identity. Retained public-key evidence and
 signed proofs authenticate the exact current and previous generations during
 offline rollback and recovery. New candidates use independently supplied trust.
 
-Automatic channel discovery remains unavailable until trusted channel freshness
-is integrated. Explicit historic release selection does not lower a consumer
-freshness floor. Same-version releases with different authenticated executable
-bytes are changed upgrades. Identical executable bytes are a no-op and preserve
+Automatic channel discovery authenticates the selected release and persists
+consumer freshness floors. Explicit historic release selection does not lower a
+consumer freshness floor. Same-version releases with different authenticated
+executable bytes are changed upgrades. Identical executable bytes are a no-op
+and preserve
 accepted provenance, even when another signed envelope contains those bytes.
 
 ## Durable records

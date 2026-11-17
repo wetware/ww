@@ -103,4 +103,5 @@ ww run /ipfs/<CID>            # mount the immutable image
 
 - Architecture: `doc/architecture.md` in the repo
 - Examples: `examples/` directory (echo, counter, oracle, chess)
-- Full guide: `ipfs cat /ipns/releases.wetware.run/.agents/prompt.md`
+- Full guide: [CLI reference](../doc/cli.md).
+  Release DNSLink activation remains held.

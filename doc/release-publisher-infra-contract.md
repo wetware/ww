@@ -3,7 +3,7 @@
 Public `wetware/ww` owns deterministic release formats, authentication, offline
 package construction, independent verification and consumer freshness. Private
 `wetware/infra` owns official publication policy, the single durable Owner/journal,
-recovery, Kubo announcement and the protected signing/publication workflow.
+recovery, Kubo announcement and the automatic signing/publication workflow.
 Production publication remains held; neither source merge grants activation.
 
 ## Public offline tool
@@ -40,7 +40,7 @@ Infra selects an exact successful public workflow run, attempt, source revision,
 artifact ID and SHA-256 digest. Admission builds `ww-release-package` from a
 separately pinned public source revision before importing the CAR and unpacking
 the tree. Infra preserves and validates each Host's original producer provenance.
-The CAR contains no package-tool executable; the protected signer uses the source-built
+The CAR contains no package-tool executable; the private signer uses the source-built
 tool and independent public trust.
 
 Public `pack-tree` and `unpack-tree` transfer bounded unsigned filesystem content.
@@ -60,7 +60,7 @@ Neither private handoff accepts ZIP payloads or falls back to ZIP extraction.
 The final private manifest pins both public crates to one exact Git SHA and owns
 its Cargo lockfile and root patches. Public code never fetches private source or
 uses private credentials. Read-only artifact access, artifact availability and
-protected signing custody require separate operational qualification.
+signing custody require separate operational qualification.
 
 The installed version-1 request/result ABI moved with the private executable.
 Its definitions, single-journal rules, restricted transport and activation gates

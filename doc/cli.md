@@ -185,7 +185,7 @@ RPC listener and does not serve this path. Wetware does not fall back to Kubo's
 | `WW_COMPILE_WORKERS` | operator | Positive compiler worker count. Missing or invalid values use half the available CPUs, clamped to 1–4 workers. |
 | `WW_CWASM_DIR` | operator | Optional directory for Wasmtime's native compilation cache. Wasmtime owns artifact compatibility; an unavailable directory falls back to uncached compilation. |
 | `WW_CWASM_CACHE_MAX_BYTES` | operator | Wasmtime cache cleanup threshold in bytes (default: `335544320`). This is a soft limit, so leave filesystem headroom. |
-| `WW_OCI_IMAGE_ID` | operator | Optional immutable OCI image identity reported by `/version`. Deployment verification uses Kubernetes `pod.status.imageID` as the authority. |
+| `WW_OCI_IMAGE_ID` | operator | Optional operator-supplied OCI image identity reported by `/version`; the Host does not independently determine the container runtime digest. |
 | `RUST_LOG` | user | Host-side tracing verbosity |
 | `WW_LOG_FORMAT` | user | Host log format: `auto` (default), `compact`, or `json` |
 | `WW_OTLP_ENDPOINT` | user | Opt-in local OTLP/HTTP trace endpoint; absent disables export |
