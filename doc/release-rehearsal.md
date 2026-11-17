@@ -92,17 +92,32 @@ It then replays the retained FHS journal with missing target bytes. Recovery mus
 restore the previous baseline before contacting an unavailable endpoint. Journal
 replay does not qualify a real process kill during the FHS update.
 
-Optionally pass `--alternate-binary /path/to/separately-built/ww` to test native
-compatibility refusal and authenticated shell recovery. Retain that binary's
-exact source, toolchain, build command, input hashes, and output hash separately.
-The candidate receives distinct local-builder provenance. The native adapter
-must reject compatibility after verified staging. The shell must authenticate
-the original release before aborting the pre-replacement transaction. The test
-retains native service observation and admission checks; an incompatible platform
-environment fails the test instead of changing the operator's service.
+Optionally pass `--alternate-binary /path/to/separately-built/ww` to test
+unmanaged native-upgrade refusal. Retain that binary's exact source, toolchain,
+build command, input hashes, and output hash separately. The candidate receives
+distinct local-builder provenance. The helper installs the original release in
+a separate `HOME` without registering a service. It invokes the changed upgrade
+with `--timeout-secs 120` and requires unmanaged replacement refusal before
+executable replacement or journal creation. Installed and private file bytes
+must remain unchanged. Service observation errors fail the rehearsal; the helper
+does not accept arbitrary errors as compatibility refusal.
+
+The helper then invokes shell `--recover --timeout-secs 120`. Because refusal
+created no transaction, the shell must reject the request for a missing pending
+journal before transport or authentication. The helper checks that no journal
+appears and that installed and private file bytes remain unchanged. This negative
+control does not demonstrate successful authenticated recovery. The default
+exact-artifact upgrade no-op remains unchanged and does not require a timeout.
+
+Successful interrupted native recovery belongs to the dedicated
+[`qualify_native_upgrade.py` qualification](../scripts/qualify_native_upgrade.py)
+and its [native integration runner](../tests/native_release_integration.py).
+See [authenticated native recovery](native-upgrades.md) for the recovery contract.
+The consumer rehearsal does not construct a pending native transaction or repeat
+that qualification campaign.
 
 Consumer `report.json` and per-command outputs distinguish successful no-ops,
-derived FHS transitions, and pre-replacement recovery. None establishes successful
-native replacement, native restart admission, launchd lifecycle, or automatic
-channel freshness. Private-state sentinels establish byte preservation, not signed
-freshness verification.
+derived FHS transitions, and native refusal checks. None establishes successful
+native replacement, interrupted native recovery, native restart admission,
+launchd lifecycle, or automatic channel freshness. Private-state sentinels
+establish byte preservation, not signed freshness verification.

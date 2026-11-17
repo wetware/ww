@@ -15,7 +15,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import shlex
 import shutil
 import subprocess
 import sys
@@ -74,13 +73,34 @@ def substituted_release(endpoint, requested, substituted):
         thread.join(timeout=5)
 
 
+def check_alternate_refusal(consume, run, recovery_home, env, first, candidate, trust, endpoint):
+    """Check unmanaged refusal and missing-transaction rejection, not recovery."""
+    recovery_root = recovery_home / ".ww"
+    recovery_installed = recovery_root / "bin/ww"
+    preserved = snapshot(recovery_home)
+    consume("alternate-host-refused", ["upgrade", "--timeout-secs", "120"], candidate,
+            selected=recovery_installed,
+            failure="unmanaged automatic native replacement is unsupported")
+    journal = recovery_root / "host-upgrade.json"
+    require(not os.path.lexists(journal), "compatibility refusal created a native journal")
+    require(snapshot(recovery_home) == preserved, "refused upgrade changed installation/private bytes")
+    # Refusal creates no transaction. The real shell must reject recovery before
+    # transport or authentication; successful recovery belongs to native qualification.
+    run("shell-recovery-without-transaction-refused",
+        ["sh", REPO / "scripts/install.sh", "--recover", "--timeout-secs", "120",
+         "--release", first, "--trusted-release-keys", trust, "--ipfs-url", endpoint],
+        env=env, failure="Recovery requires a pending Host upgrade")
+    require(not os.path.lexists(journal), "shell recovery refusal created a native journal")
+    require(snapshot(recovery_home) == preserved, "shell recovery refusal changed installation/private bytes")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rehearsal", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--package-tool", type=Path, required=True)
     parser.add_argument("--alternate-binary", type=Path,
-                        help="genuine separately built local Host; tests compatibility refusal and recovery only")
+                        help="genuine separately built local Host; tests unmanaged upgrade and missing-transaction recovery refusal")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     rehearsal = args.rehearsal.resolve(strict=True)
@@ -249,37 +269,13 @@ def main():
             recovery_home.mkdir(mode=0o700)
             env["HOME"] = str(recovery_home)
             consume("recovery-home-install", ["install"], first)
-            recovery_root = recovery_home / ".ww"
-            recovery_installed = recovery_root / "bin/ww"
-            preserved = snapshot(recovery_home)
-            consume("alternate-host-refused", ["upgrade"], selected["root"], selected=recovery_installed,
-                    failure="production integration is unavailable")
-            journal = recovery_root / "host-upgrade.json"
-            require(journal.is_file(), "expected durable pre-replacement journal after compatibility refusal")
-            require(json.loads(journal.read_text())["phase"] == "Staging", "unexpected refused transaction phase")
-            for name, digest in preserved.items():
-                require(sha256(recovery_home / name) == digest, f"refused upgrade changed {name}")
-            # This wrapper only selects the real isolated Kubo endpoint. It does
-            # not fabricate transport responses or bypass shell authentication.
-            cli = work / "kubo-client"
-            cli.mkdir()
-            real_ipfs = shutil.which("ipfs")
-            require(real_ipfs is not None, "real Kubo CLI missing")
-            wrapper = cli / "ipfs"
-            wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(real_ipfs) + " --api "
-                               + shlex.quote(api) + ' "$@"\n')
-            wrapper.chmod(0o700)
-            recovery_env = dict(env, PATH=str(cli) + os.pathsep + env["PATH"])
-            run("authenticated-shell-recovery", ["sh", REPO / "scripts/install.sh", "--recover",
-                "--release", first, "--trusted-release-keys", trust, "--ipfs-url", endpoint], env=recovery_env)
-            require(not journal.exists(), "shell recovery left pending pre-replacement journal")
-            require(snapshot(recovery_home) == preserved, "shell recovery changed original installation/private bytes")
-            checks.append("genuine alternate Host refused by native compatibility; authenticated shell aborts pre-replacement journal")
+            check_alternate_refusal(consume, run, recovery_home, env, first, selected["root"], trust, endpoint)
+            checks.append("genuine alternate Host refused before replacement or journal creation; shell recovery refuses without a transaction")
 
     report = {"status": "PASS", "checks": checks, "releases": [identity for identity, _ in releases],
               "host_sha256": sha256(binary), "commands": len(commands),
               "derived_fhs": "custom-section fixture; not original CI producer-byte evidence",
-              "not_qualified": ["changed native replacement", "native restart/readiness/rollback", "platform service lifecycle",
+              "not_qualified": ["changed native replacement", "native restart/readiness/rollback", "successful interrupted native recovery", "platform service lifecycle",
                                 "automatic channel freshness", "actual process kill during FHS update"]}
     (work / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
