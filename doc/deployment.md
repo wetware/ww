@@ -223,9 +223,14 @@ point this option at the administrative RPC listener on port 5001. Wetware
 fails with an actionable error when the listener does not expose Routing V1;
 it does not fall back to Kubo `name/resolve`, `name/publish`, or key management.
 
-## Manual image promotion
+## Historical Kubernetes image promotion
 
-Production promotion is intentionally declarative:
+The following procedure describes the retired Kubernetes deployment. It is not
+a current production instruction. Epiphyte now uses Debian 13 and systemd;
+publication remains held. See [current production operations](https://github.com/wetware/infra/blob/master/ops/vps/steady-state.md)
+and [release activation gates](https://github.com/wetware/infra/blob/master/ops/vps/publication-transition.md).
+
+The historical promotion path was declarative:
 
 ```text
 GHCR immutable digest

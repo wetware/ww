@@ -99,10 +99,13 @@ The worker verifies against its independently provisioned keyring before local
 commitment; the verifier comes from the installed executable, never the release tree.
 
 Official signing admission now belongs to private `wetware/infra`. Its inactive
-protected signing job validates the reviewed public artifact handoff before key
+automatic signing job validates the reviewed public artifact handoff before key
 access. Public CI receives no release-signing secret. The reusable signing script
 checks explicit files and independent trust; it does not allocate CI authority.
-Environment protections and signing custody require separate approval.
+The approved prototype trusts private infra workflow writers with repository
+signing authority. Credential provisioning and production activation still
+require separate approval. No protected environment or per-release approval
+is required.
 
 Private key material exists only in an owner-accessible temporary directory
 outside the artifact tree. The step disables tracing, uses `umask 077`, clears
@@ -116,7 +119,8 @@ use ephemeral runners and restrict access to runner storage.
 ## Provisioning runbook — requires separate approval
 
 1. Approve the release-key custodian, independent public-key distribution channel,
-   protected environment, and cutover release. Keep the publication hold in place.
+   repository-secret custody, and cutover release.
+   Keep the publication hold in place.
 2. Generate a fresh key on the approved signing machine, outside the checkout and
    every artifact directory. Do not reuse an IPNS or Host key:
 
@@ -133,24 +137,27 @@ use ephemeral runners and restrict access to runner storage.
    OpenSSL-generated keys, not arbitrary encoded points. Preserve a protected
    recovery copy according to the approved custody policy. Never send the private
    key to a release consumer, publisher host, issue, PR, chat, or build artifact.
-4. Provision the public keyring on consumers and the publisher host as
-   `/etc/wetware/release-keys`, owned by an administrator and not writable by
+4. Provision the public keyring as `/etc/wetware/release-keys` on consumers and
+   `/etc/wetware/release-trusted-keys` on the publisher host. Both must be
+   owned by an administrator and not writable by
    untrusted users. For a user-managed installation, provision a protected local
    path and pass `--trusted-release-keys` explicitly. Releases cannot rotate keys.
-5. After separate CI approval in `wetware/infra`, configure environment secret
-   `WW_RELEASE_SIGNING_KEY` with the private PEM and environment variable
+5. After separate CI approval in `wetware/infra`, configure repository Actions
+   secret `WW_RELEASE_SIGNING_KEY` with the private PEM and repository Actions variable
    `WW_RELEASE_TRUSTED_KEYS` with the public keyring. A final LF is optional in
-   the CI variable; the workflow adds one if absent. Restrict `release-signing`
-   to protected master and required reviewers. Do not duplicate the private
-   secret into repository-wide build or PR contexts.
+   the CI variable; the workflow adds one if absent. The official workflow
+   requires master and manual dispatch, then signs automatically after admission.
+   Repository workflow writers can author other workflows that access secrets;
+   this is an accepted trust boundary. Preserve restrictions on secrets in
+   untrusted fork workflows. Public CI must receive no signing secret.
 6. Validate a signed candidate by immutable CID without changing discovery.
    Verify all intended platforms and both fresh installation and recovery.
    Independently compare the published manifest and signature with the signed
    files. Record the source revision, CID, signer fingerprint, and test receipts.
 7. Obtain separate approval for publication/cutover. This patch does not remove
-   the IPFS hold, fence historical writers, or configure environment protections.
+   the IPFS hold, fence historical writers, or provision credentials.
    Apply [the existing publication fence](legacy-publication-hold.md), and use
-   #737/#738's publication owner when that integration is ready. Do not activate
+   infra's single durable publication Owner. Do not activate
    a competing owner or journal from this work.
 
 For offline qualification, run `ww-release-package prepare`, then
@@ -246,7 +253,7 @@ uses generated, independently checked keys; malformed non-curve local keyring
 entries can cause stricter Rust refusal than OpenSSL during overlap. They do not
 let an untrusted publisher authenticate without another valid trusted key.
 
-The actual production environment protections, key custody, cross-platform native
+Production signing custody, cross-platform native
 installation, and discovery cutover require operator qualification. Local test
 receipts and independent-review results accompany the proposed PR separately.
 
