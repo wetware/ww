@@ -58,16 +58,17 @@ narrow `Membrane` containing only `peerId` and `Stat`.
 
 ### Install
 
-Use a reviewed checkout and the signed-release prerequisites above. Production
-activation remains held; these commands do not supply a release or trust anchor.
+Use a reviewed checkout and the signed-release prerequisites above. Before
+running the command, set `RELEASE_CID` to the selected signed release and provision
+the independent release keyring. Production activation remains held; the command
+does not supply a release or trust anchor.
 
 ```bash
 sh scripts/install.sh --release "$RELEASE_CID"
 ```
 
-Set `RELEASE_CID` to the selected signed release and provision the independent
-release keyring first. The installer authenticates and installs the Host,
-baseline FHS, and identity. The shell installer requires an explicit release CID.
+The installer authenticates and installs the Host, baseline FHS, and identity.
+The shell installer requires an explicit release CID.
 For existing installations, `ww upgrade` supports authenticated IPNS selection
 with an independently configured release identity and public keyring.
 Installation does not register a daemon or configure name publication. Register

@@ -142,11 +142,12 @@ use ephemeral runners and restrict access to runner storage.
    owned by an administrator and not writable by
    untrusted users. For a user-managed installation, provision a protected local
    path and pass `--trusted-release-keys` explicitly. Releases cannot rotate keys.
-5. After separate CI approval in `wetware/infra`, configure repository Actions
-   secret `WW_RELEASE_SIGNING_KEY` with the private PEM and repository Actions variable
-   `WW_RELEASE_TRUSTED_KEYS` with the public keyring. A final LF is optional in
-   the CI variable; the workflow adds one if absent. The official workflow
-   requires master and manual dispatch, then signs automatically after admission.
+5. After separate CI approval in `wetware/infra`, set the repository Actions
+   secret `WW_RELEASE_SIGNING_KEY` to the private PEM. Set the repository Actions
+   variable `WW_RELEASE_TRUSTED_KEYS` to the public keyring. A final LF is optional
+   in `WW_RELEASE_TRUSTED_KEYS`; the workflow adds one if absent.
+   The official workflow requires master and manual dispatch, then signs
+   automatically after admission.
    Repository workflow writers can author other workflows that access secrets;
    this is an accepted trust boundary. Preserve restrictions on secrets in
    untrusted fork workflows. Public CI must receive no signing secret.
