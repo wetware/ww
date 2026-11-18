@@ -61,25 +61,30 @@ fn operation(snapshot: &FsSnapshot, id: u64) -> FsDirectoryBuildSnapshot {
         .expect("operation remains in the bounded snapshot")
 }
 
+struct NativeResult {
+    file: Option<std::fs::File>,
+    released: Arc<AtomicBool>,
+}
+
+impl Drop for NativeResult {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        self.released.store(true, Ordering::SeqCst);
+    }
+}
+
 #[tokio::test]
 async fn late_root_close_retains_completed_unpolled_directory_result_until_disposal() {
-    struct NativeResult(Option<std::fs::File>, Arc<AtomicBool>);
-    impl Drop for NativeResult {
-        fn drop(&mut self) {
-            drop(self.0.take());
-            self.1.store(true, Ordering::SeqCst);
-        }
-    }
     let (host_owner, host) = start_host(1, 1);
     let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
     let cancellation = scope.cancellation();
     let staging = tempfile::tempdir().unwrap();
     let path = staging.path().join("result");
     let disposed = Arc::new(AtomicBool::new(false));
-    let native_result = NativeResult(
-        Some(std::fs::File::create(&path).unwrap()),
-        Arc::clone(&disposed),
-    );
+    let native_result = NativeResult {
+        file: Some(std::fs::File::create(&path).unwrap()),
+        released: Arc::clone(&disposed),
+    };
     let cleanup_witness = Arc::clone(&disposed);
     let cleanup_path = path.clone();
     scope
@@ -638,17 +643,6 @@ async fn operation_records_do_not_cross_reused_root_generations() {
 
 #[tokio::test]
 async fn owner_shutdown_waits_for_native_resource_disposal_and_cleanup() {
-    struct NativeResult {
-        file: Option<std::fs::File>,
-        released: Arc<AtomicBool>,
-    }
-    impl Drop for NativeResult {
-        fn drop(&mut self) {
-            drop(self.file.take());
-            self.released.store(true, Ordering::SeqCst);
-        }
-    }
-
     let (host_owner, host) = start_host(1, 1);
     let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
     let directory = tempfile::tempdir().unwrap();

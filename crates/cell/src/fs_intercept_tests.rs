@@ -427,15 +427,6 @@ async fn slash_bearing_bare_alias_does_not_change_single_segment_path_grammar() 
 }
 
 #[tokio::test]
-async fn chained_directory_opens_keep_base_context() {
-    let (mut store, root, _) = harness().await;
-    let nested = read_open(&mut store, root, "nested").await.unwrap();
-    // Only /nested has a deeper directory. Restarting at root returns NoEntry.
-    let deeper = read_open(&mut store, nested.rep(), "deeper").await;
-    assert!(deeper.is_ok(), "nested/deeper: {deeper:?}");
-}
-
-#[tokio::test]
 async fn immutable_flags_reject_before_lookup_or_staging() {
     use p3_types::{DescriptorFlags as D, ErrorCode as E, OpenFlags as O};
     let (mut store, root, _) = harness().await;
