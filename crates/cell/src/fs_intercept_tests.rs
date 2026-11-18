@@ -76,6 +76,10 @@ fn listing(staging: &std::path::Path, cid: &str, children: &[(&str, &str, bool)]
     .unwrap();
 }
 async fn harness() -> (Store<Harness>, u32, u32) {
+    harness_with_limits(cache::CellLimits::default()).await
+}
+
+async fn harness_with_limits(limits: cache::CellLimits) -> (Store<Harness>, u32, u32) {
     let staging = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     listing(
@@ -99,7 +103,7 @@ async fn harness() -> (Store<Harness>, u32, u32) {
         cache::HostLimits::default(),
     )
     .unwrap();
-    let resources = cache::CellResources::new(Arc::clone(&host), cache::CellLimits::default());
+    let resources = cache::CellResources::new(Arc::clone(&host), limits);
     let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) =
         host.try_filesystem_scope().unwrap();
     let tree = Arc::new(CidTree::new(
@@ -231,6 +235,19 @@ async fn get_type(
         .unwrap()
 }
 
+fn install_read_only(store: &mut Store<Harness>, path: &std::path::Path) -> Fd {
+    let state = store.data_mut();
+    open_read_only_path(
+        path,
+        None,
+        Arc::clone(&state.resources),
+        state.filesystem_scope.clone(),
+    )
+    .unwrap()
+    .install(&mut state.table)
+    .unwrap()
+}
+
 async fn get_flags(
     store: &mut Store<Harness>,
     descriptor: u32,
@@ -251,29 +268,12 @@ async fn get_flags(
 
 #[tokio::test]
 async fn directory_type_is_constant_but_file_queries_and_identity_stay_charged() {
-    let (mut store, root, tmp) = harness().await;
-    let limited = cache::CellResources::new(
-        Arc::clone(store.data().resources.host()),
-        cache::CellLimits::new(1).unwrap(),
-    );
-    let hook_resources = Arc::clone(&limited);
-    let hook_scope = store.data().filesystem_scope.clone();
-    store
-        .data_mut()
-        .wasi
-        .filesystem()
-        .set_operation_hook(move || {
-            admit_native_filesystem_operation(&hook_resources, &hook_scope)
-        });
-    store.data_mut().resources = Arc::clone(&limited);
+    let (mut store, root, tmp) = harness_with_limits(cache::CellLimits::new(1).unwrap()).await;
+    let limited = Arc::clone(&store.data().resources);
 
     let file_path = store.data().scratch.path().join("type-probe");
     std::fs::write(&file_path, b"probe").unwrap();
-    let file = store
-        .data_mut()
-        .table
-        .push(open_read_only_path(&file_path, None).unwrap())
-        .unwrap();
+    let file = install_read_only(&mut store, &file_path);
     let held = limited.try_logical_io().unwrap();
 
     assert_error(
@@ -494,11 +494,7 @@ async fn file_base_and_target_types_have_exact_errors() {
     }
     let file_path = store.data().scratch.path().join("base");
     std::fs::write(&file_path, "bytes").unwrap();
-    let base = store
-        .data_mut()
-        .table
-        .push(open_read_only_path(&file_path, None).unwrap())
-        .unwrap();
+    let base = install_read_only(&mut store, &file_path);
     for flags in [O::empty(), O::CREATE] {
         assert_error(
             open(&mut store, base.rep(), "nested", flags, D::WRITE).await,
@@ -550,7 +546,7 @@ fn read_contents(store: &Store<Harness>, fd: &Fd) -> String {
         panic!("expected file")
     };
     let mut contents = String::new();
-    let mut native = &**file.file;
+    let mut native = &*file.file;
     native.read_to_string(&mut contents).unwrap();
     contents
 }
@@ -560,10 +556,10 @@ fn write_contents(store: &Store<Harness>, fd: &Fd, contents: &[u8], append: bool
         panic!("expected file")
     };
     if append {
-        let mut native = &**file.file;
+        let mut native = &*file.file;
         native.seek(SeekFrom::End(0)).unwrap();
     }
-    let mut native = &**file.file;
+    let mut native = &*file.file;
     native.write_all(contents).unwrap();
 }
 fn drop_descriptor(store: &mut Store<Harness>, fd: Fd) {
@@ -722,11 +718,7 @@ async fn drop_and_resource_id_reuse_clear_all_descriptor_context() {
     // Reuse the slot with a real non-CidTree descriptor. Its child comes from its host directory.
     let path = store.data().scratch.path().to_path_buf();
     std::fs::write(path.join("child"), "replacement").unwrap();
-    let replacement = store
-        .data_mut()
-        .table
-        .push(open_read_only_path(&path, None).unwrap())
-        .unwrap();
+    let replacement = install_read_only(&mut store, &path);
     assert_eq!(
         replacement.rep(),
         id,
@@ -753,11 +745,7 @@ async fn drop_and_resource_id_reuse_clear_all_descriptor_context() {
     drop_descriptor(&mut store, Resource::new_own(root));
     assert!(!store.data().descriptors.roots.contains(&root));
     assert!(!store.data().descriptors.directories.contains_key(&root));
-    let replacement = store
-        .data_mut()
-        .table
-        .push(open_read_only_path(&path.join("child"), None).unwrap())
-        .unwrap();
+    let replacement = install_read_only(&mut store, &path.join("child"));
     assert_eq!(replacement.rep(), root);
     assert_error(
         open(&mut store, root, "nested", O::CREATE, D::WRITE).await,
