@@ -58,6 +58,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - Installer-test setup now reuses an authenticated package with independent
   per-test copies and a bounded finalization budget for real debug Host binaries.
+  The offline corruption test now supplies its own `restore_checksums()` stub.
 - Correct required timeouts and align optional release consumer rehearsal refusal
   and journal assertions with the current upgrade CLI. Production upgrade behavior
   and native recovery guarantees are unchanged.
