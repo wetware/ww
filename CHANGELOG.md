@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Filesystem-retention regression coverage for child descriptors after parent
+  drop and cache eviction, including sibling content and final cleanup.
+  Consolidated duplicate test fixtures and removed one redundant relative-base
+  test while retaining coverage in the existing multi-descriptor test.
 - **Authenticated IPNS release selection (#742).** Let explicit `ww upgrade`
   resolve a configured release IPNS identity through existing signed-proof and
   persistent freshness validation. Preserve historical immutable-CID selection.
