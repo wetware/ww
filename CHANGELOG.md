@@ -56,6 +56,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pending authenticated selection, compatibility, and native restart admission.
 
 ### Fixed
+- Installer-test setup now reuses an authenticated package with independent
+  per-test copies and a bounded finalization budget for real debug Host binaries.
 - Correct required timeouts and align optional release consumer rehearsal refusal
   and journal assertions with the current upgrade CLI. Production upgrade behavior
   and native recovery guarantees are unchanged.

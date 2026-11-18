@@ -44,6 +44,37 @@ class Installation(unittest.TestCase):
         # private fixture copy, preserving the supplied artifact bytes.
         shutil.copyfile(PACKAGE_TOOL, cls.package_tool)
         cls.package_tool.chmod(0o700)
+        # Package the unchanged real inputs once. Each case gets independent
+        # files below; corrupting one case must not change this signed seed.
+        cls.seed = Path(cls.tools.name) / 'seed'
+        private, trusted_keys = generate_key(cls.seed / 'release-keys')
+        release = cls.seed / 'release'
+        (release / HOST_PATH).parent.mkdir(parents=True)
+        shutil.copy2(BINARY, release / HOST_PATH)
+        target = {'bin/ww/linux/aarch64/ww': 'aarch64-unknown-linux-gnu',
+                  'bin/ww/linux/x86_64/ww': 'x86_64-unknown-linux-gnu',
+                  'bin/ww/macos/aarch64/ww': 'aarch64-apple-darwin',
+                  'bin/ww/macos/x86_64/ww': 'x86_64-apple-darwin'}[HOST_PATH]
+        cls.targets = [target]
+        if target == 'x86_64-unknown-linux-gnu':
+            alias = release / 'bin/ww/linux/musl-x86_64/ww'
+            alias.parent.mkdir(parents=True)
+            shutil.copy2(BINARY, alias)
+            cls.targets.append('x86_64-unknown-linux-musl')
+        shutil.copytree(FHS, release / 'fhs')
+        package = package_release(cls.package_tool, release, cls.seed / 'spool',
+                                  private, trusted_keys, cls.targets,
+                                  command_runner=cls.package_command)
+        cls.seed_cid = package['root']
+        shutil.copyfile(cls.seed / 'spool/blocks' / cls.seed_cid, cls.seed / 'root.block')
+
+    @staticmethod
+    def package_command(stage, command):
+        # Finalization authenticates the full debug Host repeatedly. The real
+        # CI fixture exceeds 90 seconds; this is setup, not an installer deadline.
+        timeout = 300 if stage == 'package-finalize' else 90
+        return subprocess.run(command, check=True, capture_output=True, text=True,
+                              timeout=timeout).stdout
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='ww-install-test-')
@@ -51,24 +82,14 @@ class Installation(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.home = self.root / 'home'
         self.home.mkdir()
-        self.private, self.trusted_keys = generate_key(self.root / 'release-keys')
+        shutil.copytree(self.seed / 'release-keys', self.root / 'release-keys')
+        self.private = self.root / 'release-keys/private.pem'
+        self.trusted_keys = self.root / 'release-keys/trusted-keys'
         self.release = self.root / 'release'
-        (self.release / HOST_PATH).parent.mkdir(parents=True)
-        shutil.copy2(BINARY, self.release / HOST_PATH)
-        target = {'bin/ww/linux/aarch64/ww': 'aarch64-unknown-linux-gnu',
-                  'bin/ww/linux/x86_64/ww': 'x86_64-unknown-linux-gnu',
-                  'bin/ww/macos/aarch64/ww': 'aarch64-apple-darwin',
-                  'bin/ww/macos/x86_64/ww': 'x86_64-apple-darwin'}[HOST_PATH]
-        self.targets = [target]
-        if target == 'x86_64-unknown-linux-gnu':
-            alias = self.release / 'bin/ww/linux/musl-x86_64/ww'
-            alias.parent.mkdir(parents=True)
-            shutil.copy2(BINARY, alias)
-            self.targets.append('x86_64-unknown-linux-musl')
-        shutil.copytree(FHS, self.release / 'fhs')
+        shutil.copytree(self.seed / 'release', self.release)
         self.metadata = ReleaseMetadataServer()
         self.addCleanup(self.metadata.close)
-        self.checksums()
+        self.restore_checksums()
         self.stubs = self.root / 'transport'
         self.stubs.mkdir()
         ipfs = self.stubs / 'ipfs'
@@ -101,10 +122,18 @@ esac
                         NO_COLOR='1', WW_CWASM_DIR=str(self.root / 'cwasm'),
                         IPFS_API=self.metadata.endpoint, IPFS_ROUTING_API='http://127.0.0.1:1')
 
+    def restore_checksums(self):
+        for name in ('CHECKSUMS.txt', 'CHECKSUMS.txt.sig'):
+            shutil.copyfile(self.seed / 'release' / name, self.release / name)
+        shutil.copyfile(self.seed / 'root.block', self.root / 'root.block')
+        self.release_cid = self.seed_cid
+        self.publish_metadata()
+
     def checksums(self, valid_payload=True):
         if valid_payload:
             package = package_release(self.package_tool, self.release, self.root / 'spool',
-                                      self.private, self.trusted_keys, self.targets)
+                                      self.private, self.trusted_keys, self.targets,
+                                      command_runner=self.package_command)
             self.release_cid = package['root']
             (self.root / 'root.block').write_bytes(
                 (self.root / 'spool/blocks' / self.release_cid).read_bytes())
@@ -262,7 +291,7 @@ esac
                         self.assert_native_refusal_preserved(before)
                     finally:
                         (self.release / name).write_bytes(original)
-                        self.checksums()
+                        self.restore_checksums()
 
     def test_checksum_mismatch_missing_and_duplicate_entries_refused(self):
         original = (self.release / 'CHECKSUMS.txt').read_text()
