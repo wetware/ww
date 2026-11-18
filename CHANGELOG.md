@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Filesystem-retention regression coverage for child descriptors after parent
+  drop and cache eviction, including sibling content and final cleanup.
+  Consolidated duplicate test fixtures and removed one redundant relative-base
+  test while retaining coverage in the existing multi-descriptor test.
 - **Authenticated IPNS release selection (#742).** Let explicit `ww upgrade`
   resolve a configured release IPNS identity through existing signed-proof and
   persistent freshness validation. Preserve historical immutable-CID selection.
@@ -52,6 +56,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pending authenticated selection, compatibility, and native restart admission.
 
 ### Fixed
+- Installer-test setup now reuses an authenticated package with independent
+  per-test copies and a bounded finalization budget for real debug Host binaries.
+  The offline corruption test now supplies its own `restore_checksums()` stub.
 - Correct required timeouts and align optional release consumer rehearsal refusal
   and journal assertions with the current upgrade CLI. Production upgrade behavior
   and native recovery guarantees are unchanged.

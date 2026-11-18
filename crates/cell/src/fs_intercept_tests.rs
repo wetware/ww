@@ -427,15 +427,6 @@ async fn slash_bearing_bare_alias_does_not_change_single_segment_path_grammar() 
 }
 
 #[tokio::test]
-async fn chained_directory_opens_keep_base_context() {
-    let (mut store, root, _) = harness().await;
-    let nested = read_open(&mut store, root, "nested").await.unwrap();
-    // Only /nested has a deeper directory. Restarting at root returns NoEntry.
-    let deeper = read_open(&mut store, nested.rep(), "deeper").await;
-    assert!(deeper.is_ok(), "nested/deeper: {deeper:?}");
-}
-
-#[tokio::test]
 async fn immutable_flags_reject_before_lookup_or_staging() {
     use p3_types::{DescriptorFlags as D, ErrorCode as E, OpenFlags as O};
     let (mut store, root, _) = harness().await;
@@ -578,6 +569,83 @@ fn write_contents(store: &Store<Harness>, fd: &Fd, contents: &[u8], append: bool
 fn drop_descriptor(store: &mut Store<Harness>, fd: Fd) {
     p3_types::HostDescriptor::drop(&mut store.data_mut().intercepted_filesystem(), fd).unwrap();
 }
+
+#[tokio::test]
+async fn shared_generation_child_retains_paths_after_parent_drop_and_eviction() {
+    struct Pinner;
+    #[async_trait::async_trait]
+    impl cache::Pinner for Pinner {
+        async fn pin(&self, _: &cid::Cid) -> Result<()> {
+            Ok(())
+        }
+        async fn unpin(&self, _: &cid::Cid) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _: &cid::Cid) -> Result<u64> {
+            Ok(4)
+        }
+        async fn fetch(&self, _: &cid::Cid) -> Result<Vec<u8>> {
+            Ok(b"data".to_vec())
+        }
+        async fn fetch_path(&self, _: &cid::Cid, path: &str) -> Result<Vec<u8>> {
+            Ok(path.as_bytes().to_vec())
+        }
+    }
+
+    let (mut store, root, _) = harness().await;
+    let shared = Arc::new(
+        cache::PinsetCache::new(
+            Arc::new(Pinner),
+            4,
+            Arc::clone(store.data().resources.host()),
+        )
+        .await
+        .unwrap(),
+    );
+    store.data_mut().cache = Some(Arc::new(cache::CacheMode::Shared(Arc::clone(&shared))));
+    let cid = ipfs::cid_identity::parse_cid(NESTED).unwrap();
+    let other = ipfs::cid_identity::parse_cid(DEEPER).unwrap();
+
+    // Materializing leaves creates ancestors that the explicit IPFS route can open.
+    for path in ["b/nested/payload", "b/sibling"] {
+        let file = read_open(&mut store, root, &format!("ipfs/{cid}/{path}"))
+            .await
+            .unwrap();
+        drop_descriptor(&mut store, file);
+    }
+    let (generation, completion) = shared.test_generation(&cid).unwrap();
+    let parent = read_open(&mut store, root, &format!("ipfs/{cid}/b"))
+        .await
+        .unwrap();
+    let child = read_open(&mut store, parent.rep(), "nested").await.unwrap();
+    drop_descriptor(&mut store, parent);
+
+    // The surviving child came from Wasmtime's relative open, not materialization.
+    shared.ensure(&other).await.unwrap();
+    assert_eq!(
+        std::fs::read(generation.join("content/subpaths/b/sibling")).unwrap(),
+        b"b/sibling"
+    );
+    let file = read_open(&mut store, child.rep(), "payload").await.unwrap();
+    drop_descriptor(&mut store, child);
+    assert_eq!(read_contents(&store, &file), "b/nested/payload");
+    assert!(generation.exists());
+
+    // Final-handle release reclaims this generation while the Store/cache stay alive.
+    drop_descriptor(&mut store, file);
+    tokio::time::timeout(std::time::Duration::from_secs(5), completion.wait())
+        .await
+        .expect("generation cleanup deadline")
+        .unwrap();
+    assert!(!generation.exists());
+    assert!(shared.test_generation(&cid).is_none());
+    assert!(store
+        .data()
+        .table
+        .get(&Resource::<Descriptor>::new_borrow(root))
+        .is_ok());
+}
+
 async fn create_directory(store: &mut Store<Harness>, base: u32, path: &str) {
     store
         .run_concurrent(async |access| {

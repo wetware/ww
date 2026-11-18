@@ -166,6 +166,7 @@ class InstallerFixtureBoundary(unittest.TestCase):
             return subprocess.CompletedProcess([], 1, '', message)
         case.setUp = case.tearDown = lambda: None
         case.checksums, case.install = checksums, install
+        case.restore_checksums = checksums
         case.assert_native_refusal_preserved = lambda before: case.fail('injected refusal assertion')
         result = unittest.TestResult()
         with patch.object(self.module.subprocess, 'run', side_effect=AssertionError('native execution forbidden')):

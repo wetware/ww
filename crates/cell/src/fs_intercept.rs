@@ -3353,74 +3353,44 @@ mod tests {
             bytes
         }
 
-        for root_first in [true, false] {
-            let fs = TestFilesystem::new();
-            let cid: cid::Cid = DIRECTORY_CID.parse().unwrap();
-            let (shared, cache) = fs.shared_cache(Arc::new(DirectoryRootPinner), 8).await;
+        for (subpath, expected) in [
+            ("root", b"literal-root-child".as_slice()),
+            ("root/nested", b"nested-under-root-child".as_slice()),
+        ] {
+            for root_first in [true, false] {
+                let fs = TestFilesystem::new();
+                let cid: cid::Cid = DIRECTORY_CID.parse().unwrap();
+                let (shared, cache) = fs.shared_cache(Arc::new(DirectoryRootPinner), 8).await;
 
-            let (root, child) = if root_first {
-                (
-                    materialize(&fs, &cache, cid, "").await,
-                    materialize(&fs, &cache, cid, "root").await,
-                )
-            } else {
-                let child = materialize(&fs, &cache, cid, "root").await;
-                let root = materialize(&fs, &cache, cid, "").await;
-                (root, child)
-            };
+                let (root, child) = if root_first {
+                    (
+                        materialize(&fs, &cache, cid, "").await,
+                        materialize(&fs, &cache, cid, subpath).await,
+                    )
+                } else {
+                    let child = materialize(&fs, &cache, cid, subpath).await;
+                    let root = materialize(&fs, &cache, cid, "").await;
+                    (root, child)
+                };
 
-            assert!(matches!(
-                root,
-                wasmtime_wasi::filesystem::Descriptor::Dir(_)
-            ));
-            assert_eq!(read_file(&child), b"literal-root-child");
+                assert!(matches!(
+                    root,
+                    wasmtime_wasi::filesystem::Descriptor::Dir(_)
+                ));
+                assert_eq!(read_file(&child), expected);
 
-            let (generation, _) = shared.test_generation(&cid).unwrap();
-            let root_path = generation.join("content/root");
-            let child_path = generation.join("content/subpaths/root");
-            assert_ne!(root_path, child_path);
-            assert!(root_path.is_dir());
-            assert_eq!(
-                std::fs::read(root_path.join("marker")).unwrap(),
-                b"directory-root"
-            );
-            assert_eq!(std::fs::read(child_path).unwrap(), b"literal-root-child");
-        }
-
-        for root_first in [true, false] {
-            let fs = TestFilesystem::new();
-            let cid: cid::Cid = DIRECTORY_CID.parse().unwrap();
-            let (shared, cache) = fs.shared_cache(Arc::new(DirectoryRootPinner), 8).await;
-
-            let (root, nested) = if root_first {
-                (
-                    materialize(&fs, &cache, cid, "").await,
-                    materialize(&fs, &cache, cid, "root/nested").await,
-                )
-            } else {
-                let nested = materialize(&fs, &cache, cid, "root/nested").await;
-                let root = materialize(&fs, &cache, cid, "").await;
-                (root, nested)
-            };
-
-            assert!(matches!(
-                root,
-                wasmtime_wasi::filesystem::Descriptor::Dir(_)
-            ));
-            assert_eq!(read_file(&nested), b"nested-under-root-child");
-
-            let (generation, _) = shared.test_generation(&cid).unwrap();
-            let root_path = generation.join("content/root");
-            let nested_path = generation.join("content/subpaths/root/nested");
-            assert!(!nested_path.starts_with(&root_path));
-            assert_eq!(
-                std::fs::read(root_path.join("marker")).unwrap(),
-                b"directory-root"
-            );
-            assert_eq!(
-                std::fs::read(nested_path).unwrap(),
-                b"nested-under-root-child"
-            );
+                let (generation, _) = shared.test_generation(&cid).unwrap();
+                let root_path = generation.join("content/root");
+                let child_path = generation.join("content/subpaths").join(subpath);
+                assert_ne!(root_path, child_path);
+                assert!(!child_path.starts_with(&root_path));
+                assert!(root_path.is_dir());
+                assert_eq!(
+                    std::fs::read(root_path.join("marker")).unwrap(),
+                    b"directory-root"
+                );
+                assert_eq!(std::fs::read(child_path).unwrap(), expected);
+            }
         }
     }
 
