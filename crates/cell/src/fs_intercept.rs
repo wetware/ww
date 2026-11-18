@@ -16,8 +16,8 @@ use crate::vfs::{CidTree, ResolveError, ResolvedNode};
 use anyhow::Result;
 use wasmtime::component::{HasData, Linker, Resource};
 use wasmtime_wasi::filesystem::{
-    FilesystemHandle, FilesystemOperation as WasiFilesystemOperation, FilesystemOperationError,
-    WasiFilesystemCtx, WasiFilesystemCtxView,
+    FilesystemOperation as WasiFilesystemOperation, FilesystemOperationError, WasiFilesystemCtx,
+    WasiFilesystemCtxView,
 };
 
 // ── Marker type for HasData ────────────────────────────────────────
@@ -263,28 +263,66 @@ fn is_confined_relative_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+// Native state must close before the context releases its generation factory.
+struct PreparedDescriptor {
+    descriptor: wasmtime_wasi::filesystem::Descriptor,
+    attachment: WasiFilesystemCtx,
+}
+
+impl PreparedDescriptor {
+    fn install(
+        self,
+        table: &mut wasmtime::component::ResourceTable,
+    ) -> Result<
+        Resource<wasmtime_wasi::filesystem::Descriptor>,
+        wasmtime::component::ResourceTableError,
+    > {
+        self.attachment.push_descriptor(table, self.descriptor)
+    }
+
+    #[cfg(test)]
+    fn into_attached(self) -> wasmtime_wasi::filesystem::Descriptor {
+        let mut table = wasmtime::component::ResourceTable::new();
+        let resource = self.install(&mut table).unwrap();
+        table.delete(resource).unwrap()
+    }
+}
+
+// Release generation ownership before admission's final actual-work receipt.
+struct GenerationOperation {
+    _generation: Option<cache::StagedContentLease>,
+    _admission: WasiFilesystemOperation,
+}
+
 fn open_read_only_path(
     path: &std::path::Path,
     lease: Option<cache::StagedContentLease>,
-) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
+    resources: Arc<cache::CellResources>,
+    filesystem_scope: cache::FsScope,
+) -> Result<PreparedDescriptor, MaterializeError> {
     use wasmtime_wasi::filesystem::{Descriptor, Dir, File};
     use wasmtime_wasi::{FsPerms, OpenMode};
 
+    // Install backing ownership before constructing native state. The context
+    // is temporary: only the prepared result and issued descriptors retain it.
+    let mut attachment = WasiFilesystemCtx::default();
+    attachment.set_operation_hook(move || {
+        let admission = admit_native_filesystem_operation(&resources, &filesystem_scope)?;
+        Ok(WasiFilesystemOperation::new(GenerationOperation {
+            _generation: lease.clone(),
+            _admission: admission,
+        }))
+    });
     let metadata = std::fs::metadata(path).map_err(|_| MaterializeError::Io)?;
-    if metadata.is_dir() {
+    let descriptor = if metadata.is_dir() {
         let dir = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
             .map_err(|_| MaterializeError::Io)?;
-        let native = dir.into_std_file();
-        let native = match lease {
-            Some(lease) => FilesystemHandle::new(native, lease),
-            None => native.into(),
-        };
-        Ok(Descriptor::Dir(Dir::new(
-            native,
+        Descriptor::Dir(Dir::new(
+            dir.into_std_file(),
             FsPerms::ReadOnly,
             OpenMode::READ,
             false,
-        )))
+        ))
     } else {
         let file = cap_std::fs::Dir::open_ambient_dir(
             path.parent().unwrap_or(path),
@@ -293,18 +331,17 @@ fn open_read_only_path(
         .map_err(|_| MaterializeError::Io)?
         .open(path.file_name().unwrap_or_default())
         .map_err(|_| MaterializeError::Io)?;
-        let native = file.into_std();
-        let native = match lease {
-            Some(lease) => FilesystemHandle::new(native, lease),
-            None => native.into(),
-        };
-        Ok(Descriptor::File(File::new(
-            native,
+        Descriptor::File(File::new(
+            file.into_std(),
             FsPerms::ReadOnly,
             OpenMode::READ,
             false,
-        )))
-    }
+        ))
+    };
+    Ok(PreparedDescriptor {
+        descriptor,
+        attachment,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,7 +399,7 @@ pub(crate) async fn materialize_cid_tree_descriptor(
         resolved,
     )
     .await?
-    .install(|result| result)
+    .install(|result| result.map(PreparedDescriptor::into_attached))
 }
 
 async fn materialize_cid_tree_descriptor_in(
@@ -372,10 +409,8 @@ async fn materialize_cid_tree_descriptor_in(
     cache: Option<&cache::CacheMode>,
     cid_tree: &CidTree,
     resolved: ResolvedNode,
-) -> Result<
-    cache::FsResultEnvelope<Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError>>,
-    MaterializeError,
-> {
+) -> Result<cache::FsResultEnvelope<Result<PreparedDescriptor, MaterializeError>>, MaterializeError>
+{
     materialize_resolved_descriptor(
         filesystem_scope,
         resources,
@@ -491,10 +526,8 @@ async fn materialize_resolved_descriptor(
     cache: Option<&cache::CacheMode>,
     cid_tree: &CidTree,
     resolved: ResolvedNode,
-) -> Result<
-    cache::FsResultEnvelope<Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError>>,
-    MaterializeError,
-> {
+) -> Result<cache::FsResultEnvelope<Result<PreparedDescriptor, MaterializeError>>, MaterializeError>
+{
     match resolved {
         ResolvedNode::CidFile { cid, .. } => {
             let cache = cache.ok_or(MaterializeError::Io)?;
@@ -511,12 +544,14 @@ async fn materialize_resolved_descriptor(
                 tracing::warn!(%canonical_cid, ?error, "CidTree cache materialization failed");
                 error
             })?;
+            let resources = Arc::clone(resources);
+            let filesystem_scope = filesystem_scope.clone();
             transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
                     if !staging_path.exists() {
                         return Err(MaterializeError::Io);
                     }
-                    open_read_only_path(&staging_path, lease)
+                    open_read_only_path(&staging_path, lease, resources, filesystem_scope)
                 })
                 .await
                 .map_err(|_| MaterializeError::Io)
@@ -571,6 +606,8 @@ async fn materialize_resolved_descriptor(
             check_directory_cancellation(&cancellation)?;
             #[cfg(any(test, feature = "test-support"))]
             let descriptor_scope = filesystem_scope.clone();
+            let resources = Arc::clone(resources);
+            let filesystem_scope = filesystem_scope.clone();
             transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
                     check_directory_cancellation(&cancellation)?;
@@ -580,7 +617,7 @@ async fn materialize_resolved_descriptor(
                         cache::FsTestStage::Started,
                         None,
                     );
-                    open_read_only_path(&staging_dir, None)
+                    open_read_only_path(&staging_dir, None, resources, filesystem_scope)
                 })
                 .await
                 .map_err(|_| MaterializeError::Io)
@@ -772,15 +809,14 @@ fn cleanup_temporary_directory(
 }
 
 async fn materialize_ipfs_descriptor_in(
+    resources: &Arc<cache::CellResources>,
     filesystem_scope: &cache::FsScope,
     logical: cache::LogicalIoPermit,
     cache: Option<&cache::CacheMode>,
     ipfs_path: &IpfsCidPath,
     write_requested: bool,
-) -> Result<
-    cache::FsResultEnvelope<Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError>>,
-    MaterializeError,
-> {
+) -> Result<cache::FsResultEnvelope<Result<PreparedDescriptor, MaterializeError>>, MaterializeError>
+{
     if write_requested {
         return Err(MaterializeError::NotPermitted);
     }
@@ -797,12 +833,14 @@ async fn materialize_ipfs_descriptor_in(
                 tracing::warn!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, ?error, "IPFS cache materialization failed");
                 error
             })?;
+    let resources = Arc::clone(resources);
+    let filesystem_scope = filesystem_scope.clone();
     transaction
         .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
             if !target_path.exists() {
                 return Err(MaterializeError::NoEntry);
             }
-            open_read_only_path(&target_path, lease)
+            open_read_only_path(&target_path, lease, resources, filesystem_scope)
         })
         .await
         .map_err(|_| MaterializeError::Io)
@@ -817,9 +855,16 @@ pub(crate) async fn materialize_ipfs_descriptor(
     write_requested: bool,
 ) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
     let logical = resources.try_logical_io().map_err(MaterializeError::Busy)?;
-    materialize_ipfs_descriptor_in(filesystem_scope, logical, cache, ipfs_path, write_requested)
-        .await?
-        .install(|result| result)
+    materialize_ipfs_descriptor_in(
+        resources,
+        filesystem_scope,
+        logical,
+        cache,
+        ipfs_path,
+        write_requested,
+    )
+    .await?
+    .install(|result| result.map(PreparedDescriptor::into_attached))
 }
 
 use wasmtime::component::{Access, Accessor, FutureReader, StreamReader};
@@ -1201,6 +1246,7 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
             }
             OpenRoute::Ipfs(ipfs_path) => {
                 let operation = materialize_ipfs_descriptor_in(
+                    &resources,
                     &filesystem_scope,
                     logical,
                     cache.as_deref(),
@@ -1218,11 +1264,14 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
             operation.install(|opened| {
                 let opened = opened.map_err(p3_types::ErrorCode::from)?;
                 if (open_flags.contains(p3_types::OpenFlags::DIRECTORY) || path.ends_with('/'))
-                    && !matches!(opened, wasmtime_wasi::filesystem::Descriptor::Dir(_))
+                    && !matches!(
+                        opened.descriptor,
+                        wasmtime_wasi::filesystem::Descriptor::Dir(_)
+                    )
                 {
                     return Err(p3_types::ErrorCode::NotDirectory.into());
                 }
-                let opened = view.table.push(opened)?;
+                let opened = opened.install(view.table)?;
                 view.descriptors.remove(opened.rep());
                 if let Some(context) = context {
                     view.descriptors.directories.insert(opened.rep(), context);
@@ -3236,6 +3285,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_shared_results_retain_generation_until_install_or_disposal() {
+        use futures::FutureExt as _;
+        use wasmtime::component::{ResourceTable, ResourceTableError};
+        use wasmtime_wasi::filesystem::Descriptor;
+
+        for outcome in ["abandoned", "table-full", "installed"] {
+            let fs = TestFilesystem::new();
+            let first =
+                cid::Cid::new_v1(0x55, cid::multihash::Multihash::wrap(0x00, &[81]).unwrap());
+            let second =
+                cid::Cid::new_v1(0x55, cid::multihash::Multihash::wrap(0x00, &[82]).unwrap());
+            let pinner = Arc::new(MockPinner {
+                data: HashMap::from([(first, b"first".to_vec()), (second, b"other".to_vec())]),
+                path_data: HashMap::new(),
+            });
+            let (shared, cache) = fs.shared_cache(pinner, 5).await;
+            let logical = fs.resources.try_logical_io().unwrap();
+            let pending = materialize_ipfs_descriptor_in(
+                &fs.resources,
+                &fs.scope,
+                logical,
+                Some(&cache),
+                &IpfsCidPath {
+                    cid: first,
+                    subpath: String::new(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+            let (path, completion) = shared.test_generation(&first).unwrap();
+            let unrelated = materialize_ipfs_descriptor(
+                &fs.resources,
+                &fs.scope,
+                Some(&cache),
+                &IpfsCidPath {
+                    cid: second,
+                    subpath: String::new(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(path.exists());
+            assert!(completion.wait().now_or_never().is_none());
+
+            if outcome == "abandoned" {
+                drop(pending);
+            } else {
+                let mut table = ResourceTable::new();
+                if outcome == "table-full" {
+                    table.set_max_capacity(0);
+                }
+                let (result, native) = pending.install(|prepared| {
+                    let prepared = prepared.unwrap();
+                    let Descriptor::File(file) = &prepared.descriptor else {
+                        panic!("expected file");
+                    };
+                    let native = Arc::downgrade(&file.file);
+                    (prepared.install(&mut table), native)
+                });
+                if outcome == "table-full" {
+                    assert!(matches!(result, Err(ResourceTableError::Full)));
+                } else {
+                    let resource = result.unwrap();
+                    assert!(native.upgrade().is_some());
+                    assert!(path.exists());
+                    assert!(completion.wait().now_or_never().is_none());
+                    drop(table.delete(resource).unwrap());
+                }
+                assert!(native.upgrade().is_none(), "native state must be disposed");
+            }
+            completion.wait().await.unwrap();
+            assert!(
+                !path.exists(),
+                "{outcome} must release the evicted generation"
+            );
+            // Unrelated cache and filesystem context remain alive through cleanup.
+            assert!(shared.test_generation(&second).is_some());
+            drop(unrelated);
+            drop(cache);
+            drop(shared);
+        }
+    }
+
+    // Native duplicates must retain an unchanged attached descriptor explicitly.
+    struct PreservedNativeFile {
+        native: std::fs::File,
+        _source: wasmtime_wasi::filesystem::Descriptor,
+    }
+
+    #[tokio::test]
     async fn preserving_native_handle_retains_generation_after_descriptor_drop_and_eviction() {
         use futures::FutureExt as _;
         use std::io::Read as _;
@@ -3293,7 +3434,10 @@ mod tests {
         let wasmtime_wasi::filesystem::Descriptor::File(file) = &descriptor_a else {
             panic!("expected staged file descriptor")
         };
-        let native = file.file.try_clone().unwrap();
+        let native = PreservedNativeFile {
+            native: file.file.try_clone().unwrap(),
+            _source: descriptor_a.clone(),
+        };
         drop(descriptor_a);
         drop(descriptor_b);
 
@@ -3308,7 +3452,7 @@ mod tests {
         drop(shared);
         assert!(cache_completion.wait().now_or_never().is_none());
         let mut contents = String::new();
-        let mut native_file = &*native;
+        let mut native_file = &native.native;
         native_file.read_to_string(&mut contents).unwrap();
         assert_eq!(contents, "first-a");
 
@@ -3347,7 +3491,7 @@ mod tests {
                 panic!("expected a staged file descriptor")
             };
             let native = file.file.try_clone().unwrap();
-            let mut reader = &*native;
+            let mut reader = &native;
             let mut bytes = Vec::new();
             reader.read_to_end(&mut bytes).unwrap();
             bytes
