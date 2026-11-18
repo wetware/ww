@@ -62,7 +62,7 @@ which guest-visible filesystem work maps to `Busy`; Wetware never falls back to
 untracked staging.
 
 Staged subpaths are retained at CID-generation granularity. A live
-`StagedContentLease`, descriptor, or native handle for any path in a generation
+`StagedContentLease` or attached descriptor for any path in a generation
 retains the entire staged generation, including materialized siblings and
 ancestors, until the final owner closes. This avoids unsafe ancestor deletion
 and a path-level ownership graph. Every generation has a physically unique,
@@ -72,15 +72,19 @@ and cannot delete a later admission of the same CID.
 ARC residency is a separate claim. The production 128 MiB ARC target is a
 `PinEntry` weight target; it is neither resident staging bytes nor a hard disk
 quota. ARC eviction drops only the `PinEntry` generation claim. Accepted
-publishers and Wasmtime native handles retain staged content independently, so
+publishers and attached Wasmtime descriptors retain staged content independently, so
 oversized ARC-unresident content can still be materialized and used. Releasing
 the final content owner makes exact-generation cleanup eligible, providing
 eventual safe reclamation rather than a strict staging-byte bound.
 
-Wasmtime's `FilesystemOperation` owns active native work and admission, while
-`FilesystemHandle` carries native `File`/`Dir` authority plus the opaque
-`StagedContentLease` owner. An idle descriptor retains its generation without
-holding active-operation capacity. See
+Each Wasmtime descriptor retains a factory capturing its actual
+`StagedContentLease`. Each successful factory call returns a
+`FilesystemOperation` retaining both a lease clone and active-work admission.
+An idle descriptor retains its generation without holding active-operation
+capacity. Extracted native files must be explicitly paired with an unchanged
+attached descriptor or generation lease, with native state disposed first.
+Naked native `Arc<std::fs::File>` clones and raw OS-handle duplicates do not
+retain external content automatically. See
 [dependencies/wasmtime.md](dependencies/wasmtime.md) for the exact v48 backport
 and propagation contract.
 
