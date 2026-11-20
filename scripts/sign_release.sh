@@ -17,11 +17,13 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 release_dir="$(cd "$(dirname "$manifest")" && pwd -P)"
 key_dir="$(cd "$(dirname "$private_key")" && pwd -P)"
 case "$key_dir/" in "$release_dir/"*) echo 'Private signing key must be outside the release tree' >&2; exit 1 ;; esac
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-# Ed25519 signs the message itself, not a prehash. No key content is printed.
-openssl pkeyutl -sign -rawin -inkey "$private_key" -in "$manifest" -out "$work/signature"
-sh "$root/scripts/install.sh" --verify-manifest "$manifest" --signature "$work/signature" \
-  --trusted-release-keys "$trusted_keys"
-# Move only after verification against independently provisioned public keys.
-mv "$work/signature" "$signature"
+# Use the offline package tool; no running Host or OpenSSL private-key conversion.
+if [[ -n "${WW_RELEASE_PACKAGE:-}" ]]; then
+  tool="$WW_RELEASE_PACKAGE"
+elif [[ -x "$root/target/release/ww-release-package" ]]; then
+  tool="$root/target/release/ww-release-package"
+else
+  tool="$root/target/debug/ww-release-package"
+fi
+exec "$tool" sign --manifest "$manifest" --signature "$signature" \
+  --private-key "$private_key" --trusted-keys "$trusted_keys"

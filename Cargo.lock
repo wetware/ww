@@ -8454,6 +8454,7 @@ dependencies = [
  "ipfs",
  "ipld-dagpb",
  "libp2p-identity",
+ "rpc",
  "rust-ipns",
  "serde",
  "serde_json",

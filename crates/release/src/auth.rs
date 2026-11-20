@@ -449,15 +449,15 @@ mod tests {
         let bytes = manifest("bin/ww/linux/x86_64/ww", b"host artifact");
         fs::write(&manifest_path, &bytes).unwrap();
         checked(
-            Command::new("bash")
-                .arg(repository.join("scripts/sign_release.sh"))
-                .arg(&manifest_path)
-                .arg(&signature_path)
+            // Keep an independent OpenSSL producer in this verifier-only test.
+            // The native seed signer and wrapper are exercised in CLI qualification.
+            Command::new("openssl")
+                .args(["pkeyutl", "-sign", "-rawin", "-inkey"])
                 .arg(private.path())
-                .arg(&keyring)
-                // Exercise local signing with ephemeral test keys even in PR CI.
-                // The production signing admission tests exercise CI refusal separately.
-                .env_remove("GITHUB_ACTIONS"),
+                .arg("-in")
+                .arg(&manifest_path)
+                .arg("-out")
+                .arg(&signature_path),
         );
         let signature = fs::read(&signature_path).unwrap();
         let verified = trusted.authenticate(&bytes, &signature).unwrap();

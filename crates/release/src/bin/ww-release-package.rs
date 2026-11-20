@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{ensure, Result};
 use clap::{Parser, Subcommand};
+use ed25519_dalek::Signer;
 use ww_release::{
     auth::TrustedKeys,
     package::{self, Package},
@@ -24,6 +25,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Sign exact manifest bytes with a canonical base58btc Ed25519 seed.
+    Sign {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        private_key: PathBuf,
+        #[arg(long)]
+        trusted_keys: PathBuf,
+    },
+    /// Export the seed's public key as Ed25519 SPKI DER, without signing.
+    PublicKey {
+        #[arg(long)]
+        private_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Pack an unsigned content tree into a fresh immutable spool.
     PackTree {
         #[arg(long)]
@@ -112,8 +131,76 @@ fn package_result(package: &Package, trust: &TrustedKeys) -> Result<serde_json::
     }))
 }
 
+fn private_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file(),
+        "private key must be a regular file, not a symlink"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "private key must not grant group or other access"
+        );
+    }
+    let bytes = read_bounded(path, 45)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::anyhow!("private key must be UTF-8 base58btc"))?;
+    rpc::keys::decode_canonical(text)
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(path)?;
+    if let Err(error) = output.write_all(bytes).and_then(|()| output.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Sign {
+            manifest,
+            signature,
+            private_key: key_path,
+            trusted_keys,
+        } => {
+            ensure!(
+                std::fs::symlink_metadata(&manifest)?.is_file(),
+                "manifest must be a regular file"
+            );
+            let release_dir = manifest.canonicalize()?.parent().unwrap().to_path_buf();
+            ensure!(
+                !key_path.canonicalize()?.starts_with(release_dir),
+                "private signing key must be outside the release tree"
+            );
+            let key = private_key(&key_path)?;
+            let manifest = read_bounded(&manifest, ww_release::auth::MAX_MANIFEST_BYTES)?;
+            let signature_bytes = key.sign(&manifest).to_bytes();
+            keys(&trusted_keys)?.authenticate(&manifest, &signature_bytes)?;
+            write_new(&signature, &signature_bytes)
+        }
+        Command::PublicKey {
+            private_key: key_path,
+            output,
+        } => {
+            let key = private_key(&key_path)?;
+            let mut der = vec![
+                0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+            ];
+            der.extend_from_slice(key.verifying_key().as_bytes());
+            write_new(&output, &der)
+        }
         Command::PackTree { tree, spool } => {
             let package = package::pack_tree(&tree, &spool)?;
             emit(&serde_json::json!({ "root": package.root().to_string() }))

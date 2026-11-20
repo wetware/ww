@@ -90,9 +90,27 @@ or replacing a Host. This change does not implement replacement or rollback.
 
 `scripts/assemble_release.sh` still produces an unsigned staging tree for build
 and package validation. A staging tree is not an authorized release.
+The offline `ww-release-package sign --manifest MANIFEST --signature SIGNATURE
+--private-key PRIVATE_KEY --trusted-keys TRUSTED_KEYS` command consumes the existing
+`ww keygen` representation: Bitcoin-alphabet base58btc of the raw 32-byte Ed25519
+seed, without a multibase prefix. One terminal LF is accepted for `ww keygen`
+stdout compatibility; other whitespace and encodings are rejected. Existing Host
+identity loading retains its whitespace tolerance. Generate a distinct release
+key; do not reuse a Host or Kubo/IPNS identity.
+
+`ww-release-package public-key --private-key PRIVATE_KEY --output PUBLIC_DER`
+exports the existing 44-byte SPKI DER public key. Its SHA-256 fingerprint and the
+one/two-entry trusted keyring format are unchanged. Both operations reject
+symlink key files and, on Unix, any group/other key permissions. Output creation
+is exclusive and cannot overwrite an existing file. No key material is logged.
+
+`sign` signs exact bytes with pure Ed25519, authenticates them with the existing
+native verifier and independently supplied keyring, then creates the signature.
+No running Host is involved. PKCS#8 PEM input is no longer accepted.
+
 `scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS` signs the
 exact staged manifest and verifies the result against independent trusted keys.
-It rejects an existing signature destination and a private key inside the release
+It delegates to the offline package tool (`WW_RELEASE_PACKAGE`, or a local release/debug build). It rejects an existing signature destination and a private key inside the release
 tree. `ww-release-package prepare` constructs the binding before signing.
 `finalize` authenticates the signed tree before producing the transport root.
 The worker verifies against its independently provisioned keyring before local
@@ -132,8 +150,8 @@ it does not authorize release execution or production activation.
 
    ```sh
    umask 077
-   openssl genpkey -algorithm ED25519 -out release-signing.pem
-   openssl pkey -in release-signing.pem -pubout -outform DER -out release-public.der
+   ww keygen --output release-signing.seed
+   ww-release-package public-key --private-key release-signing.seed --output release-public.der
    openssl base64 -A -in release-public.der > release-keys
    printf '\n' >> release-keys
    openssl dgst -sha256 release-public.der
@@ -149,7 +167,7 @@ it does not authorize release execution or production activation.
    untrusted users. For a user-managed installation, provision a protected local
    path and pass `--trusted-release-keys` explicitly. Releases cannot rotate keys.
 5. After separate CI approval in `wetware/infra`, set the repository Actions
-   secret `WW_RELEASE_SIGNING_KEY` to the private PEM. Set the repository Actions
+   secret `WW_RELEASE_SIGNING_KEY` to the canonical base58btc seed file. Set the repository Actions
    variable `WW_RELEASE_TRUSTED_KEYS` to the public keyring. A final LF is optional
    in `WW_RELEASE_TRUSTED_KEYS`; the workflow adds one if absent.
    The official workflow requires master and manual dispatch, then signs
@@ -169,7 +187,7 @@ it does not authorize release execution or production activation.
 
 For offline qualification, run `ww-release-package prepare`, then
 `scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS`, followed
-by `ww-release-package finalize`. Keep the private PEM outside the release
+by `ww-release-package finalize`. Keep the canonical base58btc seed file outside the release
 directory and use independently supplied public trust. These commands do not
 announce a release or authorize production publication.
 

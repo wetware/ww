@@ -141,7 +141,6 @@ jobs:
         bash tests/test_deploy_context.sh
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
-        python3 tests/test_release_auth.py
         bash -n scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         if command -v shellcheck >/dev/null 2>&1; then
           shellcheck scripts/install.sh scripts/sign_release.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
@@ -550,6 +549,14 @@ jobs:
         python3 tests/test_release_package_profiles.py \
           --development-tool target/debug/ww-release-package \
           --release-tool target/release/ww-release-package --fhs target/fhs
+
+    - name: Verify canonical release signing and installer interoperability
+      env:
+        WW_RELEASE_PACKAGE: ${{ github.workspace }}/target/debug/ww-release-package
+      run: |
+        python3 tests/test_release_auth.py
+        python3 tests/test_release_signing.py --ww target/debug/ww \
+          --package-tool target/debug/ww-release-package --fhs target/fhs
 
     - name: Validate public release package library
       run: cargo test --locked -p ww-release --features package

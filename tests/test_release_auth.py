@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from release_auth_fixture import (cid_bytes, cid_text, generate_key, manifest_root,
+from release_auth_fixture import (canonical_seed, cid_bytes, cid_text, generate_key, manifest_root,
                                   pb_field, sign_manifest, varint)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -83,6 +83,8 @@ esac
             target.write_bytes(b'fixture WASM')
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(('WW_', 'IPFS_', 'GITHUB_'))}
+        if os.environ.get('WW_RELEASE_PACKAGE'):
+            self.env['WW_RELEASE_PACKAGE'] = os.environ['WW_RELEASE_PACKAGE']
         self.env.update(HOME=str(self.home), PATH=str(self.stubs) + os.pathsep + os.environ['PATH'],
                         TEST_OS='Linux', TEST_ARCH='x86_64', TEST_RELEASE=str(self.release),
                         TEST_EXECUTIONS=str(self.calls), TEST_TRANSPORT=str(self.transport),
@@ -622,10 +624,14 @@ esac
                 self.run_installer()
 
     def run_signer(self, success=False):
+        if not hasattr(self, 'seed'):
+            self.seed = self.private.with_suffix('.seed')
+            with os.fdopen(os.open(self.seed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
+                stream.write(canonical_seed(self.private))
         output = self.root / 'output.sig'
         output.unlink(missing_ok=True)
         result = subprocess.run(['bash', str(SIGNER), str(self.manifest), str(output),
-                                 str(self.private), str(self.keys)], env=self.env,
+                                 str(self.seed), str(self.keys)], env=self.env,
                                 capture_output=True, text=True, timeout=30)
         private_body = self.private.read_text().splitlines()[1]
         self.assertNotIn(private_body, result.stdout + result.stderr)
@@ -635,6 +641,30 @@ esac
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(output.exists())
+
+    def test_signer_rejects_noncanonical_keys(self):
+        valid = canonical_seed(self.private)
+        self.seed = self.private.with_suffix('.seed')
+        for invalid in (b'', valid[:-1], b'0' * 44, b'z' + valid, b' ' + valid,
+                        valid + b' ', valid + b'\n\n', valid + b'\r\n',
+                        b'1' + valid, self.private.read_bytes(), b'\xff' * 32,
+                        base64.b64encode(bytes(range(32))), bytes(range(32)).hex().encode()):
+            with self.subTest(length=len(invalid)):
+                self.seed.write_bytes(invalid)
+                self.seed.chmod(0o600)
+                self.run_signer()
+
+    def test_signer_accepts_one_terminal_lf(self):
+        self.seed = self.private.with_suffix('.seed')
+        self.seed.write_bytes(canonical_seed(self.private) + b'\n')
+        self.seed.chmod(0o600)
+        self.run_signer(success=True)
+
+    def test_signer_rejects_unsafe_key_permissions(self):
+        self.seed = self.private.with_suffix('.seed')
+        self.seed.write_bytes(canonical_seed(self.private))
+        self.seed.chmod(0o644)
+        self.run_signer()
 
     def test_signer_exact_bytes(self):
         self.run_signer(success=True)

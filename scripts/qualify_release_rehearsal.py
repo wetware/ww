@@ -15,6 +15,7 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 
 
 PLATFORMS = {
@@ -75,10 +76,11 @@ def main():
     work.mkdir(mode=0o700)
     repo = Path(__file__).resolve().parents[1]
     commands = []
+    signer_env = dict(os.environ, WW_RELEASE_PACKAGE=str(tool))
 
     def run(name, command, failure=False):
         command = [str(part) for part in command]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300, env=signer_env)
         (work / (name + ".stdout")).write_text(result.stdout)
         (work / (name + ".stderr")).write_text(result.stderr)
         commands.append({"name": name, "argv": command, "returncode": result.returncode,
@@ -106,7 +108,13 @@ def main():
         run(name + "-public", ["openssl", "pkey", "-in", private, "-pubout", "-outform", "DER", "-out", public])
         trust = directory / "trusted-keys"
         trust.write_bytes(base64.b64encode(public.read_bytes()) + b"\n")
-        return private, trust
+        # Convert only the disposable OpenSSL fixture; signatures remain independently verifiable.
+        sys.path.insert(0, str(repo / "tests"))
+        from release_auth_fixture import canonical_seed
+        seed = private.with_suffix(".seed")
+        with os.fdopen(os.open(seed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+            stream.write(canonical_seed(private))
+        return seed, trust
 
     imported = json.loads(package("input-import", "import-car", "--car", source,
                                   "--spool", work / "input-spool"))

@@ -113,7 +113,7 @@ def main():
 
     def run(name, command, env=None, failure=None):
         command = [str(part) for part in command]
-        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(command, env=dict(os.environ if env is None else env, WW_RELEASE_PACKAGE=str(package_tool)), capture_output=True, text=True, timeout=300)
         (work / (name + ".stdout")).write_text(result.stdout)
         (work / (name + ".stderr")).write_text(result.stderr)
         commands.append({"name": name, "argv": command, "returncode": result.returncode,
@@ -145,7 +145,7 @@ def main():
                                "--spool", spool, "--metadata", meta])
         run(name + "-sign", ["bash", REPO / "scripts/sign_release.sh",
                             tree / "CHECKSUMS.txt", tree / "CHECKSUMS.txt.sig",
-                            rehearsal / "signer/test-only-private.pem", trust])
+                            rehearsal / "signer/test-only-private.seed", trust])
         identity = json.loads(run(name + "-finalize", [package_tool, "finalize", "--tree", tree,
                                                      "--spool", spool, "--trusted-keys", trust]))
         car = work / (name + ".car")
@@ -256,7 +256,7 @@ def main():
             run("alternate-prepare", [package_tool, "prepare", "--tree", tree, "--spool", spool,
                                       "--metadata", path])
             run("alternate-sign", ["bash", REPO / "scripts/sign_release.sh", tree / "CHECKSUMS.txt",
-                                   tree / "CHECKSUMS.txt.sig", rehearsal / "signer/test-only-private.pem", trust])
+                                   tree / "CHECKSUMS.txt.sig", rehearsal / "signer/test-only-private.seed", trust])
             selected = json.loads(run("alternate-finalize", [package_tool, "finalize", "--tree", tree,
                                      "--spool", spool, "--trusted-keys", trust]))
             car = work / "alternate-host.car"
