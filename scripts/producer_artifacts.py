@@ -17,7 +17,7 @@ TARGETS = {
 
 def inventory(root):
     result = {}
-    for path in sorted(root.rglob('*')):
+    for path in sorted(root.rglob('*'), key=lambda entry: entry.relative_to(root).as_posix()):
         name = path.relative_to(root).as_posix()
         if path.is_symlink() or not (path.is_file() or path.is_dir()):
             raise ValueError('non-regular producer entry')

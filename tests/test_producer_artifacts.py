@@ -63,6 +63,13 @@ class ProducerArtifacts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'FHS'):
             self.validate()
 
+    def test_checksums_use_relative_posix_path_order(self):
+        root = self.root / 'ww-linux-x86_64'
+        (root / 'fhs/bin-a').write_bytes(b'prefix sibling')
+        producer.checksums(root)
+        paths = [line.split('  ', 1)[1] for line in (root / 'SHA256SUMS').read_text().splitlines()]
+        self.assertEqual(paths, sorted(paths))
+
     def test_symlink_rejected(self):
         root = self.root / 'ww-linux-x86_64'
         (root / 'link').symlink_to(root / 'ww')
