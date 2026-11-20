@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
-- Release signing consumes canonical base58btc Ed25519 seeds from `ww keygen` through the offline package tool. Preserve public trust, signature/package bytes, and Host identity loading; reject PEM signing input.
+- Rename the public `ww-release` library to `release` and move operational package/signing tooling to private infrastructure. Public CI emits checksummed Host/FHS inputs and source receipts for private assembly; release formats, independent verification and Host identities remain unchanged.
 - Adopt the Wasmtime 48.0.1 descriptor-factory backport. Shared staged descriptors
   retain their generation through attached factories and active-operation owners.
   Custom results retain ownership through installation or disposal. Native

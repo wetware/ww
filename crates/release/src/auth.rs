@@ -420,7 +420,7 @@ mod tests {
         // The standalone qualification harness also compiles this exact file.
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
-            .find(|path| path.join("scripts/sign_release.sh").is_file())
+            .find(|path| path.join("scripts/install.sh").is_file())
             .expect("repository release scripts");
         let temporary = tempfile::tempdir().unwrap();
         let release = temporary.path().join("release");

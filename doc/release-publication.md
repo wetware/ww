@@ -1,6 +1,6 @@
 # Public release formats and private publication
 
-`ww-release` defines release authentication, descriptors, consumer freshness and
+`release` defines release authentication, descriptors, consumer freshness and
 offline package construction. Private `wetware/infra` owns official publication
 policy, the sole durable `Owner`, journal, recovery, Kubo announcement and signing
 workflow. Production publication remains held. This extraction authorizes no
@@ -78,11 +78,12 @@ implementation does not substitute the broader inline-profile decoder.
 
 | Component | Owner and interface |
 | --- | --- |
-| `ww-release` default features | `auth`, `descriptor`, authenticated selection and consumer freshness |
-| `ww-release` feature `package` | `Metadata`, `prepare`, `finalize`, `Package`, CAR/tree transfer functions and offline `ww-release-package` |
+| `release` default features | `auth`, `descriptor`, authenticated selection and consumer freshness |
+| `release` feature `package` | `Metadata`, `prepare`, `finalize`, `Package`, CAR/tree transfer functions |
 | `ipfs` | Map, CID identity, pure `ipns` records, bounded CARv1 framing and Kubo/IPLD transport |
 | `cell::packaging` | Production FHS component validation and staging |
 | `ww` | Host deployment `Publisher`, `RecordStore`, `Republisher`; compatibility reexports |
+| Private `ww-release-package` | Preparation, signing, finalization and offline transfer orchestration |
 | Private `ww-release-publisher` | Official metadata/sequence policy, stage planning, single durable Owner and announcement |
 
 `ww::release::{auth,descriptor}`, `ww::packaging`, and the pure items under
@@ -91,7 +92,7 @@ implementation does not substitute the broader inline-profile decoder.
 intentional pre-1.0 API removal. No public journal or publication-policy adapter
 replaces that module.
 
-Private infra depends on `ww-release` and `ipfs` at one exact public Git revision.
+Private infra depends on `release` and `ipfs` at one exact public Git revision.
 It does not depend on root `ww` or its embedded-guest build prerequisites.
 The package feature still uses Cell/Wasmtime for production FHS validation.
 Public crates have no private dependency.
@@ -120,15 +121,14 @@ continues to use bounded CAR stages and its existing acknowledgement contract.
 Neither CAR import nor a staging Kubo pin supplies publication retention authority.
 
 ```sh
-cargo test --locked -p ww-release
-cargo test --locked -p ww-release --features package
+cargo test --locked -p release
+cargo test --locked -p release --features package
 cargo test --locked -p ipfs
-cargo build --release --locked -p ww-release --features package --bin ww-release-package
 ```
 
 ## Authentication and release graph
 
-`ww_release::descriptor::Descriptor` uses canonical versioned IPLD Map bytes.
+`release::descriptor::Descriptor` uses canonical versioned IPLD Map bytes.
 The descriptor contains real links to the FHS and native artifacts, platform
 and ABI identity, file sizes and SHA-256 digests, actual source/build provenance,
 and the Host/PID0 compatibility profile. Runtime file digests differ from UnixFS

@@ -4,8 +4,8 @@ use std::{fs, path::Path};
 
 use cid::{multihash::Multihash, Cid};
 use ipfs::map::{Map, Value};
+use release::package::Package;
 use sha2::{Digest, Sha256};
-use ww_release::package::Package;
 
 fn store(spool: &Path, codec: u64, bytes: &[u8]) -> Cid {
     let cid = Cid::new_v1(

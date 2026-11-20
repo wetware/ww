@@ -1,69 +1,80 @@
-# Public package and private publisher boundary
+# Public release library and private release operations
 
-Public `wetware/ww` owns deterministic release formats, authentication, offline
-package construction, independent verification and consumer freshness. Private
-`wetware/infra` owns official publication policy, the single durable Owner/journal,
-recovery, Kubo announcement and the automatic signing/publication workflow.
-Production publication remains held; neither source merge grants activation.
+Public `wetware/ww` owns the `release` Rust library: descriptors, authentication,
+package construction/parsing, CAR serialization and independent verification.
+Private `wetware/infra` owns the single `ww-release-package` executable, unsigned
+candidate assembly, signing, finalization, publication and custody. Private code
+imports the public library; public code never fetches private source or credentials.
+The `release` package replaces `ww-release` without changing signed bytes or wire
+formats. All private public-crate dependencies use one immutable full Git SHA.
 
-## Public offline tool
+Public consumers can authenticate releases with `release::auth::TrustedKeys`,
+`release::package::Package::authenticate`, the existing `ww` Host installation and
+upgrade commands, or `scripts/install.sh --verify-manifest` with independent trust.
+An artifact or its download location cannot supply its own trust anchor.
 
-```sh
-cargo build --release --locked -p ww-release --features package --bin ww-release-package
-ww-release-package prepare --tree release-tree --spool release-spool --metadata metadata.json
-scripts/sign_release.sh release-tree/CHECKSUMS.txt release-tree/CHECKSUMS.txt.sig private.pem trusted-keys
-ww-release-package finalize --tree release-tree --spool release-spool --trusted-keys trusted-keys
-ww-release-package verify --spool release-spool --trusted-keys trusted-keys
-```
+## Producer artifact contract
 
-`Metadata` is explicit caller input. Official sequence allocation and original
-producer receipt admission belong to infra. The reusable signing script verifies
-its output against independent public trust. The caller owns workflow admission
-and signing-key access. Public builds/tests use disposable fixture keys only.
+Public CI builds five Host targets with their canonical FHS and emits five
+separate standard GitHub ZIP artifacts:
 
-Preparation constructs the canonical descriptor and binding before signing.
-Finalization verifies signatures and payloads before returning an immutable root.
-Finalization and verification emit only `root`, `descriptor` and `sequence`.
-Private request IDs, stage counts, journal generations and retention policy are
-not public package interfaces.
+| Artifact | Provenance target |
+| --- | --- |
+| `ww-linux-x86_64` | `x86_64-unknown-linux-gnu` |
+| `ww-linux-aarch64` | `aarch64-unknown-linux-gnu` |
+| `ww-macos-aarch64` | `aarch64-apple-darwin` |
+| `ww-macos-x86_64` | `x86_64-apple-darwin` |
+| `ww-linux-musl-x86_64` | `x86_64-unknown-linux-musl` |
 
-## Artifact handoff
+Each archive has root entries `ww`, `fhs/`, `REVISION`, `PROVENANCE.json` and
+`SHA256SUMS`. `ww` is a nonempty native executable; `fhs/` is the complete canonical
+staged filesystem. All five FHS file inventories must match exactly. No Host or
+FHS from a previous run or attempt is admitted.
 
-Public CI exports one raw `release-input.car`. The CAR contains the validated
-`release-tree/` and five original Host receipt directories under `artifacts/`.
-Each receipt directory contains `REVISION`, `SHA256SUMS` and `PROVENANCE.json`.
-The existing image job receives the tested `tested-image.tar` as a separate raw
-artifact. Generic upstream Host and WASM build artifacts retain their existing
-GitHub artifact format.
+After validating those artifacts and booting the container fixtures, job
+`validate-release` (display name `Validate release packages and container boot`)
+emits a sixth standard ZIP artifact named `release-source`, containing:
 
-Infra selects an exact successful public workflow run, attempt, source revision,
-artifact ID and SHA-256 digest. Admission builds `ww-release-package` from a
-separately pinned public source revision before importing the CAR and unpacking
-the tree. Infra preserves and validates each Host's original producer provenance.
-The CAR contains no package-tool executable; the private signer uses the source-built
-tool and independent public trust.
+- `VERSION`
+- `REVISION`
+- `CHANGELOG.md`
+- `scripts/install.sh`
+- `PROVENANCE.json`
+- `SHA256SUMS`
+- Optional compiled `examples/<example>/bin/*.wasm` from the current WASM build
 
-Public `pack-tree` and `unpack-tree` transfer bounded unsigned filesystem content.
-Public `export-car` and `import-car` transfer a complete single-root block graph.
-The unsigned input root differs from the final signed release root. Private
-metadata allocation, `prepare`, signing and `finalize` produce the signed root.
-CAR transport preserves the contained block bytes and CIDs.
+`REVISION` is the current 40-character lowercase source SHA followed by LF.
+`PROVENANCE.json` contains exactly `repository`, `revision` and `builder`.
+Repository is `https://github.com/wetware/ww`; revision matches `REVISION`;
+builder is `github-actions:RUN_ID:RUN_ATTEMPT:TARGET`. Source input target is
+`release-source`; Host targets appear in the table. `SHA256SUMS` inventories every
+regular file except itself, including provenance and revision, sorted by ASCII
+relative POSIX path. Each line is lowercase SHA-256, two spaces, path and LF.
+Symlinks, special files, missing entries, duplicates and extra files are invalid.
+These are build inputs and receipts, not an assembled release or authorization.
 
-The private signer exports the finalized graph and its handoff receipt as two
-raw artifacts. Their basenames include the infra run ID and attempt. The receipt
-binds the CAR digest, original admission, pinned tool revision and signed
-root/descriptor/sequence. The publication job checks both immutable artifact
-IDs/digests against the same signing job. It imports the CAR, independently
-authenticates the candidate, and compares the receipt before deriving a request.
-Neither private handoff accepts ZIP payloads or falls back to ZIP extraction.
+Private admission authenticates the successful producer run, attempt, source SHA,
+job results and each exact artifact ID and API digest before bounded extraction.
+It validates complete checksums, provenance and identical FHS, and assembles the
+unsigned candidate using its own pinned tooling. It never executes a tool from a
+producer archive. Missing, substituted, stale or inconsistent inputs fail closed.
+Public CI has no release packager and emits no `release-input.car`.
 
-The final private manifest pins both public crates to one exact Git SHA and owns
-its Cargo lockfile and root patches. Public code never fetches private source or
-uses private credentials. Read-only artifact access, artifact availability and
-signing custody require separate operational qualification.
+The existing tested container image remains a separate raw `tested-image.tar`
+artifact. Its image job still requires the exact tested digest. This change does
+not enable release publication or modify the image job's admission conditions.
 
-The installed version-1 request/result ABI moved with the private executable.
-Its definitions, single-journal rules, restricted transport and activation gates
-are maintained in [infra's publisher contract](https://github.com/wetware/infra/blob/master/ops/vps/publisher-contract.md)
-and [private executable reference](https://github.com/wetware/infra/blob/master/tools/release-publisher/README.md).
-No production request/result schema or journal format change accompanies the move.
+## Private signed handoff
+
+Private metadata allocation, preparation, canonical-seed signing and finalization
+produce the authenticated release graph. CAR transport preserves block bytes and
+CIDs. The private signer exports the signed graph and receipt as separate raw
+artifacts. The publication job checks exact artifact IDs/digests and signing-job
+identity, imports and authenticates the CAR using independent trust, then checks
+the receipt before deriving a publication request. The signed handoff does not
+accept ZIPs or introduce fallback extraction.
+
+Operational definitions, the single durable publisher journal and activation
+gates remain in [infra's publisher contract](https://github.com/wetware/infra/blob/master/ops/vps/publisher-contract.md).
+Neither a source merge nor artifact production grants production key provisioning,
+secret upload, service changes or R1 publication authority.

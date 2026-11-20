@@ -5614,6 +5614,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "cell",
+ "chrono",
+ "cid",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "ipfs",
+ "ipld-dagpb",
+ "libp2p-identity",
+ "rust-ipns",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8398,6 +8421,7 @@ dependencies = [
  "libp2p-stream",
  "nix",
  "rand 0.9.4",
+ "release",
  "reqwest",
  "rpc",
  "rust-ipns",
@@ -8419,7 +8443,6 @@ dependencies = [
  "wit-component 0.244.0",
  "wit-parser 0.244.0",
  "ww-cache",
- "ww-release",
 ]
 
 [[package]]
@@ -8436,31 +8459,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "ww-release"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "cell",
- "chrono",
- "cid",
- "clap",
- "ed25519-dalek 2.2.0",
- "hex",
- "ipfs",
- "ipld-dagpb",
- "libp2p-identity",
- "rpc",
- "rust-ipns",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

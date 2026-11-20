@@ -8,12 +8,11 @@ import subprocess
 import tempfile
 import unittest
 
-from release_auth_fixture import (canonical_seed, cid_bytes, cid_text, generate_key, manifest_root,
+from release_auth_fixture import (cid_bytes, cid_text, generate_key, manifest_root,
                                   pb_field, sign_manifest, varint)
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALLER = REPO / 'scripts/install.sh'
-SIGNER = REPO / 'scripts/sign_release.sh'
 PLATFORMS = [('Linux', 'x86_64', 'linux/x86_64'),
              ('Linux', 'aarch64', 'linux/aarch64'),
              ('Darwin', 'x86_64', 'macos/x86_64'),
@@ -623,75 +622,6 @@ esac
                 self.env['FAIL_FETCH'] = path
                 self.run_installer()
 
-    def run_signer(self, success=False):
-        if not hasattr(self, 'seed'):
-            self.seed = self.private.with_suffix('.seed')
-            with os.fdopen(os.open(self.seed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
-                stream.write(canonical_seed(self.private))
-        output = self.root / 'output.sig'
-        output.unlink(missing_ok=True)
-        result = subprocess.run(['bash', str(SIGNER), str(self.manifest), str(output),
-                                 str(self.seed), str(self.keys)], env=self.env,
-                                capture_output=True, text=True, timeout=30)
-        private_body = self.private.read_text().splitlines()[1]
-        self.assertNotIn(private_body, result.stdout + result.stderr)
-        if success:
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(output.read_bytes(), self.signature.read_bytes())
-        else:
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertFalse(output.exists())
-
-    def test_signer_rejects_noncanonical_keys(self):
-        valid = canonical_seed(self.private)
-        self.seed = self.private.with_suffix('.seed')
-        for invalid in (b'', valid[:-1], b'0' * 44, b'z' + valid, b' ' + valid,
-                        valid + b' ', valid + b'\n\n', valid + b'\r\n',
-                        b'1' + valid, self.private.read_bytes(), b'\xff' * 32,
-                        base64.b64encode(bytes(range(32))), bytes(range(32)).hex().encode()):
-            with self.subTest(length=len(invalid)):
-                self.seed.write_bytes(invalid)
-                self.seed.chmod(0o600)
-                self.run_signer()
-
-    def test_signer_accepts_one_terminal_lf(self):
-        self.seed = self.private.with_suffix('.seed')
-        self.seed.write_bytes(canonical_seed(self.private) + b'\n')
-        self.seed.chmod(0o600)
-        self.run_signer(success=True)
-
-    def test_signer_rejects_unsafe_key_permissions(self):
-        self.seed = self.private.with_suffix('.seed')
-        self.seed.write_bytes(canonical_seed(self.private))
-        self.seed.chmod(0o644)
-        self.run_signer()
-
-    def test_signer_exact_bytes(self):
-        self.run_signer(success=True)
-
-    def test_signer_rejects_wrong_key(self):
-        self.keys.write_bytes(self.other_keys.read_bytes())
-        self.run_signer()
-
-    def test_signer_private_key_cannot_enter_release_tree(self):
-        private = self.release / 'private.pem'
-        private.write_bytes(self.private.read_bytes())
-        private.chmod(0o600)
-        self.private = private
-        self.run_signer()
-
-    def test_signer_rejects_malformed_manifest(self):
-        self.manifest.write_bytes(self.manifest.read_bytes().replace(b'# sha256', b'# blake3'))
-        self.run_signer()
-
-    def test_reusable_signer_does_not_allocate_workflow_authority(self):
-        # The caller owns CI admission. The reusable signer receives explicit
-        # fixture keys and still verifies the exact bytes against public trust.
-        self.env.update(GITHUB_ACTIONS='true', GITHUB_REPOSITORY='example/release',
-                        GITHUB_REF='refs/heads/candidate', GITHUB_EVENT_NAME='workflow_dispatch')
-        self.run_signer(success=True)
-        self.keys.write_bytes(self.other_keys.read_bytes())
-        self.run_signer()
 
 
 if __name__ == '__main__':

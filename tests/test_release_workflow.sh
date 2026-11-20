@@ -101,19 +101,18 @@ grep -Fq 'bash tests/test_container_boot.sh ww-validated:release' "$WORKFLOW" ||
 grep -Fq 'bash tests/test_container_boot.sh ww-validated:source' "$WORKFLOW" || fail 'source boot gate missing'
 grep -Fq 'docker load -i tested-image.tar' <<<"$release_job" || fail 'GHCR must publish the tested image'
 grep -Fq "            - 'scripts/**'" "$WORKFLOW" || fail 'installer-only changes must trigger release validation'
-grep -Fq 'test_release_descriptor_package.sh' "$WORKFLOW" || fail 'descriptor package validation missing'
+grep -Fq 'producer_artifacts.py validate-hosts' "$WORKFLOW" || fail 'producer validation missing'
 
 # Official signing and publication policy belong to private wetware/infra.
 # Public CI builds artifacts and verifies them with disposable fixture keys.
 if grep -Eq 'secrets\.WW_RELEASE_SIGNING_KEY|environment: release-signing|wetware/infra|request-release\.py|ww-release-publisher' "$WORKFLOW"; then
   fail 'public workflow retains private signing, source, or publisher access'
 fi
-grep -Fq 'cargo build --locked -p ww-release --features package --bin ww-release-package' "$WORKFLOW" \
-  || fail 'public offline package tool build missing'
+if grep -Fq 'ww-release-package' "$WORKFLOW"; then fail 'private packager remains public'; fi
 grep -Fq 'name: Validate public release package library' "$WORKFLOW" \
   || fail 'public package feature tests missing'
 
-# The private handoff receives one raw CAR; the tested image uses a separate raw artifact.
+# Six immutable data artifacts feed private assembly; the tested image stays raw.
 python3 - "$WORKFLOW" <<'PYGUARD'
 from pathlib import Path
 import re
@@ -123,62 +122,53 @@ def require(condition, message):
     if not condition:
         raise AssertionError(message)
 
-def validate_car_boundary(text):
+def validate_boundary(text):
+    producer = text.split('  build-binaries:\n', 1)[1].split('  validate-release:\n', 1)[0]
     validation = text.split('  validate-release:\n', 1)[1].split('  release_image:\n', 1)[0]
     image = text.split('  release_image:\n', 1)[1].split('  publish:\n', 1)[0]
+    for artifact in ('ww-linux-x86_64', 'ww-linux-aarch64', 'ww-macos-aarch64', 'ww-macos-x86_64', 'ww-linux-musl-x86_64'):
+        require(f'artifact: {artifact}\n' in producer, 'missing producer target')
+    require('producer_artifacts.py record --root ${{ matrix.bin_path }}' in producer, 'Host receipts missing')
+    require('--attempt "${{ github.run_attempt }}" --target "${{ matrix.target }}"' in producer, 'Host provenance missing')
+    require('producer_artifacts.py validate-hosts --root artifacts' in validation, 'Host/FHS validation missing')
+    require('--attempt "${{ github.run_attempt }}" --target release-source' in validation, 'source provenance missing')
+    require('cp CHANGELOG.md release-source/CHANGELOG.md' in validation and 'cp scripts/install.sh release-source/scripts/install.sh' in validation, 'source inputs missing')
+    require('cp "$example"/*.wasm "release-source/examples/$name/bin/"' in validation, 'published examples missing')
+    require('ww-release-package' not in text and 'release-input.car' not in text, 'public assembly remains')
     steps = re.split(r'^    - ', validation, flags=re.M)[1:]
-    staging = [step for step in steps if step.startswith('name: Archive validated release inputs as CAR\n')]
-    require(len(staging) == 1, 'release input CAR construction missing')
-    staging = staging[0]
-    require('for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 linux-musl-x86_64; do' in staging,
-            'release input must retain exactly five original receipt directories')
-    require('for receipt in REVISION SHA256SUMS PROVENANCE.json; do' in staging,
-            'release input receipt set changed')
-    copies = [line.strip() for line in staging.splitlines() if line.strip().startswith('cp ')]
-    require(copies == ['cp -R release-tree release-input/release-tree',
-                      'cp "artifacts/ww-$platform/$receipt" "release-input/artifacts/ww-$platform/$receipt"'],
-            'release input must contain only the release tree and original receipts')
-    require('./ww-release-package pack-tree --tree release-input --spool release-input-spool' in staging
-            and './ww-release-package export-car --spool release-input-spool --car release-input.car' in staging,
-            'release input must use the public content encoder')
     uploads = [step for step in steps if 'uses: actions/upload-artifact@' in step]
-    require(len(uploads) == 2, 'release inputs and image must use separate artifacts')
-    for path in ('release-input.car', 'tested-image.tar'):
-        upload = [step for step in uploads if re.search(r'^        path: '+re.escape(path)+r'$', step, re.M)]
-        require(len(upload) == 1, 'missing single-file artifact: '+path)
-        require('actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9' in upload[0]
-                and '        archive: false\n' in upload[0] and '        if-no-files-found: error\n' in upload[0],
-                'release handoff must use pinned raw upload: '+path)
-    require('validated-release' not in validation+image, 'obsolete mixed release artifact remains')
-    require('uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333' in image
-            and '        name: tested-image.tar\n' in image
-            and '        skip-decompress: true\n' in image
-            and '        digest-mismatch: error\n' in image,
-            'image consumer must receive the exact tested raw image')
+    require(len(uploads) == 2, 'source and image need separate artifacts')
+    source = [step for step in uploads if '        name: release-source\n' in step]
+    require(len(source) == 1 and '        path: release-source/\n' in source[0] and 'archive: false' not in source[0], 'source must be standard ZIP')
+    raw = [step for step in uploads if '        path: tested-image.tar\n' in step]
+    require(len(raw) == 1 and '        archive: false\n' in raw[0], 'tested image must remain raw')
+    for step in uploads:
+        require('actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9' in step and '        if-no-files-found: error\n' in step, 'pinned upload required')
+    require('uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333' in image and '        name: tested-image.tar\n' in image and '        skip-decompress: true\n' in image and '        digest-mismatch: error\n' in image, 'image consumer must verify tested raw image')
 
 text = Path(sys.argv[1]).read_text()
-validate_car_boundary(text)
+validate_boundary(text)
 mutations = [
     ('archive: false', 'archive: true'),
     ('actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9', 'actions/upload-artifact@v7'),
-    ('name: tested-image.tar', 'name: release-input.car'),
+    ('name: tested-image.tar', 'name: other-image.tar'),
     ('skip-decompress: true', 'skip-decompress: false'),
     ('digest-mismatch: error', 'digest-mismatch: warn'),
-    ('for receipt in REVISION SHA256SUMS PROVENANCE.json; do', 'for receipt in REVISION SHA256SUMS; do'),
-    ('cp -R release-tree release-input/release-tree', 'cp -R release-tree release-input/release-tree\n        cp ww-release-package release-input/tool'),
-    ('./ww-release-package export-car', './ww-release-package verify'),
-    ('./ww-release-package pack-tree', './ww-release-package verify'),
-    ('path: release-input.car', 'path: release-input-spool/'),
-    ('cp "artifacts/ww-$platform/$receipt"', 'cp "replacement/$receipt"'),
+    ('--target release-source', '--target unknown'),
+    ('producer_artifacts.py validate-hosts', 'producer_artifacts.py record'),
+    ('cp CHANGELOG.md release-source/CHANGELOG.md', 'true'),
+    ('name: release-source', 'name: different-source'),
+    ('cp "$example"/*.wasm', 'true'),
+    ('artifact: ww-linux-aarch64', 'artifact: older-linux-aarch64'),
 ]
 for old, new in mutations:
     require(old in text, 'mutation target missing: '+old)
     try:
-        validate_car_boundary(text.replace(old, new))
+        validate_boundary(text.replace(old, new))
     except AssertionError:
         continue
-    raise AssertionError('raw CAR boundary accepted mutation: '+old)
-print(f'PASS: raw CAR source contract and {len(mutations)} mutation controls')
+    raise AssertionError('producer boundary accepted mutation: '+old)
+print(f'PASS: producer artifact contract and {len(mutations)} mutation controls')
 PYGUARD
 
 # Freeze the existing job-level admission controls during the maintenance hold.
