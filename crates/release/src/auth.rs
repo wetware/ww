@@ -7,8 +7,9 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, ensure, Context, Result};
+use base58::{FromBase58, ToBase58};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 /// Upper bound shared with the shell installer.
@@ -16,6 +17,25 @@ pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const SPKI_PREFIX: &[u8] = &[
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
+
+/// Decode the existing `ww keygen` seed representation for offline signing.
+/// Accept one optional terminal LF, but no other whitespace or encoding.
+/// This does not load files, generate keys, or alter Host identity loading.
+pub fn decode_signing_seed(contents: &str) -> Result<SigningKey> {
+    let encoded = contents.strip_suffix('\n').unwrap_or(contents);
+    ensure!(encoded.len() <= 44, "invalid private seed length");
+    let bytes = encoded
+        .from_base58()
+        .map_err(|_| anyhow::anyhow!("private seed must be canonical base58btc"))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("private seed must contain exactly 32 bytes"))?;
+    ensure!(
+        seed.to_base58() == encoded,
+        "private seed must be canonical base58btc"
+    );
+    Ok(SigningKey::from_bytes(&seed))
+}
 
 /// One release key, or two keys during an explicitly managed rotation.
 ///
@@ -159,6 +179,39 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn signing_seed_is_canonical_and_does_not_reveal_private_input() {
+        let bytes = [7u8; 32];
+        let encoded = bytes.to_base58();
+        for valid in [encoded.clone(), format!("{encoded}\n")] {
+            assert_eq!(decode_signing_seed(&valid).unwrap().to_bytes(), bytes);
+        }
+        for invalid in [
+            String::new(),
+            encoded[..encoded.len() - 1].into(),
+            "0".repeat(44),
+            format!("z{encoded}"),
+            format!(" {encoded}"),
+            format!("{encoded} "),
+            format!("{encoded}\n\n"),
+            format!("{encoded}\r\n"),
+            format!("1{encoded}"),
+            STANDARD.encode(bytes),
+            hex::encode(bytes),
+        ] {
+            let error = decode_signing_seed(&invalid).unwrap_err().to_string();
+            if !invalid.is_empty() {
+                assert!(!error.contains(&invalid));
+            }
+        }
+        assert_eq!(
+            decode_signing_seed(&[0u8; 32].to_base58())
+                .unwrap()
+                .to_bytes(),
+            [0; 32]
+        );
+    }
 
     fn keyring(keys: &[SigningKey]) -> Vec<u8> {
         let mut output = String::new();

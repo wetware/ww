@@ -57,17 +57,6 @@ fn decode(s: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&arr))
 }
 
-/// Decode the canonical release-signing representation, optionally followed by one LF.
-/// Host identity loading deliberately retains its existing whitespace tolerance.
-pub fn decode_canonical(contents: &str) -> Result<SigningKey> {
-    let encoded = contents.strip_suffix('\n').unwrap_or(contents);
-    let key = decode(encoded)?;
-    if encode(&key) != encoded {
-        bail!("private key must use canonical base58btc encoding");
-    }
-    Ok(key)
-}
-
 /// Load an Ed25519 private key from a local filesystem path (base58btc).
 pub fn load(path: &str) -> Result<SigningKey> {
     let contents =
@@ -183,19 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn canonical_release_decode_preserves_host_whitespace_compatibility() {
+    fn host_load_preserves_whitespace_compatibility() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let encoded = encode(&key);
-        assert_eq!(
-            decode_canonical(&encoded).unwrap().to_bytes(),
-            key.to_bytes()
-        );
-        assert_eq!(
-            decode_canonical(&format!("{encoded}\n"))
-                .unwrap()
-                .to_bytes(),
-            key.to_bytes()
-        );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("identity");
         for text in [
@@ -203,7 +182,6 @@ mod tests {
             format!("\t{encoded}\r\n"),
             format!("{encoded}\n\n"),
         ] {
-            assert!(decode_canonical(&text).is_err());
             std::fs::write(&path, text).unwrap();
             assert_eq!(
                 load(path.to_str().unwrap()).unwrap().to_bytes(),

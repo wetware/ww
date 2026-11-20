@@ -5618,6 +5618,7 @@ name = "release"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base58",
  "base64",
  "bytes",
  "cell",
