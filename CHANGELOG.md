@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer carry backing-content ownership automatically.
 
 ### Added
+- Add the R1 public release keyring at `doc/release-keys` with its SPKI fingerprint
+  and independent trust-distribution instructions.
 - Filesystem-retention regression coverage for child descriptors after parent
   drop and cache eviction, including sibling content and final cleanup.
   Consolidated duplicate test fixtures and removed one redundant relative-base

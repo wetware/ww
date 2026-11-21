@@ -44,6 +44,24 @@ must supply the installer. The installer requires OpenSSL 3.x or 4.x with
 Ed25519 support. Unsupported OpenSSL/LibreSSL fails closed. On macOS, place a
 trusted OpenSSL installation on `PATH`; the OS-provided tool might be LibreSSL.
 
+## R1 public trust key
+
+The [R1 keyring](release-keys) contains one Ed25519 public key in the format above.
+Its fingerprint is SHA-256 of the 44 SPKI DER bytes:
+
+```text
+sha256:c15cb2b5a66ab54bba27e39c79da23a3d927b52032b91df3456c8d4146f5b348
+```
+
+For distribution, replace `<TRUST_REVISION>` with the full reviewed commit:
+
+`https://raw.githubusercontent.com/wetware/ww/<TRUST_REVISION>/doc/release-keys`
+
+Authenticate that commit and fingerprint through an independent channel, not
+solely through this download location or the release. Provision the verified
+keyring through the existing installer trust path or flag. Publishing this
+public keyring does not activate release publication.
+
 ## Consumers and producers
 
 `scripts/install.sh` authenticates the manifest, independently binds it to the
