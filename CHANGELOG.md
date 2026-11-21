@@ -64,6 +64,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pending authenticated selection, compatibility, and native restart admission.
 
 ### Fixed
+- Download producer WASM artifacts after Rust cache restoration so partial-cache
+  cleanup cannot remove the FHS inputs before packaging.
 - Installer-test setup now reuses an authenticated package with independent
   per-test copies and a bounded finalization budget for real debug Host binaries.
   The offline corruption test now supplies its own `restore_checksums()` stub.
