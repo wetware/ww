@@ -44,21 +44,12 @@ do not authenticate a release: call `Package::authenticate` with independent
 trust before using a signed release. Signed package roots are not accepted by
 the unsigned tree materializer.
 
-The CLI exposes the same operations:
+These are public Rust library APIs. The single operational `ww-release-package`
+executable lives in private `wetware/infra`, imports this library, and owns
+preparation, signing, finalization and transport orchestration. This package has
+no executable target. Independent verification remains available through
+`release::auth::TrustedKeys`, `release::package::Package::authenticate`, the public
+installer and the existing `ww` installation/upgrade commands.
 
-```sh
-ww-release-package pack-tree --tree inputs --spool packed
-ww-release-package export-car --spool packed --car inputs.car
-ww-release-package import-car --car inputs.car --spool received
-ww-release-package unpack-tree --spool received --tree restored
-```
-
-Each prints only a JSON object containing `root`. No tool or receipt extracted
-from an untrusted candidate supplies the verifier's authority; consumers use
-their independently pinned package implementation and admission rules.
-
-The existing `prepare`, `finalize`, and `verify` commands are unchanged.
-`prepare` still validates real FHS payloads and binds the private caller's
-metadata into the manifest. After the existing signer signs that manifest,
-`finalize` constructs and authenticates the signed root. Exporting that package
-to CAR preserves its root, descriptor, signature, and legacy consumer bytes.
+The `release` package name replaces `ww-release`; Rust consumers import `release`.
+Descriptors, manifests, signatures, CARs and CIDs do not change with this rename.

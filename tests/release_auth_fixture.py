@@ -237,6 +237,21 @@ def generate_key(directory):
     return private, keyring
 
 
+def canonical_seed(private):
+    """Independent OpenSSL fixture conversion; never use production identities."""
+    der = subprocess.run(['openssl', 'pkey', '-in', str(private), '-outform', 'DER'],
+                         check=True, capture_output=True).stdout
+    assert len(der) == 48 and der[:16].hex() == '302e020100300506032b657004220420'
+    raw = der[16:]
+    alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+    value = int.from_bytes(raw, 'big')
+    encoded = ''
+    while value:
+        value, digit = divmod(value, 58)
+        encoded = alphabet[digit] + encoded
+    return ('1' * (len(raw) - len(raw.lstrip(bytes([0])))) + encoded).encode()
+
+
 def sign_manifest(private, manifest, signature=None):
     manifest = Path(manifest)
     signature = Path(signature) if signature else manifest.with_suffix(manifest.suffix + '.sig')

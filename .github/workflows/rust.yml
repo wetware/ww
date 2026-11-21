@@ -142,9 +142,10 @@ jobs:
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
         python3 tests/test_release_auth.py
-        bash -n scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
+        python3 tests/test_producer_artifacts.py
+        bash -n tests/test_container_boot.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/install.sh scripts/sign_release.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
+          shellcheck scripts/install.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh tests/test_container_boot.sh
         fi
 
     - name: Check offline native qualification controls
@@ -373,8 +374,6 @@ jobs:
     - name: Stage and validate canonical FHS
       run: |
         make package-check
-        cargo build --locked -p ww-release --features package --bin ww-release-package
-        bash tests/test_release_package.sh target/debug/examples/stage_fhs target/fhs
 
     - uses: actions/upload-artifact@v7
       with:
@@ -384,7 +383,6 @@ jobs:
           std/status/bin/status.wasm
           target/fhs/
           target/debug/examples/stage_fhs
-          target/debug/ww-release-package
           examples/*/bin/
           target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm
           target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
@@ -503,9 +501,7 @@ jobs:
     - name: Validate actual packaged installation and startup
       run: |
         cargo build --locked
-        cargo build --locked -p ww-release --features package --bin ww-release-package
         WW_TEST_BINARY=target/debug/ww WW_TEST_FHS=target/fhs python3 tests/test_host_install.py
-        python3 tests/test_install.py --binary target/debug/ww --fhs target/fhs --package-tool target/debug/ww-release-package
         bash tests/test_installed_boot.sh target/debug/ww target/fhs
 
     - name: Smoke-test Chess authority proof command
@@ -544,15 +540,8 @@ jobs:
         fi
         cat proof.stdout
 
-    - name: Compare development and release package outputs
-      run: |
-        cargo build --release --locked -p ww-release --features package --bin ww-release-package
-        python3 tests/test_release_package_profiles.py \
-          --development-tool target/debug/ww-release-package \
-          --release-tool target/release/ww-release-package --fhs target/fhs
-
     - name: Validate public release package library
-      run: cargo test --locked -p ww-release --features package
+      run: cargo test --locked -p release --features package
 
   test-stdlib:
     name: Test standalone standard library
@@ -748,11 +737,9 @@ jobs:
         cmp std/status/bin/status.wasm target/fhs/bin/status.wasm
         cp target/${{ matrix.target }}/release/ww ${{ matrix.bin_path }}/ww
         cp -R target/fhs ${{ matrix.bin_path }}/fhs
-        printf '%s\n' "${{ github.sha }}" > ${{ matrix.bin_path }}/REVISION
-        python3 -c 'import json,sys; print(json.dumps(dict(repository="https://github.com/wetware/ww", revision=sys.argv[1], builder=sys.argv[2])))' \
-          "${{ github.sha }}" "github-actions:${{ github.run_id }}:${{ github.run_attempt }}:${{ matrix.target }}" \
-          > ${{ matrix.bin_path }}/PROVENANCE.json
-        (cd ${{ matrix.bin_path }} && shasum -a 256 ww > SHA256SUMS)
+        python3 scripts/producer_artifacts.py record --root ${{ matrix.bin_path }} \
+          --revision "${{ github.sha }}" --run "${{ github.run_id }}" \
+          --attempt "${{ github.run_attempt }}" --target "${{ matrix.target }}"
 
     - name: Verify static linking
       if: ${{ matrix.install_musl }}
@@ -762,6 +749,7 @@ jobs:
       with:
         name: ${{ matrix.artifact }}
         path: ${{ matrix.bin_path }}/
+        if-no-files-found: error
         retention-days: 1
 
   validate-release:
@@ -778,52 +766,54 @@ jobs:
     - uses: actions/download-artifact@v8
       with:
         path: artifacts
-    - name: Validate and assemble all five platform packages
+    - name: Validate all five producer Host and FHS artifacts
       run: |
+        python3 scripts/producer_artifacts.py validate-hosts --root artifacts \
+          --revision "${{ github.sha }}" --run "${{ github.run_id }}" --attempt "${{ github.run_attempt }}"
         chmod +x artifacts/wasm-artifacts/target/debug/examples/stage_fhs
-        bash scripts/assemble_release.sh artifacts release-tree "${{ github.sha }}"
-        cp artifacts/wasm-artifacts/target/debug/ww-release-package ./ww-release-package
-        chmod +x ./ww-release-package
-        bash tests/test_release_descriptor_package.sh ./ww-release-package artifacts release-tree
+        artifacts/wasm-artifacts/target/debug/examples/stage_fhs verify \
+          artifacts/wasm-artifacts/std/kernel/bin/main.wasm \
+          artifacts/wasm-artifacts/std/status/bin/status.wasm artifacts/ww-linux-x86_64/fhs
         chmod +x artifacts/ww-linux-musl-x86_64/ww
-        WW_TEST_BINARY=artifacts/ww-linux-musl-x86_64/ww WW_TEST_FHS=release-tree/fhs python3 tests/test_host_install.py
-        python3 tests/test_install.py --binary artifacts/ww-linux-musl-x86_64/ww --fhs release-tree/fhs --package-tool ./ww-release-package
+        WW_TEST_BINARY=artifacts/ww-linux-musl-x86_64/ww WW_TEST_FHS=artifacts/ww-linux-x86_64/fhs python3 tests/test_host_install.py
     - name: Build and boot artifact containers
       run: |
         mkdir deploy-context
         cp artifacts/ww-linux-musl-x86_64/ww deploy-context/ww
         cp artifacts/ww-linux-x86_64/ww deploy-context/ww-amd64
         chmod +x deploy-context/ww-amd64
-        cp -R release-tree/fhs deploy-context/fhs
+        cp -R artifacts/ww-linux-x86_64/fhs deploy-context/fhs
         docker build -f Containerfile.deploy -t ww-validated:deploy deploy-context
-        bash tests/test_container_boot.sh ww-validated:deploy release-tree/fhs
+        bash tests/test_container_boot.sh ww-validated:deploy artifacts/ww-linux-x86_64/fhs
         docker build --build-arg TARGETARCH=amd64 -f Containerfile.release -t ww-validated:release deploy-context
-        bash tests/test_container_boot.sh ww-validated:release release-tree/fhs release
+        bash tests/test_container_boot.sh ww-validated:release artifacts/ww-linux-x86_64/fhs release
     - name: Build and boot source container
       run: |
         mkdir -p std/kernel/bin std/status/bin
-        cp release-tree/fhs/boot/kernel.wasm std/kernel/bin/main.wasm
-        cp release-tree/fhs/bin/status.wasm std/status/bin/status.wasm
+        cp artifacts/ww-linux-x86_64/fhs/boot/kernel.wasm std/kernel/bin/main.wasm
+        cp artifacts/ww-linux-x86_64/fhs/bin/status.wasm std/status/bin/status.wasm
         docker build --build-arg WW_BUILD_GIT_SHA="${{ github.sha }}" -f Containerfile -t ww-validated:source .
-        bash tests/test_container_boot.sh ww-validated:source release-tree/fhs
-    - name: Archive validated release inputs as CAR
+        bash tests/test_container_boot.sh ww-validated:source artifacts/ww-linux-x86_64/fhs
+    - name: Record validated producer source inputs
       run: |
-        set -euo pipefail
-        mkdir release-input
-        cp -R release-tree release-input/release-tree
-        for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 linux-musl-x86_64; do
-          mkdir -p "release-input/artifacts/ww-$platform"
-          for receipt in REVISION SHA256SUMS PROVENANCE.json; do
-            cp "artifacts/ww-$platform/$receipt" "release-input/artifacts/ww-$platform/$receipt"
-          done
+        mkdir -p release-source/scripts
+        sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1 > release-source/VERSION
+        cp CHANGELOG.md release-source/CHANGELOG.md
+        cp scripts/install.sh release-source/scripts/install.sh
+        for example in artifacts/wasm-artifacts/examples/*/bin; do
+          [ -d "$example" ] || continue
+          name="$(basename "$(dirname "$example")")"
+          mkdir -p "release-source/examples/$name/bin"
+          cp "$example"/*.wasm "release-source/examples/$name/bin/"
         done
-        ./ww-release-package pack-tree --tree release-input --spool release-input-spool
-        ./ww-release-package export-car --spool release-input-spool --car release-input.car
-    - name: Upload validated release input CAR
+        python3 scripts/producer_artifacts.py record --root release-source \
+          --revision "${{ github.sha }}" --run "${{ github.run_id }}" \
+          --attempt "${{ github.run_attempt }}" --target release-source
+    - name: Upload validated producer source inputs
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
-        path: release-input.car
-        archive: false
+        name: release-source
+        path: release-source/
         if-no-files-found: error
         retention-days: 1
     - name: Save tested image

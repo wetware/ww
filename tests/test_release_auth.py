@@ -13,7 +13,6 @@ from release_auth_fixture import (cid_bytes, cid_text, generate_key, manifest_ro
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALLER = REPO / 'scripts/install.sh'
-SIGNER = REPO / 'scripts/sign_release.sh'
 PLATFORMS = [('Linux', 'x86_64', 'linux/x86_64'),
              ('Linux', 'aarch64', 'linux/aarch64'),
              ('Darwin', 'x86_64', 'macos/x86_64'),
@@ -83,6 +82,8 @@ esac
             target.write_bytes(b'fixture WASM')
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(('WW_', 'IPFS_', 'GITHUB_'))}
+        if os.environ.get('WW_RELEASE_PACKAGE'):
+            self.env['WW_RELEASE_PACKAGE'] = os.environ['WW_RELEASE_PACKAGE']
         self.env.update(HOME=str(self.home), PATH=str(self.stubs) + os.pathsep + os.environ['PATH'],
                         TEST_OS='Linux', TEST_ARCH='x86_64', TEST_RELEASE=str(self.release),
                         TEST_EXECUTIONS=str(self.calls), TEST_TRANSPORT=str(self.transport),
@@ -621,47 +622,6 @@ esac
                 self.env['FAIL_FETCH'] = path
                 self.run_installer()
 
-    def run_signer(self, success=False):
-        output = self.root / 'output.sig'
-        output.unlink(missing_ok=True)
-        result = subprocess.run(['bash', str(SIGNER), str(self.manifest), str(output),
-                                 str(self.private), str(self.keys)], env=self.env,
-                                capture_output=True, text=True, timeout=30)
-        private_body = self.private.read_text().splitlines()[1]
-        self.assertNotIn(private_body, result.stdout + result.stderr)
-        if success:
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(output.read_bytes(), self.signature.read_bytes())
-        else:
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertFalse(output.exists())
-
-    def test_signer_exact_bytes(self):
-        self.run_signer(success=True)
-
-    def test_signer_rejects_wrong_key(self):
-        self.keys.write_bytes(self.other_keys.read_bytes())
-        self.run_signer()
-
-    def test_signer_private_key_cannot_enter_release_tree(self):
-        private = self.release / 'private.pem'
-        private.write_bytes(self.private.read_bytes())
-        private.chmod(0o600)
-        self.private = private
-        self.run_signer()
-
-    def test_signer_rejects_malformed_manifest(self):
-        self.manifest.write_bytes(self.manifest.read_bytes().replace(b'# sha256', b'# blake3'))
-        self.run_signer()
-
-    def test_reusable_signer_does_not_allocate_workflow_authority(self):
-        # The caller owns CI admission. The reusable signer receives explicit
-        # fixture keys and still verifies the exact bytes against public trust.
-        self.env.update(GITHUB_ACTIONS='true', GITHUB_REPOSITORY='example/release',
-                        GITHUB_REF='refs/heads/candidate', GITHUB_EVENT_NAME='workflow_dispatch')
-        self.run_signer(success=True)
-        self.keys.write_bytes(self.other_keys.read_bytes())
-        self.run_signer()
 
 
 if __name__ == '__main__':

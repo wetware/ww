@@ -172,6 +172,25 @@ mod tests {
     }
 
     #[test]
+    fn host_load_preserves_whitespace_compatibility() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let encoded = encode(&key);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity");
+        for text in [
+            format!(" {encoded} "),
+            format!("\t{encoded}\r\n"),
+            format!("{encoded}\n\n"),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                load(path.to_str().unwrap()).unwrap().to_bytes(),
+                key.to_bytes()
+            );
+        }
+    }
+
+    #[test]
     fn hex_encoding_rejected() {
         let sk = generate().unwrap();
         let hex_str = hex::encode(sk.to_bytes());

@@ -88,90 +88,29 @@ verification and manifest parsing. `verify_artifact` explicitly uses SHA-256.
 #739 must obtain trust independently and use this verification before consuming
 or replacing a Host. This change does not implement replacement or rollback.
 
-`scripts/assemble_release.sh` still produces an unsigned staging tree for build
-and package validation. A staging tree is not an authorized release.
-`scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS` signs the
-exact staged manifest and verifies the result against independent trusted keys.
-It rejects an existing signature destination and a private key inside the release
-tree. `ww-release-package prepare` constructs the binding before signing.
-`finalize` authenticates the signed tree before producing the transport root.
-The worker verifies against its independently provisioned keyring before local
-commitment; the verifier comes from the installed executable, never the release tree.
+Release assembly, signing and custody procedures belong to private
+[`wetware/infra`](https://github.com/wetware/infra/blob/master/ops/vps/official-release.md).
+Its single `ww-release-package` executable imports the public `release` library;
+no signing executable or private infrastructure dependency is shipped here.
+The private signer consumes the existing `ww keygen` representation: canonical
+Bitcoin-alphabet base58btc of a raw 32-byte Ed25519 seed, without a multibase
+prefix. Host identity loading and `ww keygen` behavior remain unchanged.
+The artifact-signing key must remain separate from Host and Kubo/IPNS identities.
 
-Official signing admission now belongs to private `wetware/infra`. Its inactive
-automatic signing job validates the reviewed public artifact handoff before key
-access. Public CI receives no release-signing secret. The reusable signing script
-checks explicit files and independent trust; it does not allocate CI authority.
-The approved prototype trusts private infra workflow writers with repository
-signing authority. Credential provisioning and production activation still
-require separate approval. No protected environment or per-release approval
-is required.
+The public library, installer and Host provide independent authentication without
+access to private source or credentials. To verify an independently obtained
+manifest and detached signature using an independently provisioned keyring:
 
-Private key material exists only in an owner-accessible temporary directory
-outside the artifact tree. The step disables tracing, uses `umask 077`, clears
-the secret environment variable, and removes the directory on exit. The private
-key is never copied to the VPS, Kubo, a release archive, or a build/test job.
-Trusted master code and the signing runner can access the key during signing.
-A compromised signing runner or authorized signing code remains in the threat
-model's trusted computing base. Abrupt runner termination might bypass cleanup;
-use ephemeral runners and restrict access to runner storage.
+```sh
+sh scripts/install.sh --trusted-release-keys /absolute/path/release-keys \
+  --verify-manifest /absolute/path/CHECKSUMS.txt \
+  --signature /absolute/path/CHECKSUMS.txt.sig
+```
 
-Operational release execution belongs to the private infra
-[operator runbook](https://github.com/wetware/infra/blob/9f0815f8555e1b00d00f063837bf0f806bed4963/ops/vps/official-release.md),
-the reviewed draft in [infra#50](https://github.com/wetware/infra/pull/50).
-The provisioning procedure below defines key creation and independent trust;
-it does not authorize release execution or production activation.
-
-## Provisioning runbook — requires separate approval
-
-1. Approve the release-key custodian, independent public-key distribution channel,
-   repository-secret custody, and cutover release.
-   Keep the publication hold in place.
-2. Generate a fresh key on the approved signing machine, outside the checkout and
-   every artifact directory. Do not reuse an IPNS or Host key:
-
-   ```sh
-   umask 077
-   openssl genpkey -algorithm ED25519 -out release-signing.pem
-   openssl pkey -in release-signing.pem -pubout -outform DER -out release-public.der
-   openssl base64 -A -in release-public.der > release-keys
-   printf '\n' >> release-keys
-   openssl dgst -sha256 release-public.der
-   ```
-
-3. Confirm the DER fingerprint through the approved independent channel. Use
-   OpenSSL-generated keys, not arbitrary encoded points. Preserve a protected
-   recovery copy according to the approved custody policy. Never send the private
-   key to a release consumer, publisher host, issue, PR, chat, or build artifact.
-4. Provision the public keyring as `/etc/wetware/release-keys` on consumers and
-   `/etc/wetware/release-trusted-keys` on the publisher host. Both must be
-   owned by an administrator and not writable by
-   untrusted users. For a user-managed installation, provision a protected local
-   path and pass `--trusted-release-keys` explicitly. Releases cannot rotate keys.
-5. After separate CI approval in `wetware/infra`, set the repository Actions
-   secret `WW_RELEASE_SIGNING_KEY` to the private PEM. Set the repository Actions
-   variable `WW_RELEASE_TRUSTED_KEYS` to the public keyring. A final LF is optional
-   in `WW_RELEASE_TRUSTED_KEYS`; the workflow adds one if absent.
-   The official workflow requires master and manual dispatch, then signs
-   automatically after admission.
-   Repository workflow writers can author other workflows that access secrets;
-   this is an accepted trust boundary. Preserve restrictions on secrets in
-   untrusted fork workflows. Public CI must receive no signing secret.
-6. Validate a signed candidate by immutable CID without changing discovery.
-   Verify all intended platforms and both fresh installation and recovery.
-   Independently compare the published manifest and signature with the signed
-   files. Record the source revision, CID, signer fingerprint, and test receipts.
-7. Obtain separate approval for publication/cutover. This patch does not remove
-   the IPFS hold, fence historical writers, or provision credentials.
-   Apply [the existing publication fence](legacy-publication-hold.md), and use
-   infra's single durable publication Owner. Do not activate
-   a competing owner or journal from this work.
-
-For offline qualification, run `ww-release-package prepare`, then
-`scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS`, followed
-by `ww-release-package finalize`. Keep the private PEM outside the release
-directory and use independently supplied public trust. These commands do not
-announce a release or authorize production publication.
+This verification mode performs no network requests and does not install or
+execute a candidate. Public tests use disposable OpenSSL-generated keys and
+independent native and shell verifiers. Provisioning a production key, changing
+consumer trust and activating publication remain separate operator decisions.
 
 ## Rotation, compromise, and unsigned releases
 

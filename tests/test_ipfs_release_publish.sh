@@ -27,13 +27,14 @@ for package in metadata['packages']:
     if package['id'] not in members:
         continue
     for target in package['targets']:
-        assert target['name'] != 'ww-release-publisher', 'public publisher target remains'
+        assert target['name'] not in ('ww-release-publisher', 'ww-release-package'), 'private executable target remains public'
     for dependency in package['dependencies']:
         assert dependency['name'] != 'ww-release-publisher', 'public package depends on private publisher'
         assert 'wetware/infra' not in (dependency.get('source') or ''), 'public package depends on private infrastructure'
 PY
 grep -Fq 'queue: max' "$workflow" || fail 'release concurrency queue missing'
-grep -Fq 'ww-release-package' "$workflow" || fail 'public offline package tool not built or validated'
+grep -Fq 'cargo test --locked -p release --features package' "$workflow" || fail 'public release library not validated'
+if grep -Fq 'ww-release-package' "$workflow"; then fail 'private packager remains public'; fi
 if grep -Fq 'ww-release-publisher' "$workflow"; then
   fail 'public workflow retains the private publisher'
 fi

@@ -2,4 +2,4 @@
 //!
 //! Compatibility paths for the public release protocol implementation.
 
-pub use ww_release::{auth, descriptor};
+pub use release::{auth, descriptor};
