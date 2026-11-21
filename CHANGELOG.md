@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- Reuse the CI Wasmtime compilation cache across PID0 lifecycle tests while
+  preserving the metrics test's empty private cache and isolated node state.
 - Rename the public `ww-release` library to `release` and move operational package/signing tooling to private infrastructure. Public CI emits checksummed Host/FHS inputs and source receipts for private assembly; release formats, independent verification and Host identities remain unchanged.
 - Adopt the Wasmtime 48.0.1 descriptor-factory backport. Shared staged descriptors
   retain their generation through attached factories and active-operation owners.
