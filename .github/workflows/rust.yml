@@ -691,10 +691,6 @@ jobs:
       with:
         submodules: recursive
 
-    - uses: actions/download-artifact@v8
-      with:
-        name: wasm-artifacts
-
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@1.99.1
       with:
@@ -716,6 +712,10 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         key: master-${{ matrix.target }}
+
+    - uses: actions/download-artifact@v8
+      with:
+        name: wasm-artifacts
 
     - name: Build (native)
       if: ${{ !matrix.use_cross }}
