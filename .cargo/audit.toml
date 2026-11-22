@@ -4,6 +4,5 @@
 # behavior) and not part of the reachable dependency graph after disabling
 # libp2p dns/mdns features.
 ignore = [
-  "RUSTSEC-2026-0118",
   "RUSTSEC-2026-0119",
 ]
