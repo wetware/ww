@@ -143,6 +143,7 @@ struct RunningNode {
 }
 
 struct NodeOptions {
+    private_wasmtime_cache: bool,
     mounts: Vec<String>,
     installed_baseline: bool,
     cwd: Option<PathBuf>,
@@ -164,6 +165,7 @@ struct StemOptions {
 impl NodeOptions {
     fn installed(http_addr: Option<SocketAddr>) -> Self {
         Self {
+            private_wasmtime_cache: false,
             mounts: vec![STATUS_LAYER.to_string()],
             installed_baseline: true,
             cwd: None,
@@ -245,7 +247,23 @@ impl RunningNode {
             .env("RUST_LOG", "ww=info,atom=info,cache=info,cell=info,ipfs=info,membrane=info,rpc=info,stem=info,rpc::http_listener=trace")
             .env("NO_COLOR", "1")
             .env("WW_KUBO_WAIT_MAX_SECS", "30")
-            .env("WW_CWASM_DIR", home.join("cwasm"))
+            // Reuse CI's compiled components across isolated nodes. The metrics
+            // test opts out because it must observe writes to an empty cache.
+            .env(
+                "WW_CWASM_DIR",
+                if options.private_wasmtime_cache {
+                    home.join("cwasm")
+                } else {
+                    std::env::var_os("WW_CWASM_DIR")
+                        // Some nodes boot from an unrelated working directory.
+                        .map(|path| {
+                            std::env::current_dir()
+                                .expect("resolve shared compilation cache directory")
+                                .join(path)
+                        })
+                        .unwrap_or_else(|| home.join("cwasm"))
+                },
+            )
             .env_remove("WW_CWASM_CACHE_MAX_BYTES")
             .env_remove("WW_IDENTITY")
             .env_remove("WW_HTTP_ADMIN")
@@ -1938,7 +1956,8 @@ mod rust_lifecycle {
             .expect("bind delayed Kubo proxy");
         let proxy_addr = proxy_listener.local_addr().expect("read proxy address");
         let home = tempfile::tempdir().expect("create isolated HOME");
-        let options = NodeOptions::installed(Some(http_addr));
+        let mut options = NodeOptions::installed(Some(http_addr));
+        options.private_wasmtime_cache = true;
         let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
         let kernel_source = "/boot/kernel.wasm";
         let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
