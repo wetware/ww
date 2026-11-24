@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- Run the IPFS and Kad integration suites against the configured CI Kubo daemon.
+  Required runs fail when the daemon is unavailable.
 - Run mandatory source-container qualification alongside native release builds,
   retaining exact-revision checks and publication gates. Add a validation-only
   dispatch mode for branch measurements without publication.
