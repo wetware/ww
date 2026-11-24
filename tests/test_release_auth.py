@@ -105,6 +105,10 @@ esac
 set -eu
 printf 'verifier %s\n' "$*" >> "$TEST_VERIFIER_CALLS"
 [ "$1" = install ] || exit 91
+if [ -n "${{TEST_CAPTURE_KEY:-}}" ]; then
+  while [ "$1" != --trusted-release-keys ]; do shift; done
+  cp -p "$2" "$TEST_CAPTURE_KEY"
+fi
 mkdir -p "$HOME/.ww/bin"
 cp "$TEST_RELEASE/bin/ww/{path}/ww" "$HOME/.ww/bin/ww"
 chmod +x "$HOME/.ww/bin/ww"
@@ -435,6 +439,15 @@ chmod +x "$HOME/.ww/bin/ww"
                 self.assertIn(f'install --release {self.release_cid}', self.verifier_calls.read_text())
                 self.calls.unlink()
                 self.transport.unlink()
+
+    def test_embedded_key_permissions_with_group_writable_umask(self):
+        installer = self.automatic_fixture()
+        observed = self.root / 'observed-key'
+        result = subprocess.run(['sh', str(installer)], umask=0o002,
+                                env=dict(self.env, TEST_CAPTURE_KEY=str(observed)),
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(observed.stat().st_mode & 0o777, 0o600)
 
     def test_invalid_ipns_and_malformed_targets_never_fetch_release_content(self):
         installer = self.automatic_fixture()

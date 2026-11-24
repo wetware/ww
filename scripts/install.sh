@@ -489,7 +489,7 @@ if [ -z "$RELEASE_CID" ]; then
       [ -d "$key_directory" ] && [ -x "$key_directory" ] || die "Cannot inspect $key_directory"
     fi
     TRUSTED_RELEASE_KEYS=$WW_TMPDIR/bootstrap-key
-    printf '%s\n' "$BOOTSTRAP_KEY" > "$TRUSTED_RELEASE_KEYS"
+    (umask 077 && printf '%s\n' "$BOOTSTRAP_KEY" > "$TRUSTED_RELEASE_KEYS")
   fi
 fi
 IPFS_BASE="/ipfs/${RELEASE_CID}"
