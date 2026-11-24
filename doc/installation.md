@@ -1,22 +1,26 @@
 # Installation and recovery
 
-Use an installer from a reviewed checkout or independently authenticated HTTPS
-distribution. The installer requires OpenSSL 3.x or 4.x on `PATH` and a running
-Kubo node. It selects the existing Linux or macOS Host for ARM64 or x86-64.
+The canonical installation command is:
 
 ```sh
-sh scripts/install.sh
-sh scripts/install.sh --release <CID> --trusted-release-keys /trusted/path/release-keys
+curl -fsSL https://wetware.run/install.sh | sh
 ```
 
-With no release argument, the installer asks Kubo to resolve the fixed
-`ww-release` IPNS name without recursion or its resolver cache. It accepts
-only the exact path to R1 `v0.1.1`:
-`/ipfs/bafybeihdekx4kiimojt7l3qcl52xwrwiuukst4556ongnacbo4ulj4aqpi`.
-Unavailable discovery or a different root stops installation, including when a
-newer signed release exists. Updating this checkpoint requires review and
-independent distribution of the installer. An operator can select a known CID
-explicitly during a discovery outage.
+The public redirect still serves the explicit-CID installer pending review and
+deployment approval. Use `sh scripts/install.sh` from this revision to run the
+candidate locally. Both paths require a configured Kubo CLI and running daemon,
+Python 3, and OpenSSL 3.x or 4.x. Use a Kubo version that supports
+`ipfs name get` and `ipfs name inspect --verify`, such as 0.43.1. On macOS, check `openssl version` if the
+system provides LibreSSL. The R1 Linux verifier requires glibc 2.39 on ARM64 and glibc 2.38 on x86-64.
+
+The installer fetches the signed record for the fixed `ww-release` IPNS
+identity with `ipfs name get`. Local Kubo inspects the signature and validity
+against that identity. Only a direct immutable release CID is eligible.
+To select a known CID during a discovery outage, run:
+
+```sh
+sh scripts/install.sh --release "$RELEASE_CID" --trusted-release-keys /trusted/path/release-keys
+```
 
 For automatic bootstrap, the installer uses the keyring selected by
 `--trusted-release-keys`, then a provisioned `/etc/wetware/release-keys`.
@@ -25,28 +29,21 @@ its temporary directory. A configured keyring that fails verification stops
 installation. Explicit CID, recovery, and manifest-only modes require a
 provisioned keyring. See [release authentication](release-authentication.md).
 
-A fresh consumer cannot detect a replay of the exact checkpoint or determine
-whether a higher signed release sequence exists. The shell receives a path
-from Kubo. It does not inspect raw IPNS records or initialize sequence floors.
-If `~/.ww/release-consumer` already exists, automatic bootstrap refuses.
-Use native discovery for its persistent rollback checks. Explicit CID selection
-continues to permit historical selection under the native installation
-ownership checks.
+A first-time installer can receive an older, still-valid IPNS record. A valid
+signature and expiry check cannot prove that the record selects the globally
+latest release. Shell installation creates no IPNS or release sequence floor.
+If `~/.ww/release-consumer` exists, use native discovery to enforce its floors.
 
-The shell independently hashes the raw release root and verifies that its direct
-`CHECKSUMS.txt` link identifies the authenticated manifest. Signed payload hashes
-then bind the staged executable to the requested root before its first execution.
-Kubo supplies bytes; its path-resolution results do not grant execution authority.
-Shell bootstrap accepts the current package producer format: canonical lowercase
-base32 CIDv1 DAG-PB SHA-256 roots with a single raw-block manifest. CIDv0 roots,
-chunked manifests, and other unsupported layouts fail closed. The native
-`--release` selector additionally verifies the typed descriptor and compatibility.
-
-The installer downloads the Host, `fhs/boot/kernel.wasm`, and
-`fhs/bin/status.wasm` to a temporary directory. It requires an exact SHA-256
-checksum entry for each file. The candidate Host validates both components
-before changing installed files. Kernel validation uses the production kernel
-contract. Status validation uses the ordinary Cell contract.
+The shell authenticates the manifest, binds it to the requested transport root,
+and verifies SHA-256 for the staged Host, kernel, and status files. Automatic
+installation also checks the signed descriptor binding, descriptor block, and
+channel against the selected root. The HTTPS
+installer pins the SHA-256 of an independently verified R1 verifier for each
+platform. For a subsequent release, the installer retrieves the verifier from
+the immutable R1 root. R1 must therefore remain available. The pinned verifier
+runs `ww install --release`, authenticates the typed descriptor, selects the
+compatible Host and FHS, and checks the reconstructed bytes before installation.
+The installed Host first runs to report its version.
 
 The shell hands the authenticated package to `ww install`. Installation writes
 `~/.ww/bin/ww`, `~/.ww/fhs/boot/kernel.wasm`, `~/.ww/fhs/bin/status.wasm`, and a
@@ -59,11 +56,6 @@ namespace, or publish a name. Existing namespace and service configuration
 remains unchanged. Private identity, keys,
 IPNS records, watermarks, caches, logs, and application data stay outside the FHS.
 
-The native bootstrap handoff reauthenticates the staged manifest with the
-independent keyring before parsing or installing component payloads. It also
-fetches the immutable release descriptor metadata through the shared native
-HTTP release selector after shell staging; staged payloads alone do not supply
-the complete retained proof.
 `ww install --release <CID>` authenticates an immutable release through the
 shared release descriptor and installs its selected platform Host and FHS.
 `--trusted-release-keys` defaults to `/etc/wetware/release-keys`.

@@ -1,4 +1,6 @@
 #!/bin/sh
+# Parse the complete installer before starting a piped installation.
+{
 # Independently distributed installer. Review these R1 values together when
 # qualifying a new bootstrap release. Never load them from the release tree.
 BOOTSTRAP_CID=bafybeihdekx4kiimojt7l3qcl52xwrwiuukst4556ongnacbo4ulj4aqpi
@@ -119,6 +121,37 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Fetch the wire record through the configured Kubo CLI. Inspect it with the
+# local Kubo executable in a private, empty repo path, without a daemon.
+discover_release() {
+  (ulimit -f 20 && ipfs name get "$RELEASE_IPNS") > "$WW_TMPDIR/ipns-record" \
+    || die "Cannot fetch ww-release. Check Kubo connectivity and support for ipfs name get."
+  [ -s "$WW_TMPDIR/ipns-record" ] && [ "$(wc -c < "$WW_TMPDIR/ipns-record")" -le 10240 ] \
+    || die "Invalid ww-release IPNS record size"
+  IPFS_PATH="$WW_TMPDIR/inspect-repo" ipfs --offline name inspect \
+    --verify="$RELEASE_IPNS" --dump=false --enc=json < "$WW_TMPDIR/ipns-record" \
+    > "$WW_TMPDIR/ipns-inspection" || die "Cannot inspect ww-release IPNS record"
+
+  # A successful inspect command can report an invalid signature or expired
+  # record. Read the verdict and target from the same local inspection.
+  python3 -I - "$RELEASE_IPNS" "$WW_TMPDIR/ipns-inspection" <<'PY' || die "Invalid ww-release IPNS record or release CID"
+import json
+import re
+import sys
+
+with open(sys.argv[2], encoding="utf-8") as inspection:
+    result = json.load(inspection)
+verdict = result["Validation"]
+if verdict["Valid"] is not True or verdict["Name"] != sys.argv[1]:
+    sys.exit(1)
+# CIDv1, DAG-PB, SHA-256 with a 32-byte digest, canonical lowercase base32.
+target = re.fullmatch(r"/ipfs/(bafybei[a-h][a-z2-7]{50}[aeimquy4])", result["Entry"]["Value"])
+if target is None:
+    sys.exit(1)
+print(target[1])
+PY
+}
+
 # --- Parse arguments ---
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -145,7 +178,7 @@ while [ $# -gt 0 ]; do
       echo "       install.sh --verify-manifest FILE --signature FILE [--trusted-release-keys FILE]"
       echo "  Trust keys: --trusted-release-keys FILE or /etc/wetware/release-keys"
       echo "  --release  Install a specific release by immutable CID"
-      echo "  Without --release, require ww-release to resolve to the reviewed R1 CID."
+      echo "  Without --release, discover the release from the signed ww-release IPNS record."
       echo "  Only this mode uses the embedded R1 key when no keyring is configured."
       echo "  --recover  Recover only the pending native Host transaction"
       echo "  --ipfs-url Native installation/recovery Kubo HTTP endpoint (default: IPFS_API or http://localhost:5001)"
@@ -273,7 +306,7 @@ verify_release_binding() {
     || die "Could not read release root"
   # Accept only the producer profile: sorted unique ASCII names, canonical
   # length varints, exact Hash/Name/Tsize fields, and plain-directory Data.
-  # Other links remain opaque; only CHECKSUMS.txt grants payload authority.
+  # Save the direct descriptor link for comparison with the signed binding.
   awk -v digest="$manifest_digest" -v size="$(wc -c < "$WW_TMPDIR/CHECKSUMS.txt")" '
     function fail() { exit 1 }
     function number(end,    value,scale,b,count) {
@@ -341,11 +374,12 @@ verify_release_binding() {
             if (hash!="01551220" digest || link_size!=size) fail()
             matched=1
           }
+          if (name=="release-descriptor") print hash, link_size
         }
       }
       if (data!=1 || !matched) fail()
     }
-  ' "$WW_TMPDIR/root-bytes" || die "Invalid release root or manifest binding"
+  ' "$WW_TMPDIR/root-bytes" > "$WW_TMPDIR/descriptor-link" || die "Invalid release root or manifest binding"
 }
 
 if ! "$RECOVER" && [ -n "$RECOVERY_TIMEOUT_SECS" ]; then
@@ -444,14 +478,11 @@ fi
 
 # --- Select immutable release ---
 WW_TMPDIR=$(mktemp -d)
+expected_channel=""
 if [ -z "$RELEASE_CID" ]; then
-  # Compare bytes, including the final LF. Kubo supplies only a locator.
-  printf '/ipfs/%s\n' "$BOOTSTRAP_CID" > "$WW_TMPDIR/expected-path"
-  ipfs name resolve --recursive=false --nocache "/ipns/$RELEASE_IPNS" > "$WW_TMPDIR/resolved-path" \
-    || die "Could not resolve ww-release. For a known release, use --release CID with independent trust keys."
-  cmp -s "$WW_TMPDIR/expected-path" "$WW_TMPDIR/resolved-path" \
-    || die "ww-release does not resolve to this installer's reviewed release. Check the installer revision."
-  RELEASE_CID=$BOOTSTRAP_CID
+  expected_channel=$RELEASE_IPNS
+  # Resolve and validate the official signed record before selecting any bytes.
+  RELEASE_CID=$(discover_release) || die "Could not authenticate ww-release IPNS record"
   if ! "$KEYS_EXPLICIT" && [ ! -e "$TRUSTED_RELEASE_KEYS" ] && [ ! -L "$TRUSTED_RELEASE_KEYS" ]; then
     key_directory=${TRUSTED_RELEASE_KEYS%/*}
     if [ -e "$key_directory" ] || [ -L "$key_directory" ]; then
@@ -488,20 +519,77 @@ fetch_verified() {
   ' "${WW_TMPDIR}/CHECKSUMS.txt") || die "Missing or duplicate SHA-256 entry: ${package_path}"
   case "$expected" in *[!0-9a-f]*|'') die "Invalid SHA-256 entry: ${package_path}" ;; esac
   [ "${#expected}" -eq 64 ] || die "Invalid SHA-256 length: ${package_path}"
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "$staged_path" | awk '{print $1}')
-  else
-    actual=$(shasum -a 256 "$staged_path" | awk '{print $1}')
-  fi
+  actual=$(file_sha256 "$staged_path")
   [ "$actual" = "$expected" ] || die "Checksum mismatch: ${package_path}"
+}
+
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+verify_descriptor() {
+  (ulimit -f 1 && fetch_verified "RELEASE-DESCRIPTOR" "$WW_TMPDIR/binding") \
+    || die "Cannot authenticate release descriptor binding"
+  descriptor_cid=$(python3 -I - "$WW_TMPDIR" <<'PY'
+import base64
+from pathlib import Path
+import sys
+
+stage = Path(sys.argv[1])
+link, size = (stage / "descriptor-link").read_text().split()
+raw = bytes.fromhex(link)
+if len(raw) != 36 or raw[:4] != bytes.fromhex("01711220") or not 0 < int(size) <= 1048576:
+    sys.exit("Invalid direct release descriptor link")
+cid = "b" + base64.b32encode(raw).decode().rstrip("=").lower()
+if (stage / "binding").read_bytes() != (cid + "\n").encode():
+    sys.exit("Signed release descriptor binding disagrees with transport root")
+print(cid)
+PY
+  ) || die "Invalid release descriptor binding"
+  (ulimit -f 2048 && ipfs block get "$descriptor_cid") > "$WW_TMPDIR/descriptor.cbor" \
+    || die "Cannot fetch release descriptor block"
+  [ "$(wc -c < "$WW_TMPDIR/descriptor.cbor")" -eq "$(awk '{print $2}' "$WW_TMPDIR/descriptor-link")" ] \
+    || die "Release descriptor size mismatch"
+
+  descriptor_hash=$(awk '{print substr($1, 9)}' "$WW_TMPDIR/descriptor-link")
+  [ "$(file_sha256 "$WW_TMPDIR/descriptor.cbor")" = "$descriptor_hash" ] || die "Release descriptor CID mismatch"
+  if [ "$RELEASE_CID" = "$BOOTSTRAP_CID" ]; then
+    # The verified R1 descriptor names ww-release and the four supported Hosts.
+    [ "$descriptor_cid" = bafyreiavqux4s2baztgqwnvyqeh6ytxccpns5drvjunzkm5u76wx6mxuam ] \
+      || die "Unexpected R1 descriptor"
+    return
+  fi
+  # Decode only the block whose local CID matches the signed binding. Kubo's
+  # temporary repository uses offline commands for every operation.
+  (
+    export IPFS_PATH="$WW_TMPDIR/inspect-repo"
+    ipfs --offline init --profile=test > /dev/null &&
+      ipfs --offline block put --cid-codec=dag-cbor < "$WW_TMPDIR/descriptor.cbor" > "$WW_TMPDIR/local-cid" &&
+      cmp -s "$WW_TMPDIR/binding" "$WW_TMPDIR/local-cid" &&
+      ipfs --offline dag get "$descriptor_cid" > "$WW_TMPDIR/descriptor.json"
+  ) || die "Cannot authenticate or decode release descriptor"
+
+  python3 -I - "$WW_TMPDIR/descriptor.json" "$RELEASE_IPNS" <<'PY' || die "Release descriptor channel mismatch"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as descriptor:
+    version, fields = json.load(descriptor)
+if type(version) is not int or version != 1 or fields["channel"] != sys.argv[2]:
+    sys.exit(1)
+PY
 }
 
 spin "Fetching verified Host..."
 fetch_verified "$BIN_PATH" "${WW_TMPDIR}/ww"
-chmod +x "${WW_TMPDIR}/ww"
 spin_ok "Fetched verified Host"
 
 if "$RECOVER"; then
+  chmod +x "${WW_TMPDIR}/ww"
   "${WW_TMPDIR}/ww" upgrade --recover-only --release "$RELEASE_CID" \
     --ipfs-url "$BOOTSTRAP_IPFS_URL" --timeout-secs "$RECOVERY_TIMEOUT_SECS" \
     --trusted-release-keys "$TRUSTED_RELEASE_KEYS"
@@ -512,18 +600,28 @@ spin "Fetching verified FHS payloads..."
 mkdir -p "${WW_TMPDIR}/fhs/boot" "${WW_TMPDIR}/fhs/bin"
 fetch_verified "fhs/boot/kernel.wasm" "${WW_TMPDIR}/fhs/boot/kernel.wasm"
 fetch_verified "fhs/bin/status.wasm" "${WW_TMPDIR}/fhs/bin/status.wasm"
+if [ -n "$expected_channel" ] || [ "$RELEASE_CID" = "$BOOTSTRAP_CID" ]; then
+  verify_descriptor
+fi
 spin_ok "Fetched verified package"
 
-# The candidate validates components, identity, ownership and configuration.
-# Its installer repeats preflight and uses atomic replacement for each file.
-# Multi-file installation is recoverable by rerunning this installer, not atomic.
-"${WW_TMPDIR}/ww" install --check --payload "${WW_TMPDIR}/fhs" \
-  --manifest "${WW_TMPDIR}/CHECKSUMS.txt" --signature "${WW_TMPDIR}/CHECKSUMS.txt.sig" \
-  --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
-  --ipfs-url "$BOOTSTRAP_IPFS_URL" --bootstrap-release "${IPFS_BASE#/ipfs/}"
-"${WW_TMPDIR}/ww" install --payload "${WW_TMPDIR}/fhs" \
-  --manifest "${WW_TMPDIR}/CHECKSUMS.txt" --signature "${WW_TMPDIR}/CHECKSUMS.txt.sig" \
-  --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
-  --ipfs-url "$BOOTSTRAP_IPFS_URL" --bootstrap-release "${IPFS_BASE#/ipfs/}"
+# These hashes come from the independently verified R1 manifest. The
+# selected release cannot choose the executable that validates its descriptor.
+case "$OS_NAME/$ARCH_NAME" in
+  linux/aarch64) verifier_hash=b69bc0047fad1e69de8b3cf55f0c4b66cfbd6c54d7973a3e89b4db485227b927 ;;
+  linux/x86_64) verifier_hash=edb12cd48e34cf13d60eeb9ac3b3789196a1f6d5e26a8b52a269a0952e42a9d8 ;;
+  macos/aarch64) verifier_hash=1fd3a88757d8a1068c0ead50b4b2b535af580ad3c51375ea423d7d069e473e84 ;;
+  macos/x86_64) verifier_hash=34d105775e63b9c6223414c8ee18b2f0ab1153ab51994ef37cbd6b2a13df4fb0 ;;
+esac
+verifier=$WW_TMPDIR/ww
+if [ "$RELEASE_CID" != "$BOOTSTRAP_CID" ]; then
+  verifier=$WW_TMPDIR/r1-verifier
+  ipfs cat "/ipfs/$BOOTSTRAP_CID/$BIN_PATH" > "$verifier" || die "Could not fetch R1 verifier"
+fi
+[ "$(file_sha256 "$verifier")" = "$verifier_hash" ] || die "R1 verifier checksum mismatch"
+chmod +x "$verifier"
+"$verifier" install --release "$RELEASE_CID" --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
+  --ipfs-url "$BOOTSTRAP_IPFS_URL"
 "${WW_HOME}/bin/ww" --version
-printf '\nInstalled Host, baseline FHS, and identity. Register a service separately with ww daemon install.\n'
+printf '\nInstalled Wetware in %s. Start the Host with "%s/bin/ww" run.\n' "$WW_HOME" "$WW_HOME"
+}

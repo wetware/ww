@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer carry backing-content ownership automatically.
 
 ### Added
+- Discover the signed release through `ww-release` when installing without arguments on macOS or Linux.
 - Add the R1 public release keyring at `doc/release-keys` with its SPKI fingerprint
   and independent trust-distribution instructions.
 - Filesystem-retention regression coverage for child descriptors after parent

@@ -2,6 +2,7 @@
 """Exercise real shell authentication with ephemeral keys and isolated transport."""
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -9,11 +10,10 @@ import tempfile
 import unittest
 
 from release_auth_fixture import (cid_bytes, cid_text, generate_key, manifest_root,
-                                  pb_field, sign_manifest, varint)
+                                  pb_field, pin_fixture_verifiers, R1_ROOT, sign_manifest, varint)
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALLER = REPO / 'scripts/install.sh'
-R1_ROOT = 'bafybeihdekx4kiimojt7l3qcl52xwrwiuukst4556ongnacbo4ulj4aqpi'
 R1_SPKI_SHA256 = 'c15cb2b5a66ab54bba27e39c79da23a3d927b52032b91df3456c8d4146f5b348'
 RELEASE_NAME = 'k51qzi5uqu5dgbw6eyddak3ozm2p2zwet8skgn8qzbwzb90d5obsnnwimvp14i'
 PLATFORMS = [('Linux', 'x86_64', 'linux/x86_64'),
@@ -52,13 +52,31 @@ esac
 case "$1" in
 id) exit "${TEST_ID_STATUS:-0}" ;;
 name)
+  [ "$*" = "name get $TEST_RELEASE_NAME" ] || exit 91
   cat "$TEST_DISCOVERY"
   exit "${TEST_RESOLVE_STATUS:-0}" ;;
+--offline)
+  [ -n "$IPFS_PATH" ] || exit 91
+  shift
+  case "$*" in
+    "name inspect --verify=$TEST_RELEASE_NAME --dump=false --enc=json") cat ;;
+    "init --profile=test") mkdir "$IPFS_PATH" ;;
+    "block put --cid-codec=dag-cbor")
+      cmp -s - "$TEST_DESCRIPTOR_BLOCK" || exit 91
+      cat "$TEST_RELEASE/RELEASE-DESCRIPTOR" ;;
+    "dag get $TEST_DESCRIPTOR_CID") cat "$TEST_DESCRIPTOR_JSON" ;;
+    *) exit 91 ;;
+  esac ;;
 block)
-  [ "$2" = get ] && [ "$3" = "$TEST_CID" ] || exit 91
+  [ "$2" = get ] || exit 91
+  if [ "$3" = "${TEST_DESCRIPTOR_CID:-}" ]; then cat "$TEST_DESCRIPTOR_BLOCK"; exit; fi
+  [ "$3" = "$TEST_CID" ] || exit 91
   [ "${FAIL_FETCH:-}" != root ] || exit 1
   cat "$TEST_ROOT_BLOCK" ;;
 cat)
+  case "$2" in
+    "/ipfs/$TEST_VERIFIER_ROOT/"*) cat "$TEST_VERIFIERS/${2#"/ipfs/$TEST_VERIFIER_ROOT/"}"; exit ;;
+  esac
   prefix=/ipfs/${TEST_CID:-test-release}/
   case "$2" in "$prefix"*) ;; *) exit 91 ;; esac
   path=${2#"$prefix"}
@@ -68,7 +86,7 @@ cat)
 esac
 ''')
         # The frozen legacy installer still invokes perform. This executable
-        # fixture models both consumers; the production CLI has no alias.
+        # fixture also records the first execution of the installed Host.
         binary = b'''#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$TEST_EXECUTIONS"
@@ -78,7 +96,20 @@ case "$*" in
 'install '*|'perform install '*) mkdir -p "$HOME/.ww/bin"; cp "$0" "$HOME/.ww/bin/ww" ;;
 esac
 '''
+        verifiers = {}
+        verifier_root = self.root / 'verifiers'
         for _, _, path in PLATFORMS:
+            verifier = verifier_root / 'bin/ww' / path / 'ww'
+            verifier.parent.mkdir(parents=True)
+            verifier.write_text(f'''#!/bin/sh
+set -eu
+printf 'verifier %s\n' "$*" >> "$TEST_VERIFIER_CALLS"
+[ "$1" = install ] || exit 91
+mkdir -p "$HOME/.ww/bin"
+cp "$TEST_RELEASE/bin/ww/{path}/ww" "$HOME/.ww/bin/ww"
+chmod +x "$HOME/.ww/bin/ww"
+''')
+            verifiers[path] = verifier
             target = self.release / 'bin/ww' / path / 'ww'
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(binary)
@@ -94,6 +125,10 @@ esac
                         TEST_OS='Linux', TEST_ARCH='x86_64', TEST_RELEASE=str(self.release),
                         TEST_EXECUTIONS=str(self.calls), TEST_TRANSPORT=str(self.transport),
                         TEST_PLATFORM_PROBES=str(self.probes), TEST_ROOT_BLOCK=str(self.root / 'root.block'))
+        self.verifier_calls = self.root / 'verifier-calls'
+        self.env.update(TEST_VERIFIER_ROOT=R1_ROOT, TEST_VERIFIERS=str(verifier_root),
+                        TEST_VERIFIER_CALLS=str(self.verifier_calls))
+        self.installer = pin_fixture_verifiers(INSTALLER, self.root / 'fixture-install.sh', verifiers)
         self.write_manifest()
 
     def script(self, name, body):
@@ -120,7 +155,7 @@ esac
         self.env['TEST_CID'] = self.release_cid
 
     def run_installer(self, verify=False, success=False, keys=None, legacy=False):
-        installer = REPO / 'tests/fixtures/release-auth/legacy-install.sh' if legacy else INSTALLER
+        installer = REPO / 'tests/fixtures/release-auth/legacy-install.sh' if legacy else self.installer
         args = ['sh', str(installer)]
         if not legacy:
             args += ['--trusted-release-keys', str(keys or self.keys)]
@@ -137,17 +172,10 @@ esac
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             if not verify and not legacy:
                 calls = self.calls.read_text().splitlines()[previous_calls:]
-                self.assertEqual(len(calls), 3, calls)
-                self.assertTrue(calls[0].startswith('install --check --payload '), calls)
-                self.assertTrue(calls[1].startswith('install --payload '), calls)
-                self.assertTrue(all(call.endswith(f' --bootstrap-release {self.release_cid}')
-                                    for call in calls[:2]), calls)
-                for call in calls[:2]:
-                    self.assertIn(' --manifest ', call)
-                    self.assertIn(' --signature ', call)
-                    self.assertIn(f' --trusted-release-keys {keys or self.keys} ', call)
-                self.assertEqual(calls[2], '--version')
-                self.assertFalse(any('--executable' in call for call in calls), calls)
+                self.assertEqual(calls, ['--version'])
+                verifier_call = self.verifier_calls.read_text().splitlines()[-1]
+                self.assertIn(f'install --release {self.release_cid} ', verifier_call)
+                self.assertIn('--trusted-release-keys ', verifier_call)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(self.calls.exists(), 'unauthenticated candidate executed')
@@ -163,7 +191,7 @@ esac
             with self.subTest(os=os_name, arch=arch):
                 self.env.update(TEST_OS=os_name, TEST_ARCH=arch)
                 self.run_installer(success=True)
-                self.assertEqual(len(self.calls.read_text().splitlines()), 3)
+                self.assertEqual(self.calls.read_text().splitlines(), ['--version'])
                 self.calls.unlink()
 
     def substituted_release(self, original_root):
@@ -201,6 +229,12 @@ esac
 
     def test_other_valid_manifest_under_requested_root_never_executes(self):
         self.substituted_release(original_root=True)
+
+    def test_substituted_bootstrap_verifier_never_executes(self):
+        verifier = Path(self.env['TEST_VERIFIERS']) / 'bin/ww/linux/x86_64/ww'
+        verifier.write_bytes(verifier.read_bytes() + b'\n# corrupted verifier\n')
+        self.run_installer()
+        self.assertFalse(self.verifier_calls.exists())
 
     def test_root_bytes_must_match_requested_cid_before_candidate_fetch(self):
         root = self.root / 'root.block'
@@ -338,22 +372,41 @@ esac
         self.assertEqual(after, before)
         return result
 
-    def automatic_fixture(self):
-        # A private installer copy provisions the fixture's trust anchor and
-        # immutable checkpoint. Production has no environment override for either.
-        content = INSTALLER.read_text()
+    def automatic_descriptor(self, channel):
+        # Real Map/DAG-CBOR envelope [1, {"channel": NAME}]. This transport
+        # fixture isolates channel binding. test_install.py uses a full descriptor.
+        text = channel.encode()
+        assert 23 < len(text) < 256
+        block = bytes.fromhex('8201a1676368616e6e656c78') + bytes([len(text)]) + text
+        cid = cid_text(block, 0x71)
+        descriptor = self.root / 'descriptor.cbor'
+        descriptor.write_bytes(block)
+        dag_json = self.root / 'descriptor.json'
+        dag_json.write_text(json.dumps([1, {'channel': channel}]))
+        (self.release / 'RELEASE-DESCRIPTOR').write_text(cid + '\n')
+        self.env.update(TEST_DESCRIPTOR_CID=cid, TEST_DESCRIPTOR_JSON=str(dag_json),
+                        TEST_DESCRIPTOR_BLOCK=str(descriptor))
+        self.write_manifest()
+        self.set_root(manifest_root(self.manifest.read_bytes(), block))
+
+    def automatic_fixture(self, channel=RELEASE_NAME):
+        self.automatic_descriptor(channel)
+        # Provision ephemeral test trust in a private installer copy.
+        content = self.installer.read_text()
         r1_key = (REPO / 'doc/release-keys').read_text().strip()
         self.assertEqual(hashlib.sha256(base64.b64decode(r1_key, validate=True)).hexdigest(),
                          R1_SPKI_SHA256)
-        for production, fixture in [(R1_ROOT, self.release_cid),
-                                    (r1_key, self.keys.read_text().strip()),
+        for production, fixture in [(r1_key, self.keys.read_text().strip()),
                                     ('/etc/wetware/release-keys', str(self.root / 'system-keys'))]:
             self.assertIn(production, content)
             content = content.replace(production, fixture)
         installer = self.root / 'install.sh'
         installer.write_text(content)
         self.discovery = self.root / 'resolved'
-        self.discovery.write_bytes(f'/ipfs/{self.release_cid}\n'.encode())
+        self.inspection = {"Entry": {"Value": f"/ipfs/{self.release_cid}"},
+                           "Validation": {"Valid": True, "Name": RELEASE_NAME}}
+        self.discovery.write_text(json.dumps(self.inspection))
+        self.env['TEST_RELEASE_NAME'] = RELEASE_NAME
         self.env['TEST_DISCOVERY'] = str(self.discovery)
         return installer
 
@@ -367,30 +420,34 @@ esac
             self.assertFalse(self.calls.exists(), 'rejected candidate executed')
         return result
 
-    def test_automatic_install_uses_checkpoint_and_embedded_key_all_platforms(self):
+    def test_automatic_install_uses_discovered_root_and_embedded_key_all_platforms(self):
         installer = self.automatic_fixture()
         for os_name, arch, path in PLATFORMS:
             with self.subTest(os=os_name, arch=arch):
                 self.env.update(TEST_OS=os_name, TEST_ARCH=arch)
                 self.auto_install(installer, success=True)
                 transport = self.transport.read_text().splitlines()
-                self.assertIn(f'name resolve --recursive=false --nocache /ipns/{RELEASE_NAME}', transport)
+                self.assertIn(f'name get {RELEASE_NAME}', transport)
                 self.assertIn(f'cat /ipfs/{self.release_cid}/bin/ww/{path}/ww', transport)
                 calls = self.calls.read_text().splitlines()
-                self.assertEqual(len(calls), 3)
-                self.assertIn('install --check ', calls[0])
-                self.assertIn(f'--bootstrap-release {self.release_cid}', calls[1])
-                self.assertEqual('--version', calls[2])
+                self.assertEqual(calls, ['--version'])
+                self.assertIn(f'cat /ipfs/{R1_ROOT}/bin/ww/{path}/ww', transport)
+                self.assertIn(f'install --release {self.release_cid}', self.verifier_calls.read_text())
                 self.calls.unlink()
                 self.transport.unlink()
 
-    def test_automatic_discovery_rejects_other_roots_and_malformed_output(self):
+    def test_invalid_ipns_and_malformed_targets_never_fetch_release_content(self):
         installer = self.automatic_fixture()
         valid = self.discovery.read_bytes()
-        for data in [f'/ipfs/{cid_text(b"other root")}\n'.encode(),
-                     valid[:-1], valid + b'\n', valid * 2, valid.replace(b'/', b'/\x00', 1),
-                     valid.rstrip() + b'/child\n', b'']:
-            with self.subTest(data=data):
+        malformed = [b'', b'{', b'x' * 10241]
+        for changes in ({"Valid": False}, {"Valid": 1}, {"Name": "wrong signer"}):
+            verdict = dict(self.inspection["Validation"], **changes)
+            malformed.append(json.dumps(dict(self.inspection, Validation=verdict)).encode())
+        for path in ("/ipns/" + RELEASE_NAME, "/ipfs/" + self.release_cid + "/child",
+                     "/ipfs/" + self.release_cid + "\n", "/ipfs/" + self.release_cid[:-1] + "b"):
+            malformed.append(json.dumps(dict(self.inspection, Entry={"Value": path})).encode())
+        for index, data in enumerate(malformed):
+            with self.subTest(case=index):
                 self.discovery.write_bytes(data)
                 self.auto_install(installer)
                 self.assertFalse(any(op.startswith(('cat ', 'block '))
@@ -401,20 +458,22 @@ esac
         self.auto_install(installer)
         self.assertNotIn('cat ', self.transport.read_text())
 
-    def test_automatic_discovery_rejects_previously_signed_release(self):
-        older = self.release_cid
-        (self.release / 'VERSION').write_text('later release\n')
-        self.write_manifest()
-        self.assertNotEqual(self.release_cid, older)
-        installer = self.automatic_fixture()
-        self.discovery.write_bytes(f'/ipfs/{older}\n'.encode())
+    def test_signed_release_for_another_channel_cannot_start_verifier(self):
+        installer = self.automatic_fixture(channel='k' * 62)
         self.auto_install(installer)
-        self.assertNotIn('cat ', self.transport.read_text())
+        self.assertFalse(self.verifier_calls.exists())
+
+    def test_changed_descriptor_cannot_start_verifier(self):
+        installer = self.automatic_fixture()
+        block = Path(self.env['TEST_DESCRIPTOR_BLOCK'])
+        block.write_bytes(bytes(len(block.read_bytes())))
+        self.auto_install(installer)
+        self.assertFalse(self.verifier_calls.exists())
 
     def test_explicit_install_and_verify_require_external_keyring(self):
         installer = self.automatic_fixture()
         self.auto_install(installer, '--release', self.release_cid)
-        self.assertNotIn('name resolve', self.transport.read_text())
+        self.assertNotIn('name get', self.transport.read_text())
         self.auto_install(installer, '--verify-manifest', str(self.manifest),
                           '--signature', str(self.signature))
 
@@ -458,7 +517,7 @@ esac
         signature = self.signature.read_bytes()
         self.signature.unlink()
         self.auto_install(installer)
-        self.sign(self.other_private)
+        sign_manifest(self.other_private, self.manifest)
         (self.release / 'release-keys').write_bytes(self.other_keys.read_bytes())
         self.auto_install(installer)
         self.signature.write_bytes(signature)
@@ -496,7 +555,7 @@ esac
     def test_install_forwards_configured_ipfs_endpoint(self):
         self.env['IPFS_API'] = 'http://127.0.0.1:41003'
         self.run_installer(success=True)
-        for call in self.calls.read_text().splitlines()[:2]:
+        for call in self.verifier_calls.read_text().splitlines():
             self.assertIn('--ipfs-url http://127.0.0.1:41003', call)
 
     def prepare_recovery(self, pointer=None):

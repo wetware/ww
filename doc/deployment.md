@@ -187,8 +187,9 @@ The public IPFS publication job and all private official release jobs remain hel
 
 Provision the current release IPNS identity independently from infra's accepted
 identity record; do not reuse the retired hardcoded name or initialize a new key.
-`scripts/install.sh` and fresh `ww install` require an explicit authenticated
-release selection. The shell installer does not discover releases automatically.
+The HTTPS installer embeds the accepted identity and discovers the release
+from its signed IPNS record. Standalone `ww install --release CID` uses an
+explicit immutable release.
 For an existing installation, `ww upgrade` supports authenticated IPNS selection
 with `WW_RELEASE_IPNS` or `--release-ipns`, while `--release CID` selects an
 immutable release explicitly. Channel checks persist freshness floors without

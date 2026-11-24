@@ -32,12 +32,13 @@ The second key exists only for a bounded operator-managed rotation.
 
 A separately provisioned keyring at `/etc/wetware/release-keys` or a path
 selected with `--trusted-release-keys` takes precedence over embedded trust.
-Only automatic bootstrap can use the embedded R1 key, and only for the exact
-reviewed release CID. The installer never obtains a key from release content.
+Automatic bootstrap uses the embedded R1 key when no local keyring is configured.
+The installer never obtains a key from release content.
 Explicit selection, recovery, and offline manifest verification require an
 external keyring.
 
-The installer and its checkpoint require independent authentication.
+The installer distributes the release key, expected IPNS identity, and four R1
+verifier digests over HTTPS.
 Compromise of the HTTPS origin, redirect target, or reviewed installer can
 replace both verification code and key. The installer requires OpenSSL 3.x or 4.x with
 Ed25519 support. Unsupported OpenSSL/LibreSSL fails closed. On macOS, place a
@@ -173,11 +174,10 @@ The frozen binding order is:
 `AuthenticatedRelease` verifies the signature, binding bytes, descriptor CID,
 schema, and manifest artifact bindings. Selection checks platform and Host/PID0
 compatibility. Artifact verification checks exact reconstructed bytes before use.
-The shell installer keeps its signed-manifest staging path during migration;
-it does not interpret descriptors or persist consumer freshness state. Zero-argument bootstrap requires the fixed IPNS name to resolve to the exact
-reviewed CID. A matching resolution carries no signing authority or sequence
-evidence. Recovery delegates typed verification to the staged Host
-only after independently verifying root-to-manifest membership and Host bytes.
+After the shell authenticates the staged manifest and payloads,
+the pinned R1 verifier authenticates and interprets the typed descriptor before installation.
+Zero-argument bootstrap verifies the raw IPNS record locally. A first-time
+consumer can accept an older valid record and has no global freshness proof.
 
 The Rust consumer records raw signed IPNS evidence and the signed release proof
 in one locked durable watermark. IPNS sequence and release sequence are separate

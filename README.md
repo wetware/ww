@@ -19,16 +19,21 @@ model running inside the cell.
 
 ## Run an authenticated release
 
-Run the installer from a reviewed checkout with Kubo running and OpenSSL 3.x
-or 4.x on `PATH`. The installer accepts the signed R1 release when the
-`ww-release` IPNS name resolves to its reviewed CID. Deployment of this
-installer at `https://wetware.run/install.sh` requires separate approval.
-See [installation](doc/installation.md).
+The canonical installer command for macOS and GNU/Linux on ARM64 and x86-64 is:
 
 ```sh
-sh scripts/install.sh
+curl -fsSL https://wetware.run/install.sh | sh
+```
+
+**Deployment pending.** The public redirect still serves the explicit-CID installer at
+`2842c69d3fdb1fe52da492358175e257bbd4b01d`. To use zero-argument installation
+before cutover, run `sh scripts/install.sh` from this reviewed revision.
+Install Kubo, start its daemon, and put Python 3 and OpenSSL 3.x or 4.x on
+`PATH`. See [installation and trust](doc/installation.md).
+
+```sh
 # Start in the foreground; query /status from another terminal.
-ww run --http-listen 127.0.0.1:2080
+"$HOME/.ww/bin/ww" run --http-listen 127.0.0.1:2080
 # In another terminal: curl http://localhost:2080/status
 ```
 

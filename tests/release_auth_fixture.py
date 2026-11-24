@@ -16,6 +16,27 @@ import threading
 from urllib.parse import parse_qs, urlsplit
 
 
+# These hashes identify the four R1 executables reviewed as bootstrap verifiers.
+R1_VERIFIERS = {
+    'macos/aarch64': '1fd3a88757d8a1068c0ead50b4b2b535af580ad3c51375ea423d7d069e473e84',
+    'macos/x86_64': '34d105775e63b9c6223414c8ee18b2f0ab1153ab51994ef37cbd6b2a13df4fb0',
+    'linux/aarch64': 'b69bc0047fad1e69de8b3cf55f0c4b66cfbd6c54d7973a3e89b4db485227b927',
+    'linux/x86_64': 'edb12cd48e34cf13d60eeb9ac3b3789196a1f6d5e26a8b52a269a0952e42a9d8',
+}
+R1_ROOT = 'bafybeihdekx4kiimojt7l3qcl52xwrwiuukst4556ongnacbo4ulj4aqpi'
+
+
+def pin_fixture_verifiers(source, destination, verifiers):
+    """Substitute only the verifier pins in a private test copy of install.sh."""
+    content = source.read_text()
+    for platform_name, binary in verifiers.items():
+        original = R1_VERIFIERS[platform_name]
+        assert content.count(original) == 1, platform_name
+        content = content.replace(original, hashlib.sha256(binary.read_bytes()).hexdigest())
+    destination.write_text(content)
+    return destination
+
+
 def varint(value):
     encoded = bytearray()
     while value >= 128:
@@ -191,14 +212,23 @@ class ReleaseMetadataServer:
                     key = (parsed.path, query['arg'][0])
                     fixture.requests.append(key)
                     body = fixture.routes[key]
-                    assert len(body) <= 2 * 1024 * 1024
+                    if isinstance(body, Path):
+                        size = body.stat().st_size
+                        assert 0 < size <= 1024 * 1024 * 1024
+                    else:
+                        size = len(body)
+                        assert size <= 2 * 1024 * 1024
                 except (AssertionError, KeyError, ValueError):
                     self.send_error(404, 'unexpected fixture request')
                     return
                 self.send_response(200)
-                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Content-Length', str(size))
                 self.end_headers()
-                self.wfile.write(body)
+                if isinstance(body, Path):
+                    with body.open('rb') as artifact:
+                        shutil.copyfileobj(artifact, self.wfile)
+                else:
+                    self.wfile.write(body)
 
             def log_message(self, *_):
                 pass
