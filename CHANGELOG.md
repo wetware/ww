@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+- Update workspace dependencies affected by RustSec advisories, including Quinn,
+  rustls, and zstd. Remove two obsolete `hickory-proto` audit exceptions.
+
 ### Changed
 - Run mandatory source-container qualification alongside native release builds,
   retaining exact-revision checks and publication gates. Add a validation-only
