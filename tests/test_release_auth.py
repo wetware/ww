@@ -401,6 +401,25 @@ esac
         self.auto_install(installer)
         self.assertNotIn('cat ', self.transport.read_text())
 
+    def test_embedded_key_permissions_with_group_writable_umask(self):
+        # Capture the key passed to the staged Host before installer cleanup.
+        host = self.release / 'bin/ww/linux/x86_64/ww'
+        probe = b'''
+if [ "$1" = install ]; then
+  (
+    while [ "$1" != --trusted-release-keys ]; do shift; done
+    cp -p "$2" "$HOME/observed-key"
+  )
+fi
+'''
+        host.write_bytes(host.read_bytes().replace(b'set -eu\n', b'set -eu\n' + probe))
+        self.write_manifest()
+        installer = self.automatic_fixture()
+        result = subprocess.run(['sh', str(installer)], env=self.env, umask=0o002,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.home / 'observed-key').stat().st_mode & 0o777, 0o600)
+
     def test_automatic_discovery_rejects_previously_signed_release(self):
         older = self.release_cid
         (self.release / 'VERSION').write_text('later release\n')
