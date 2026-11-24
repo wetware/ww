@@ -61,8 +61,29 @@ producer archive. Missing, substituted, stale or inconsistent inputs fail closed
 Public CI has no release packager and emits no `release-input.car`.
 
 The existing tested container image remains a separate raw `tested-image.tar`
-artifact. Its image job still requires the exact tested digest. This change does
-not enable release publication or modify the image job's admission conditions.
+artifact. Its image job still requires the exact tested digest.
+
+### Parallel source-container qualification
+
+`validate-source-container` starts after `build-wasm` and consumes the current
+run's `wasm-artifacts/target/fhs`. It builds `Containerfile` with `github.sha`,
+boots the image, checks its revision and canonical FHS bytes, then records
+`github.run_attempt`. Native producers and Host tests can run concurrently.
+The job retains the existing full-qualification trigger and adds no compiler cache.
+
+`validate-release` joins source qualification, Host tests, WASM and all five
+native producers. Its first step rejects any non-success dependency result and
+any missing or stale source qualification attempt before artifact validation or
+receipt uploads. A partial rerun cannot reuse source qualification from an older
+attempt. Rerun all jobs to qualify a new attempt. Producer provenance checks,
+artifact-container boots, FHS comparisons and private admission remain required.
+
+For branch measurements, dispatch `rust.yml` with `validation_only=true`.
+This explicit mode runs the full qualification graph on the selected revision
+and disables Pages generation/deployment and GHCR publication. The IPFS
+publication hold remains unconditional. The default remains `false`; ordinary
+PRs and master release triggers retain their existing scope. A validation-only
+run is measurement evidence, not an official publication authorization.
 
 ## Private signed handoff
 

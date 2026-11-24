@@ -5,7 +5,12 @@ on:
     branches: [ "master", "staging" ]
   pull_request:
     branches: [ "master", "staging" ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      validation_only:
+        description: Run full qualification without image publication or Pages deployment
+        type: boolean
+        default: false
 
 # Serialize release-producing runs per ref so image + IPNS publication from
 # different commits cannot interleave. Retain every pending run. The durable
@@ -588,9 +593,9 @@ jobs:
   build-architecture-map:
     name: Build architecture map
     if: >-
-      github.event_name == 'workflow_dispatch'
+      !inputs.validation_only && (github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/master'
-          && needs.changes.outputs.architecture_map == 'true')
+          && needs.changes.outputs.architecture_map == 'true'))
     needs: [changes, fmt, clippy, solidity, build, test, test-architecture-map]
     runs-on: ubuntu-latest
     permissions:
@@ -752,15 +757,71 @@ jobs:
         if-no-files-found: error
         retention-days: 1
 
+  # Source compilation consumes only canonical WASM, not native producer outputs.
+  validate-source-container:
+    name: Validate source container boot
+    if: >-
+      (github.ref == 'refs/heads/master'
+       && (github.event_name == 'workflow_dispatch'
+           || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
+      || (github.event_name == 'workflow_dispatch' && inputs.validation_only)
+    needs: [changes, build-wasm]
+    runs-on: ubuntu-latest
+    outputs:
+      qualified_attempt: ${{ steps.qualification.outputs.attempt }}
+    steps:
+    - uses: actions/checkout@v5
+    - uses: actions/download-artifact@v8
+      with:
+        name: wasm-artifacts
+        path: artifacts/wasm-artifacts
+    - name: Report resources before source build
+      run: |
+        df -B1 .
+        docker system df
+    - name: Build and boot source container
+      run: |
+        mkdir -p std/kernel/bin std/status/bin
+        cp artifacts/wasm-artifacts/target/fhs/boot/kernel.wasm std/kernel/bin/main.wasm
+        cp artifacts/wasm-artifacts/target/fhs/bin/status.wasm std/status/bin/status.wasm
+        docker build --build-arg WW_BUILD_GIT_SHA="${{ github.sha }}" -f Containerfile -t ww-validated:source .
+        bash tests/test_container_boot.sh ww-validated:source artifacts/wasm-artifacts/target/fhs
+    - name: Record source qualification attempt
+      id: qualification
+      run: echo 'attempt=${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+    - name: Report resources after source build
+      if: ${{ always() }}
+      run: |
+        df -B1 .
+        docker system df
+
   validate-release:
     name: Validate release packages and container boot
     if: >-
-      github.ref == 'refs/heads/master'
-      && (github.event_name == 'workflow_dispatch'
-          || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')
-    needs: [changes, test, build-binaries, build-wasm]
+      always() && (
+      (github.ref == 'refs/heads/master'
+       && (github.event_name == 'workflow_dispatch'
+           || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
+      || (github.event_name == 'workflow_dispatch' && inputs.validation_only)
+      )
+    needs: [changes, test, build-binaries, build-wasm, validate-source-container]
     runs-on: ubuntu-latest
     steps:
+    # Run even when a prerequisite is skipped/cancelled; reject before uploads.
+    - name: Require current-attempt full qualification
+      env:
+        SOURCE_RESULT: ${{ needs.validate-source-container.result }}
+        SOURCE_ATTEMPT: ${{ needs.validate-source-container.outputs.qualified_attempt }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+        TEST_RESULT: ${{ needs.test.result }}
+        PRODUCER_RESULT: ${{ needs.build-binaries.result }}
+        WASM_RESULT: ${{ needs.build-wasm.result }}
+      run: |
+        test "$SOURCE_RESULT" = success
+        test "$SOURCE_ATTEMPT" = "$RUN_ATTEMPT"
+        test "$TEST_RESULT" = success
+        test "$PRODUCER_RESULT" = success
+        test "$WASM_RESULT" = success
     - uses: actions/checkout@v5
     - uses: ./.github/actions/setup-kubo
     - uses: actions/download-artifact@v8
@@ -787,13 +848,6 @@ jobs:
         bash tests/test_container_boot.sh ww-validated:deploy artifacts/ww-linux-x86_64/fhs
         docker build --build-arg TARGETARCH=amd64 -f Containerfile.release -t ww-validated:release deploy-context
         bash tests/test_container_boot.sh ww-validated:release artifacts/ww-linux-x86_64/fhs release
-    - name: Build and boot source container
-      run: |
-        mkdir -p std/kernel/bin std/status/bin
-        cp artifacts/ww-linux-x86_64/fhs/boot/kernel.wasm std/kernel/bin/main.wasm
-        cp artifacts/ww-linux-x86_64/fhs/bin/status.wasm std/status/bin/status.wasm
-        docker build --build-arg WW_BUILD_GIT_SHA="${{ github.sha }}" -f Containerfile -t ww-validated:source .
-        bash tests/test_container_boot.sh ww-validated:source artifacts/ww-linux-x86_64/fhs
     - name: Record validated producer source inputs
       run: |
         mkdir -p release-source/scripts
@@ -829,12 +883,14 @@ jobs:
   release_image:
     name: Build and publish ww-master image
     if: >-
-      !cancelled() && github.ref == 'refs/heads/master'
+      !cancelled() && !inputs.validation_only && github.ref == 'refs/heads/master'
       && needs.test.result == 'success' && needs.validate-release.result == 'success'
+      && needs.validate-source-container.result == 'success'
+      && needs.validate-source-container.outputs.qualified_attempt == github.run_attempt
       && (github.event_name == 'workflow_dispatch'
           || (github.event_name == 'push' && github.ref == 'refs/heads/master'
               && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')))
-    needs: [changes, test, validate-release]
+    needs: [changes, test, validate-release, validate-source-container]
     runs-on: ubuntu-latest
     environment: master
     permissions:

@@ -81,7 +81,11 @@ fi
 if grep -Fq 'fetch_previous_binaries' "$WORKFLOW"; then
   fail "std-only releases must consume the current run's Host binaries"
 fi
-for condition in "needs.test.result == 'success'" "needs.validate-release.result == 'success'"; do
+for condition in \
+  "needs.test.result == 'success'" \
+  "needs.validate-release.result == 'success'" \
+  "needs.validate-source-container.result == 'success'" \
+  'needs.validate-source-container.outputs.qualified_attempt == github.run_attempt'; do
   grep -Fq "$condition" <<<"$release_job" || fail "GHCR must fail closed on $condition"
 done
 # The hold supersedes the former success-dependent publication condition.
@@ -171,6 +175,84 @@ for old, new in mutations:
 print(f'PASS: producer artifact contract and {len(mutations)} mutation controls')
 PYGUARD
 
+# Execute the workflow's actual join gate, including failure and partial reruns.
+python3 - "$WORKFLOW" <<'PYQUALIFICATION'
+from itertools import product
+from pathlib import Path
+import os
+import re
+import subprocess
+import sys
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+text = Path(sys.argv[1]).read_text()
+jobs = dict(re.findall(r'^  ([a-z][a-z0-9_-]*):\n(.*?)(?=^  [a-z][a-z0-9_-]*:|\Z)', text, re.M | re.S))
+source = jobs['validate-source-container']
+validation = jobs['validate-release']
+require('    needs: [changes, test, validate-release, validate-source-container]\n' in jobs['release_image'],
+        'image-only reruns must directly bind source qualification')
+require('    needs: [changes, build-wasm]\n' in source, 'source must run independently of native producers and Host tests')
+require('    needs: [changes, test, build-binaries, build-wasm, validate-source-container]\n' in validation,
+        'release qualification must join every required producer and source validation')
+require('always()' in validation.split('    steps:', 1)[0], 'join must evaluate failed or skipped prerequisites')
+require('ww-validated:source' not in validation, 'source build must leave the serial artifact-validation job')
+require('name: wasm-artifacts' in source, 'source must consume canonical WASM artifacts')
+require('path: artifacts/wasm-artifacts' in source, 'source inputs must remain isolated from the checkout')
+for command in (
+    'cp artifacts/wasm-artifacts/target/fhs/boot/kernel.wasm std/kernel/bin/main.wasm',
+    'cp artifacts/wasm-artifacts/target/fhs/bin/status.wasm std/status/bin/status.wasm',
+    'docker build --build-arg WW_BUILD_GIT_SHA="${{ github.sha }}" -f Containerfile -t ww-validated:source .',
+    'bash tests/test_container_boot.sh ww-validated:source artifacts/wasm-artifacts/target/fhs',
+):
+    require(command in source, 'canonical exact-revision source qualification missing: ' + command)
+dispatch = text.split('  workflow_dispatch:\n', 1)[1].split('\n#', 1)[0]
+require('validation_only:' in dispatch and 'type: boolean' in dispatch and 'default: false' in dispatch,
+        'measurement dispatch must be an explicit boolean opt-in')
+for job in ('release_image', 'build-architecture-map'):
+    require('!inputs.validation_only' in jobs[job].split('    steps:', 1)[0],
+            'measurement dispatch must not publish: ' + job)
+require('qualified_attempt: ${{ steps.qualification.outputs.attempt }}' in source,
+        'source must expose the completed qualification attempt')
+source_steps = re.split(r'^    - ', source, flags=re.M)[1:]
+boot = next(i for i, step in enumerate(source_steps) if 'bash tests/test_container_boot.sh ww-validated:source' in step)
+qualification = next(i for i, step in enumerate(source_steps) if 'id: qualification' in step)
+require(qualification >= boot, 'attempt receipt must follow source boot')
+require('github.run_attempt' in source_steps[qualification] and '$GITHUB_OUTPUT' in source_steps[qualification],
+        'attempt receipt must bind the current run attempt')
+require('if:' not in source_steps[qualification], 'failed boot must not emit an attempt receipt')
+first = re.split(r'^    - ', validation, flags=re.M)[1]
+require('Require current-attempt full qualification' in first, 'qualification gate must precede artifact checks and uploads')
+require('if:' not in first, 'qualification gate must not be conditional')
+for variable, expression in {
+    'SOURCE_RESULT': 'needs.validate-source-container.result',
+    'SOURCE_ATTEMPT': 'needs.validate-source-container.outputs.qualified_attempt',
+    'RUN_ATTEMPT': 'github.run_attempt',
+    'TEST_RESULT': 'needs.test.result',
+    'PRODUCER_RESULT': 'needs.build-binaries.result',
+    'WASM_RESULT': 'needs.build-wasm.result',
+}.items():
+    require(f'{variable}: ${{{{ {expression} }}}}' in first, 'incorrect gate binding: ' + variable)
+script = first.split('      run: |\n', 1)[1]
+script = '\n'.join(line[8:] for line in script.splitlines() if line.strip())
+statuses = ('success', 'failure', 'cancelled', 'skipped', '')
+variables = ('SOURCE_RESULT', 'TEST_RESULT', 'PRODUCER_RESULT', 'WASM_RESULT')
+cases = 0
+for results in product(statuses, repeat=len(variables)):
+    env = dict(os.environ, **dict(zip(variables, results)), SOURCE_ATTEMPT='2', RUN_ATTEMPT='2')
+    passed = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], env=env).returncode == 0
+    require(passed == all(result == 'success' for result in results), 'incorrect gate outcome: ' + repr(results))
+    cases += 1
+for attempt in ('1', '', '3'):
+    env = dict(os.environ, **dict.fromkeys(variables, 'success'), SOURCE_ATTEMPT=attempt, RUN_ATTEMPT='2')
+    require(subprocess.run(['bash', '-euo', 'pipefail', '-c', script], env=env).returncode != 0,
+            'gate accepted stale or missing source attempt: ' + repr(attempt))
+    cases += 1
+print(f'PASS: parallel source dependency graph and {cases} executed qualification cases')
+PYQUALIFICATION
+
 # Freeze the existing job-level admission controls during the maintenance hold.
 # This covers ordinary Rust/metrics CI, release validation, GHCR and Pages.
 # YAML/action validation is separate; this check follows the workflow's layout.
@@ -211,9 +293,9 @@ expected_admission="$({
     if: ${{ always() }}
   build-architecture-map:
     if: >-
-      github.event_name == 'workflow_dispatch'
+      !inputs.validation_only && (github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/master'
-          && needs.changes.outputs.architecture_map == 'true')
+          && needs.changes.outputs.architecture_map == 'true'))
     needs: [changes, fmt, clippy, solidity, build, test, test-architecture-map]
   deploy-architecture-map:
     if: ${{ needs.build-architecture-map.result == 'success' }}
@@ -224,20 +306,32 @@ expected_admission="$({
       || (github.event_name == 'push' && github.ref == 'refs/heads/master'
           && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
     needs: [changes, fmt, clippy, solidity, build, build-wasm]
+  validate-source-container:
+    if: >-
+      (github.ref == 'refs/heads/master'
+       && (github.event_name == 'workflow_dispatch'
+           || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
+      || (github.event_name == 'workflow_dispatch' && inputs.validation_only)
+    needs: [changes, build-wasm]
   validate-release:
     if: >-
-      github.ref == 'refs/heads/master'
-      && (github.event_name == 'workflow_dispatch'
-          || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')
-    needs: [changes, test, build-binaries, build-wasm]
+      always() && (
+      (github.ref == 'refs/heads/master'
+       && (github.event_name == 'workflow_dispatch'
+           || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
+      || (github.event_name == 'workflow_dispatch' && inputs.validation_only)
+      )
+    needs: [changes, test, build-binaries, build-wasm, validate-source-container]
   release_image:
     if: >-
-      !cancelled() && github.ref == 'refs/heads/master'
+      !cancelled() && !inputs.validation_only && github.ref == 'refs/heads/master'
       && needs.test.result == 'success' && needs.validate-release.result == 'success'
+      && needs.validate-source-container.result == 'success'
+      && needs.validate-source-container.outputs.qualified_attempt == github.run_attempt
       && (github.event_name == 'workflow_dispatch'
           || (github.event_name == 'push' && github.ref == 'refs/heads/master'
               && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')))
-    needs: [changes, test, validate-release]
+    needs: [changes, test, validate-release, validate-source-container]
 ADMISSION
 })"
 [[ "$actual_admission" == "$expected_admission" ]] \
