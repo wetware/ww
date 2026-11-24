@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer carry backing-content ownership automatically.
 
 ### Added
+- Install the signed R1 release with zero arguments when `ww-release` resolves to the reviewed CID.
 - Add the R1 public release keyring at `doc/release-keys` with its SPKI fingerprint
   and independent trust-distribution instructions.
 - Filesystem-retention regression coverage for child descriptors after parent
