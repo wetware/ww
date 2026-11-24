@@ -155,8 +155,9 @@ multiprocess coordination or secure monotonic storage.
 ## Artifact publication
 
 Public CI builds and validates Host binaries, the canonical FHS, and container
-images. It exports unsigned release input as `release-input.car`, preserving
-original producer receipts. An unsigned input CAR is not an authenticated release.
+images. It exports five Host/FHS archives and one `release-source` archive,
+preserving original producer receipts. These build inputs are not an authenticated
+release. See the [producer artifact contract](release-publisher-infra-contract.md).
 
 After separately approved production activation, the implemented official path is:
 
