@@ -476,6 +476,18 @@ chmod +x "$HOME/.ww/bin/ww"
         self.auto_install(installer)
         self.assertFalse(self.verifier_calls.exists())
 
+    def test_large_existing_transport_log_does_not_limit_metadata_fetch(self):
+        installer = self.automatic_fixture()
+        self.transport.write_bytes(b'x' * (1024 * 1024 + 1))
+        self.auto_install(installer, success=True)
+
+    def test_oversized_descriptor_binding_refused_before_verifier(self):
+        installer = self.automatic_fixture()
+        (self.release / 'RELEASE-DESCRIPTOR').write_bytes(b'x' * 129)
+        result = self.auto_install(installer)
+        self.assertIn('exceeds metadata size limit', result.stderr)
+        self.assertFalse(self.verifier_calls.exists())
+
     def test_changed_descriptor_cannot_start_verifier(self):
         installer = self.automatic_fixture()
         block = Path(self.env['TEST_DESCRIPTOR_BLOCK'])

@@ -121,10 +121,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Bound only the returned metadata. A process-wide file size limit also
+# affects unrelated writes by the Kubo CLI, including diagnostics.
+fetch_bounded() {
+  python3 -I - "$@" <<'PYTHON'
+import subprocess
+import sys
+
+limit = int(sys.argv[1])
+with subprocess.Popen(["ipfs", *sys.argv[2:]], stdout=subprocess.PIPE) as command:
+    data = command.stdout.read(limit + 1)
+    if len(data) > limit:
+        command.kill()
+        sys.exit("Kubo response exceeds metadata size limit")
+    if command.wait() != 0:
+        sys.exit(1)
+sys.stdout.buffer.write(data)
+PYTHON
+}
+
 # Fetch the wire record through the configured Kubo CLI. Inspect it with the
 # local Kubo executable in a private, empty repo path, without a daemon.
 discover_release() {
-  (ulimit -f 20 && ipfs name get "$RELEASE_IPNS") > "$WW_TMPDIR/ipns-record" \
+  fetch_bounded 10240 name get "$RELEASE_IPNS" > "$WW_TMPDIR/ipns-record" \
     || die "Cannot fetch ww-release. Check Kubo connectivity and support for ipfs name get."
   [ -s "$WW_TMPDIR/ipns-record" ] && [ "$(wc -c < "$WW_TMPDIR/ipns-record")" -le 10240 ] \
     || die "Invalid ww-release IPNS record size"
@@ -509,9 +528,11 @@ verify_release_binding
 fetch_verified() {
   package_path="$1"
   staged_path="$2"
-  if ! ipfs cat "${IPFS_BASE}/${package_path}" > "$staged_path"; then
-    die "Could not fetch mandatory payload: ${package_path}"
-  fi
+  if [ "$#" -eq 3 ]; then
+    fetch_bounded "$3" cat "${IPFS_BASE}/${package_path}"
+  else
+    ipfs cat "${IPFS_BASE}/${package_path}"
+  fi > "$staged_path" || die "Could not fetch mandatory payload: ${package_path}"
   [ -s "$staged_path" ] || die "Mandatory payload is empty: ${package_path}"
   expected=$(awk -v path="$package_path" '
     NR > 1 && $2 == path { count++; hash=$1 }
@@ -532,7 +553,7 @@ file_sha256() {
 }
 
 verify_descriptor() {
-  (ulimit -f 1 && fetch_verified "RELEASE-DESCRIPTOR" "$WW_TMPDIR/binding") \
+  fetch_verified "RELEASE-DESCRIPTOR" "$WW_TMPDIR/binding" 128 \
     || die "Cannot authenticate release descriptor binding"
   descriptor_cid=$(python3 -I - "$WW_TMPDIR" <<'PY'
 import base64
@@ -550,7 +571,7 @@ if (stage / "binding").read_bytes() != (cid + "\n").encode():
 print(cid)
 PY
   ) || die "Invalid release descriptor binding"
-  (ulimit -f 2048 && ipfs block get "$descriptor_cid") > "$WW_TMPDIR/descriptor.cbor" \
+  fetch_bounded 1048576 block get "$descriptor_cid" > "$WW_TMPDIR/descriptor.cbor" \
     || die "Cannot fetch release descriptor block"
   [ "$(wc -c < "$WW_TMPDIR/descriptor.cbor")" -eq "$(awk '{print $2}' "$WW_TMPDIR/descriptor-link")" ] \
     || die "Release descriptor size mismatch"
