@@ -13,6 +13,9 @@ from release_auth_fixture import (cid_bytes, cid_text, generate_key, manifest_ro
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALLER = REPO / 'scripts/install.sh'
+R1_ROOT = 'bafybeihdekx4kiimojt7l3qcl52xwrwiuukst4556ongnacbo4ulj4aqpi'
+R1_SPKI_SHA256 = 'c15cb2b5a66ab54bba27e39c79da23a3d927b52032b91df3456c8d4146f5b348'
+RELEASE_NAME = 'k51qzi5uqu5dgbw6eyddak3ozm2p2zwet8skgn8qzbwzb90d5obsnnwimvp14i'
 PLATFORMS = [('Linux', 'x86_64', 'linux/x86_64'),
              ('Linux', 'aarch64', 'linux/aarch64'),
              ('Darwin', 'x86_64', 'macos/x86_64'),
@@ -47,7 +50,10 @@ esac
 ''')
         self.script('ipfs', '''printf '%s\n' "$*" >> "$TEST_TRANSPORT"
 case "$1" in
-id) exit 0 ;;
+id) exit "${TEST_ID_STATUS:-0}" ;;
+name)
+  cat "$TEST_DISCOVERY"
+  exit "${TEST_RESOLVE_STATUS:-0}" ;;
 block)
   [ "$2" = get ] && [ "$3" = "$TEST_CID" ] || exit 91
   [ "${FAIL_FETCH:-}" != root ] || exit 1
@@ -332,9 +338,134 @@ esac
         self.assertEqual(after, before)
         return result
 
-    def test_release_selection_is_required_before_transport(self):
-        result = self.refuse_before_transport([])
-        self.assertIn('--release', result.stderr)
+    def automatic_fixture(self):
+        # A private installer copy provisions the fixture's trust anchor and
+        # immutable checkpoint. Production has no environment override for either.
+        content = INSTALLER.read_text()
+        r1_key = (REPO / 'doc/release-keys').read_text().strip()
+        self.assertEqual(hashlib.sha256(base64.b64decode(r1_key, validate=True)).hexdigest(),
+                         R1_SPKI_SHA256)
+        for production, fixture in [(R1_ROOT, self.release_cid),
+                                    (r1_key, self.keys.read_text().strip()),
+                                    ('/etc/wetware/release-keys', str(self.root / 'system-keys'))]:
+            self.assertIn(production, content)
+            content = content.replace(production, fixture)
+        installer = self.root / 'install.sh'
+        installer.write_text(content)
+        self.discovery = self.root / 'resolved'
+        self.discovery.write_bytes(f'/ipfs/{self.release_cid}\n'.encode())
+        self.env['TEST_DISCOVERY'] = str(self.discovery)
+        return installer
+
+    def auto_install(self, installer, *args, success=False):
+        result = subprocess.run(['sh', str(installer), *args], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        if success:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(self.calls.exists(), 'rejected candidate executed')
+        return result
+
+    def test_automatic_install_uses_checkpoint_and_embedded_key_all_platforms(self):
+        installer = self.automatic_fixture()
+        for os_name, arch, path in PLATFORMS:
+            with self.subTest(os=os_name, arch=arch):
+                self.env.update(TEST_OS=os_name, TEST_ARCH=arch)
+                self.auto_install(installer, success=True)
+                transport = self.transport.read_text().splitlines()
+                self.assertIn(f'name resolve --recursive=false --nocache /ipns/{RELEASE_NAME}', transport)
+                self.assertIn(f'cat /ipfs/{self.release_cid}/bin/ww/{path}/ww', transport)
+                calls = self.calls.read_text().splitlines()
+                self.assertEqual(len(calls), 3)
+                self.assertIn('install --check ', calls[0])
+                self.assertIn(f'--bootstrap-release {self.release_cid}', calls[1])
+                self.assertEqual('--version', calls[2])
+                self.calls.unlink()
+                self.transport.unlink()
+
+    def test_automatic_discovery_rejects_other_roots_and_malformed_output(self):
+        installer = self.automatic_fixture()
+        valid = self.discovery.read_bytes()
+        for data in [f'/ipfs/{cid_text(b"other root")}\n'.encode(),
+                     valid[:-1], valid + b'\n', valid * 2, valid.replace(b'/', b'/\x00', 1),
+                     valid.rstrip() + b'/child\n', b'']:
+            with self.subTest(data=data):
+                self.discovery.write_bytes(data)
+                self.auto_install(installer)
+                self.assertFalse(any(op.startswith(('cat ', 'block '))
+                                     for op in self.transport.read_text().splitlines()))
+                self.transport.unlink()
+        self.discovery.write_bytes(valid)
+        self.env['TEST_RESOLVE_STATUS'] = '1'
+        self.auto_install(installer)
+        self.assertNotIn('cat ', self.transport.read_text())
+
+    def test_automatic_discovery_rejects_previously_signed_release(self):
+        older = self.release_cid
+        (self.release / 'VERSION').write_text('later release\n')
+        self.write_manifest()
+        self.assertNotEqual(self.release_cid, older)
+        installer = self.automatic_fixture()
+        self.discovery.write_bytes(f'/ipfs/{older}\n'.encode())
+        self.auto_install(installer)
+        self.assertNotIn('cat ', self.transport.read_text())
+
+    def test_explicit_install_and_verify_require_external_keyring(self):
+        installer = self.automatic_fixture()
+        self.auto_install(installer, '--release', self.release_cid)
+        self.assertNotIn('name resolve', self.transport.read_text())
+        self.auto_install(installer, '--verify-manifest', str(self.manifest),
+                          '--signature', str(self.signature))
+
+    def test_automatic_discovery_requires_kubo_and_supported_platform(self):
+        installer = self.automatic_fixture()
+        self.env['TEST_ID_STATUS'] = '1'
+        self.auto_install(installer)
+        self.assertEqual(['id'], self.transport.read_text().splitlines())
+        self.transport.unlink()
+        self.env.update(TEST_ID_STATUS='0', TEST_ARCH='riscv64')
+        result = self.auto_install(installer)
+        self.assertIn('Unsupported architecture', result.stderr)
+        self.assertFalse(self.transport.exists())
+
+    def test_automatic_discovery_refuses_existing_consumer_state(self):
+        installer = self.automatic_fixture()
+        state = self.home / '.ww/release-consumer'
+        state.parent.mkdir()
+        state.mkdir()
+        self.auto_install(installer)
+        state.rmdir()
+        state.symlink_to('missing')
+        self.auto_install(installer)
+        self.assertTrue(state.is_symlink())
+
+    def test_configured_keyring_excludes_embedded_authority(self):
+        installer = self.automatic_fixture()
+        system_keys = self.root / 'system-keys'
+        system_keys.write_bytes(self.other_keys.read_bytes())
+        self.auto_install(installer)
+        self.auto_install(installer, '--trusted-release-keys', str(self.keys), success=True)
+        self.calls.unlink()
+        system_keys.unlink()
+        system_keys.symlink_to('missing')
+        self.auto_install(installer)
+        system_keys.unlink()
+        self.auto_install(installer, '--trusted-release-keys', str(system_keys))
+
+    def test_automatic_install_rejects_missing_signature_and_substituted_bytes(self):
+        installer = self.automatic_fixture()
+        signature = self.signature.read_bytes()
+        self.signature.unlink()
+        self.auto_install(installer)
+        self.sign(self.other_private)
+        (self.release / 'release-keys').write_bytes(self.other_keys.read_bytes())
+        self.auto_install(installer)
+        self.signature.write_bytes(signature)
+        (self.release / 'bin/ww/linux/x86_64/ww').write_bytes(b'changed executable')
+        result = self.auto_install(installer)
+        self.assertIn('Checksum mismatch', result.stderr)
+        self.assertNotIn('/release-keys', self.transport.read_text())
 
     def test_release_rejects_paths_and_malformed_cids_before_transport(self):
         for value in ('test-release', '/ipfs/' + self.release_cid, '/ipns/untrusted',
@@ -377,7 +508,8 @@ esac
 
     def test_recovery_requires_canonical_local_locator_or_explicit_release(self):
         self.prepare_recovery()
-        cases = [None, b'', b'{}', b'{"version":2,"release":"' + self.release_cid.encode() + b'"}',
+        cases = [None, b'', b'{}', b'{"version":1,"release":""}',
+                 b'{"version":2,"release":"' + self.release_cid.encode() + b'"}',
                  b'{"version":1,"release":"' + self.release_cid.encode() + b'"}\n',
                  b'{"release":"' + self.release_cid.encode() + b'","version":1}',
                  b'{"version":1,"release":"/ipns/untrusted"}',
