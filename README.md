@@ -19,14 +19,14 @@ model running inside the cell.
 
 ## Run an authenticated release
 
-Production signing, IPFS publication, DNSLink and `/install` activation remain
-held. The public `/install` endpoint is in maintenance; it is not a working
-bootstrap path. The commands below use `scripts/install.sh` from a reviewed
-checkout and require an available signed release CID, independently provisioned
-public trust, and running Kubo. See [installation](doc/installation.md).
+Run the installer from a reviewed checkout with Kubo running and OpenSSL 3.x
+or 4.x on `PATH`. The installer accepts the signed R1 release when the
+`ww-release` IPNS name resolves to its reviewed CID. Deployment of this
+installer at `https://wetware.run/install.sh` requires separate approval.
+See [installation](doc/installation.md).
 
 ```sh
-sh scripts/install.sh --release "$RELEASE_CID"
+sh scripts/install.sh
 # Start in the foreground; query /status from another terminal.
 ww run --http-listen 127.0.0.1:2080
 # In another terminal: curl http://localhost:2080/status
@@ -58,17 +58,13 @@ narrow `Membrane` containing only `peerId` and `Stat`.
 
 ### Install
 
-Use a reviewed checkout and the signed-release prerequisites above. Before
-running the command, set `RELEASE_CID` to the selected signed release and provision
-the independent release keyring. Production activation remains held; the command
-does not supply a release or trust anchor.
+To select an immutable release explicitly, supply its CID and a provisioned
+public keyring:
 
-```bash
-sh scripts/install.sh --release "$RELEASE_CID"
+```sh
+sh scripts/install.sh --release "$RELEASE_CID" --trusted-release-keys /trusted/path/release-keys
 ```
 
-The installer authenticates and installs the Host, baseline FHS, and identity.
-The shell installer requires an explicit release CID.
 For existing installations, `ww upgrade` supports authenticated IPNS selection
 with an independently configured release identity and public keyring.
 Installation does not register a daemon or configure name publication. Register

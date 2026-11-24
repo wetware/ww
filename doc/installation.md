@@ -1,20 +1,38 @@
 # Installation and recovery
 
-Provision the release public keyring independently before running the installer.
-See [release authentication](release-authentication.md) for the trust format,
-key rotation, and the production activation hold. The installer requires
-OpenSSL 3.x or 4.x and a running Kubo node:
+Use an installer from a reviewed checkout or independently authenticated HTTPS
+distribution. The installer requires OpenSSL 3.x or 4.x on `PATH` and a running
+Kubo node. It selects the existing Linux or macOS Host for ARM64 or x86-64.
 
 ```sh
-sh scripts/install.sh --release <CID>
+sh scripts/install.sh
 sh scripts/install.sh --release <CID> --trusted-release-keys /trusted/path/release-keys
 ```
 
-The installer authenticates the exact checksum manifest with Ed25519 before
-trusting any checksum. Missing signatures and unsigned historic releases fail
-closed. The default trust path is `/etc/wetware/release-keys`; fetched release
-content cannot supply this trust anchor.
-Automatic channel selection refuses until trusted channel freshness is integrated.
+With no release argument, the installer asks Kubo to resolve the fixed
+`ww-release` IPNS name without recursion or its resolver cache. It accepts
+only the exact path to R1 `v0.1.1`:
+`/ipfs/bafybeihdekx4kiimojt7l3qcl52xwrwiuukst4556ongnacbo4ulj4aqpi`.
+Unavailable discovery or a different root stops installation, including when a
+newer signed release exists. Updating this checkpoint requires review and
+independent distribution of the installer. An operator can select a known CID
+explicitly during a discovery outage.
+
+For automatic bootstrap, the installer uses the keyring selected by
+`--trusted-release-keys`, then a provisioned `/etc/wetware/release-keys`.
+Only when neither is configured does it stage the embedded R1 public key in
+its temporary directory. A configured keyring that fails verification stops
+installation. Explicit CID, recovery, and manifest-only modes require a
+provisioned keyring. See [release authentication](release-authentication.md).
+
+A fresh consumer cannot detect a replay of the exact checkpoint or determine
+whether a higher signed release sequence exists. The shell receives a path
+from Kubo. It does not inspect raw IPNS records or initialize sequence floors.
+If `~/.ww/release-consumer` already exists, automatic bootstrap refuses.
+Use native discovery for its persistent rollback checks. Explicit CID selection
+continues to permit historical selection under the native installation
+ownership checks.
+
 The shell independently hashes the raw release root and verifies that its direct
 `CHECKSUMS.txt` link identifies the authenticated manifest. Signed payload hashes
 then bind the staged executable to the requested root before its first execution.
@@ -79,8 +97,8 @@ sh scripts/install.sh --release <CID> --ipfs-url http://127.0.0.1:55001
 no top-level `update`. Deployment following remains `run --stem` or
 `run --ipns-stem`; publishers retain authority to advance those sources.
 
-For release discovery, independently configure the `ww-release` IPNS identity with
-`WW_RELEASE_IPNS` or `--release-ipns <NAME>`. No production identity is embedded.
+For native upgrade discovery, independently configure the `ww-release` IPNS identity with
+`WW_RELEASE_IPNS` or `--release-ipns <NAME>`. The native command requires this configuration.
 The signing keyring remains independently provisioned through
 `--trusted-release-keys` (default `/etc/wetware/release-keys`). Raw signed records
 come from `--ipns-routing-url` / `IPFS_ROUTING_API`; Kubo must expose Routing V1.

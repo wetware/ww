@@ -1,6 +1,9 @@
 #!/bin/sh
-# Wetware installer for an explicitly selected authenticated release.
-# Usage: curl -sSf https://raw.githubusercontent.com/wetware/ww/master/scripts/install.sh | sh -s -- --release <CID>
+# Independently distributed installer. Review these R1 values together when
+# qualifying a new bootstrap release. Never load them from the release tree.
+BOOTSTRAP_CID=bafybeihdekx4kiimojt7l3qcl52xwrwiuukst4556ongnacbo4ulj4aqpi
+RELEASE_IPNS=k51qzi5uqu5dgbw6eyddak3ozm2p2zwet8skgn8qzbwzb90d5obsnnwimvp14i
+BOOTSTRAP_KEY=MCowBQYDK2VwAyEAwZP5U1kng72CiZOgyDgkv8hiAshVDNxsf7PAunCO1EY=
 set -eu
 export LC_ALL=C
 
@@ -8,6 +11,7 @@ RELEASE_CID=""
 RECOVER=false
 RECOVERY_TIMEOUT_SECS=""
 BOOTSTRAP_IPFS_URL=${IPFS_API:-http://localhost:5001}
+KEYS_EXPLICIT=false
 TRUSTED_RELEASE_KEYS=/etc/wetware/release-keys
 VERIFY_MANIFEST=""
 VERIFY_SIGNATURE=""
@@ -128,7 +132,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] && [ -n "$2" ] || die "$1 requires an argument"
       case "$2" in --*) die "$1 requires an argument" ;; esac
       case "$1" in
-        --trusted-release-keys) TRUSTED_RELEASE_KEYS=$2 ;;
+        --trusted-release-keys) TRUSTED_RELEASE_KEYS=$2; KEYS_EXPLICIT=true ;;
         --verify-manifest) VERIFY_MANIFEST=$2 ;;
         --signature) VERIFY_SIGNATURE=$2 ;;
         --ipfs-url) BOOTSTRAP_IPFS_URL=$2 ;;
@@ -136,12 +140,13 @@ while [ $# -gt 0 ]; do
       esac
       shift 2 ;;
     --help)
-      echo "Usage: install.sh --release CID [--ipfs-url URL] [--trusted-release-keys FILE]"
+      echo "Usage: install.sh [--release CID] [--ipfs-url URL] [--trusted-release-keys FILE]"
       echo "       install.sh --recover --timeout-secs N [--release CID] [--ipfs-url URL] [--trusted-release-keys FILE]"
       echo "       install.sh --verify-manifest FILE --signature FILE [--trusted-release-keys FILE]"
-      echo "  Trust keys: independently provisioned /etc/wetware/release-keys by default"
+      echo "  Trust keys: --trusted-release-keys FILE or /etc/wetware/release-keys"
       echo "  --release  Install a specific release by immutable CID"
-      echo "  Automatic channel selection requires a provisioned freshness contract."
+      echo "  Without --release, require ww-release to resolve to the reviewed R1 CID."
+      echo "  Only this mode uses the embedded R1 key when no keyring is configured."
       echo "  --recover  Recover only the pending native Host transaction"
       echo "  --ipfs-url Native installation/recovery Kubo HTTP endpoint (default: IPFS_API or http://localhost:5001)"
       echo "  --timeout-secs Positive native recovery operation budget; required with --recover"
@@ -378,8 +383,8 @@ if "$RECOVER"; then
     pointer_value=$(cat "$pointer")
     [ "${#pointer_value}" -eq "$pointer_size" ] \
       || die "Recovery release locator is noncanonical; supply --release CID for the recorded generation."
-    RELEASE_CID=$(printf '%s' "$pointer_value" | sed -n 's/^{"version":1,"release":"\([A-Za-z0-9]*\)"}$/\1/p')
-    [ "$pointer_value" = "{\"version\":1,\"release\":\"$RELEASE_CID\"}" ] \
+    RELEASE_CID=$(printf '%s' "$pointer_value" | sed -n 's/^{"version":1,"release":"\([A-Za-z0-9][A-Za-z0-9]*\)"}$/\1/p')
+    [ -n "$RELEASE_CID" ] && [ "$pointer_value" = "{\"version\":1,\"release\":\"$RELEASE_CID\"}" ] \
       || die "Recovery release locator is invalid; supply --release CID for the recorded generation."
   fi
 fi
@@ -391,12 +396,14 @@ if [ -n "$VERIFY_MANIFEST" ] || [ -n "$VERIFY_SIGNATURE" ]; then
   exit 0
 fi
 
-[ -n "$RELEASE_CID" ] \
-  || die "Automatic release selection is unavailable until trusted channel freshness is provisioned. Specify --release CID."
-printf '%s\n' "$RELEASE_CID" | awk '
-  /^bafybei[a-z2-7]{52}$/ { valid=1 }
-  END { exit !(NR == 1 && valid) }
-' || die "--release requires one canonical CIDv1 DAG-PB SHA-256 release root, without a path or query."
+if [ -n "$RELEASE_CID" ]; then
+  printf '%s\n' "$RELEASE_CID" | awk '
+    /^bafybei[a-z2-7]{52}$/ { valid=1 }
+    END { exit !(NR == 1 && valid) }
+  ' || die "--release requires one canonical CIDv1 DAG-PB SHA-256 release root, without a path or query."
+elif [ -e "$WW_HOME/release-consumer" ] || [ -L "$WW_HOME/release-consumer" ]; then
+  die "Existing release consumer state requires native channel verification. Use ww upgrade --check."
+fi
 
 # --- Detect platform ---
 OS="$(uname -s)"
@@ -436,9 +443,25 @@ else
 fi
 
 # --- Select immutable release ---
-IPFS_BASE="/ipfs/${RELEASE_CID}"
-
 WW_TMPDIR=$(mktemp -d)
+if [ -z "$RELEASE_CID" ]; then
+  # Compare bytes, including the final LF. Kubo supplies only a locator.
+  printf '/ipfs/%s\n' "$BOOTSTRAP_CID" > "$WW_TMPDIR/expected-path"
+  ipfs name resolve --recursive=false --nocache "/ipns/$RELEASE_IPNS" > "$WW_TMPDIR/resolved-path" \
+    || die "Could not resolve ww-release. For a known release, use --release CID with independent trust keys."
+  cmp -s "$WW_TMPDIR/expected-path" "$WW_TMPDIR/resolved-path" \
+    || die "ww-release does not resolve to this installer's reviewed release. Check the installer revision."
+  RELEASE_CID=$BOOTSTRAP_CID
+  if ! "$KEYS_EXPLICIT" && [ ! -e "$TRUSTED_RELEASE_KEYS" ] && [ ! -L "$TRUSTED_RELEASE_KEYS" ]; then
+    key_directory=${TRUSTED_RELEASE_KEYS%/*}
+    if [ -e "$key_directory" ] || [ -L "$key_directory" ]; then
+      [ -d "$key_directory" ] && [ -x "$key_directory" ] || die "Cannot inspect $key_directory"
+    fi
+    TRUSTED_RELEASE_KEYS=$WW_TMPDIR/bootstrap-key
+    printf '%s\n' "$BOOTSTRAP_KEY" > "$TRUSTED_RELEASE_KEYS"
+  fi
+fi
+IPFS_BASE="/ipfs/${RELEASE_CID}"
 
 # Authenticate all staged bytes before executing the selected Host.
 BIN_PATH="bin/ww/${OS_NAME}/${ARCH_NAME}/ww"
