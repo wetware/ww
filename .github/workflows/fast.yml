@@ -101,6 +101,12 @@ jobs:
         cargo fmt --manifest-path tests/fixtures/stream-lifecycle-probe/Cargo.toml -- --check
         cargo fmt --manifest-path tests/fixtures/gate2b-root/Cargo.toml -- --check
 
+    - name: Install Csh and Tcsh for startup-file regression tests
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends csh tcsh
+        sudo update-alternatives --set csh /bin/tcsh
+
     - name: Check IPFS release publish scripts
       run: |
         bash tests/test_ipfs_release_publish.sh
@@ -110,6 +116,7 @@ jobs:
         bash tests/test_deploy_context.sh
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
+        python3 tests/test_install_path.py
         python3 tests/test_release_auth.py
         python3 tests/test_producer_artifacts.py
         bash -n tests/test_container_boot.sh

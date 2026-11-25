@@ -434,7 +434,7 @@ fi
 if "$RECOVER"; then
   status '⚗️' 'Recovering the recorded Host transaction...'
 else
-  status '⚗️' 'Installing wetware...'
+  status '⚗️' 'Installing Wetware...'
 fi
 
 # --- Select immutable release ---
@@ -547,9 +547,232 @@ if type(version) is not int or version != 1 or fields["channel"] != sys.argv[2]:
 PY
 }
 
-status '>' "Fetching verified Host..."
+# Keep this post-install step independent of the signed installation result.
+configure_path() {
+  input=unattended
+  if [ -t 0 ] || [ -p /dev/stdin ]; then input=interactive; fi
+  python3 -I - "$input" "${PPID:-0}" <<'PYTHON'
+import contextlib
+import fcntl
+import os
+from pathlib import Path
+import pwd
+import re
+import select
+import shutil
+import stat
+import sys
+
+
+def append_config(home, destination, command):
+    """Append one command, keeping the existing inode, bytes and permissions."""
+    if (not home.is_absolute() or home == home.parent or home not in destination.parents
+            or ".." in destination.parts):
+        raise ValueError("startup file must be inside an absolute home directory")
+
+    uid = os.geteuid()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with contextlib.ExitStack() as handles:
+        directory = os.open("/", directory_flags)
+        handles.callback(os.close, directory)
+        for depth, part in enumerate(destination.parent.parts[1:], start=1):
+            try:
+                child = os.open(part, directory_flags, dir_fd=directory)
+            except FileNotFoundError:
+                if depth < len(home.parts):
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=directory)
+                except FileExistsError:
+                    pass  # A concurrent installer may have created it.
+                child = os.open(part, directory_flags, dir_fd=directory)
+            handles.callback(os.close, child)
+            directory = child
+            info = os.fstat(child)
+            inside_home = depth >= len(home.parts) - 1
+            # Root-owned sticky directories (e.g. /tmp) protect existing names.
+            sticky_parent = not inside_home and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+            if (info.st_uid not in ((uid,) if inside_home else (0, uid))
+                    or (info.st_mode & 0o022 and not sticky_parent)):
+                raise ValueError("unsafe startup directory ownership or permissions")
+
+        if not os.fstat(directory).st_mode & stat.S_IWUSR:
+            raise ValueError("startup directory is read-only")
+        flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        name = destination.name
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+        else:
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("startup file must be a regular file")
+            fd = os.open(name, flags, dir_fd=directory)
+        with os.fdopen(fd, "rb") as config:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1
+                    or not info.st_mode & stat.S_IWUSR or info.st_mode & 0o7022):
+                raise ValueError("unsafe startup file ownership, links or permissions")
+
+            line = command.encode("ascii")
+            newline = b"\n"
+            terminated = True
+            for existing in config:
+                terminated = existing.endswith(b"\n")
+                if terminated:
+                    newline = b"\r\n" if existing.endswith(b"\r\n") else b"\n"
+                if existing.rstrip(b"\r\n") == line:
+                    return
+            addition = (b"" if terminated else newline) + line + newline
+            # Append in one write. A short write can only add a prefix of our
+            # command. Roll back that prefix if nobody else has appended since.
+            written = os.write(fd, addition)
+            if written != len(addition):
+                if os.fstat(fd).st_size == info.st_size + written:
+                    os.ftruncate(fd, info.st_size)
+                raise OSError("incomplete startup file write")
+
+
+def startup_file(shell_path, home):
+    shell = shell_path.name
+    if shell == "zsh":
+        return Path(os.environ.get("ZDOTDIR", str(home))) / ".zshrc"
+    if shell == "bash":
+        if sys.platform != "darwin":
+            return home / ".bashrc"
+        for name in (".bash_profile", ".bash_login", ".profile"):
+            if os.path.lexists(home / name):
+                return home / name
+        return home / ".bash_profile"
+    if shell == "fish":
+        base = os.environ.get("XDG_CONFIG_HOME") or home / ".config"
+        return Path(base) / "fish/conf.d/ww-path.fish"
+    if shell in ("ksh", "ksh93", "mksh"):
+        path = Path(os.environ.get("ENV", ""))
+        if (path.name in (".kshrc", "kshrc", ".mkshrc") and path.is_absolute()
+                and re.fullmatch(r"[a-zA-Z0-9_./-]+", str(path)) and os.path.lexists(path)):
+            return path
+    if shell == "csh" and shell_path.is_absolute():
+        # macOS hard-links csh to tcsh. Linux can select either implementation
+        # through alternatives. Identify the binary without executing SHELL.
+        for binary in ("/bin/tcsh", "/bin/bsd-csh", "/usr/bin/tcsh", "/usr/bin/bsd-csh"):
+            try:
+                if shell_path.samefile(binary):
+                    shell = Path(binary).name
+                    break
+            except OSError:
+                continue
+    if shell in ("tcsh", "bsd-csh"):
+        if shell == "tcsh" and os.path.lexists(home / ".tcshrc"):
+            return home / ".tcshrc"
+        return home / ".cshrc"
+    return None
+
+
+def consent(destination):
+    if (sys.argv[1] != "interactive" or not all(os.isatty(fd) for fd in (1, 2))
+            or os.environ.get("TERM", "dumb") == "dumb"
+            or any(key in os.environ for key in ("CI", "NONINTERACTIVE", "WW_NONINTERACTIVE"))):
+        return False
+    try:
+        with open("/dev/tty", "r+b", buffering=0) as tty:
+            # An interactive job-control shell gives its foreground pipeline a
+            # separate process group. An unattended script can inherit a TTY.
+            group = os.getpgrp()
+            if os.tcgetpgrp(tty.fileno()) != group or os.getpgid(int(sys.argv[2])) == group:
+                return False
+            tty.write(f"Startup file  {destination}\nAdd Wetware to your shell PATH? [y/N] ".encode())
+            ready, _, _ = select.select([tty], [], [], 15)
+            if not ready:
+                tty.write(b"\n")
+                return False
+            answer = tty.read(256)
+            if not answer:
+                tty.write(b"\n")
+            return answer.strip().lower() in (b"y", b"yes")
+    except OSError:
+        return False
+
+
+def next_steps(available=False, configured=False, leading_blank=True):
+    ww = "ww" if available else "~/.ww/bin/ww"
+    steps = [(ww + " run", "Start Wetware now")]
+    if configured:
+        steps.append(("ww run", "Start from a new terminal"))
+    steps.append((ww + " daemon install", "Install as a background service"))
+    print("\nNext steps" if leading_blank else "Next steps")
+    for cmd, description in steps:
+        print(f"  {cmd:<27}  {description}")
+
+
+def configure():
+    home = Path(os.environ["HOME"])
+    bin_dir = home / ".ww/bin"
+    if ":" in str(bin_dir):
+        print("The installation path contains a colon.")
+        next_steps()
+        return
+    for entry in os.get_exec_path():
+        try:
+            present = bin_dir.samefile(entry or ".")
+        except OSError:
+            continue
+        if present:
+            resolved = shutil.which("ww")
+            available = resolved is not None and os.path.samefile(resolved, bin_dir / "ww")
+            if not available:
+                print("Another ww takes precedence on PATH. Use the installed path below.")
+            next_steps(available=available, leading_blank=not available)
+            return
+
+    shell_path = Path(os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell)
+    shell = shell_path.name
+    destination = startup_file(shell_path, home)
+    if shell == "fish":
+        command = 'contains -- "$HOME/.ww/bin" $PATH; or set -gx PATH "$HOME/.ww/bin" $PATH'
+    elif shell in ("tcsh", "csh", "bsd-csh"):
+        command = 'if ( ":${PATH}:" !~ *":${HOME}/.ww/bin:"* ) set path = ( "$HOME/.ww/bin" $path:q )'
+    elif shell == "nu":
+        command = "$env.PATH = ($env.PATH | prepend ($env.HOME | path join '.ww' 'bin'))"
+    elif shell in ("sh", "ash", "dash", "busybox", "bash", "ksh", "ksh93", "mksh", "zsh"):
+        command = 'case ":${PATH}:" in *":$HOME/.ww/bin:"*) ;; *) export PATH="$HOME/.ww/bin:$PATH" ;; esac'
+    else:
+        print("To use ww by name, add ~/.ww/bin to PATH in your shell configuration.")
+        next_steps()
+        return
+
+    if destination and home.is_absolute() and home in destination.parents and ".." not in destination.parts:
+        name = "~/" + str(destination.relative_to(home))
+        if not name.isascii() or not name.isprintable():
+            name = ascii(name)
+        if consent(name):
+            try:
+                append_config(home, destination, command + " # Wetware PATH")
+                print(f"✓ Configured ~/.ww/bin in {name}")
+                print("Open a new terminal to use ww.")
+                next_steps(configured=True)
+                return
+            except (ValueError, OSError) as error:
+                print(f"Could not configure PATH: {ascii(str(error))}")
+        else:
+            print(f"For future sessions, you can add the command below to {name}.")
+    elif shell == "nu":
+        print("For future sessions, add the command below to the file named by $nu.config-path.")
+    else:
+        print("Startup files depend on your shell configuration. Choose your own startup file for persistence.")
+    immediate = 'export PATH="$HOME/.ww/bin:$PATH"' if command.startswith("case ") else command
+    print("For the current session, run:\n  " + immediate)
+    next_steps()
+
+
+configure()
+PYTHON
+}
+
+status '>' 'Fetching verified Host...'
 fetch_verified "$BIN_PATH" "${WW_TMPDIR}/ww"
-status '+' "Fetched verified Host"
+status '✓' 'Host verified'
 
 if "$RECOVER"; then
   chmod +x "${WW_TMPDIR}/ww"
@@ -559,14 +782,13 @@ if "$RECOVER"; then
   exit 0
 fi
 
-status '>' "Fetching verified FHS payloads..."
 mkdir -p "${WW_TMPDIR}/fhs/boot" "${WW_TMPDIR}/fhs/bin"
 fetch_verified "fhs/boot/kernel.wasm" "${WW_TMPDIR}/fhs/boot/kernel.wasm"
 fetch_verified "fhs/bin/status.wasm" "${WW_TMPDIR}/fhs/bin/status.wasm"
 if [ -n "$expected_channel" ] || [ "$RELEASE_CID" = "$BOOTSTRAP_CID" ]; then
   verify_descriptor
 fi
-status '+' "Fetched verified package"
+status '✓' 'FHS verified'
 
 # These hashes come from the independently verified R1 manifest. The
 # selected release cannot choose the executable that validates its descriptor.
@@ -583,8 +805,27 @@ if [ "$RELEASE_CID" != "$BOOTSTRAP_CID" ]; then
 fi
 [ "$(file_sha256 "$verifier")" = "$verifier_hash" ] || die "R1 verifier checksum mismatch"
 chmod +x "$verifier"
+# The pinned verifier reports warnings separately from changed files and digests.
+report=$WW_TMPDIR/install-report.json
 "$verifier" install --release "$RELEASE_CID" --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
-  --ipfs-url "$BOOTSTRAP_IPFS_URL"
-"${WW_HOME}/bin/ww" --version
-printf '\nInstalled Wetware in %s. Start the Host with "%s/bin/ww" run.\n' "$WW_HOME" "$WW_HOME"
+  --ipfs-url "$BOOTSTRAP_IPFS_URL" --json > "$report" || {
+    result=$?
+    cat "$report" >&2
+    exit "$result"
+  }
+python3 -I - "$report" <<'PYTHON' >&2 || cat "$report" >&2
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as report:
+    for warning in json.load(report)["warnings"]:
+        # R1 includes the routine installation scope in its warnings array.
+        if warning != "Host, baseline FHS, and identity only. Register a daemon separately with ww daemon install.":
+            print(warning)
+PYTHON
+"${WW_HOME}/bin/ww" --version > /dev/null
+printf '\n'
+if "$show_progress"; then printf '✓ '; fi
+printf 'Wetware installed successfully!\n\n  Location  ~/.ww\n  Release   %s\n\n' "$RELEASE_CID"
+configure_path || printf '%s\n' 'Run ~/.ww/bin/ww directly or add ~/.ww/bin to PATH.'
 }

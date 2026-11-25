@@ -1,0 +1,19 @@
+⚗️	Installing Wetware...
+>	Fetching verified Host...
+✓	Host verified
+✓	FHS verified
+
+✓ Wetware installed successfully!
+
+  Location  ~/.ww
+  Release   bafybeid3rced2tilxswelc5qfic7oeeezjtprua6xtw467xfyywwql4fbe
+
+Startup file  ~/.zshrc
+Add Wetware to your shell PATH? [y/N] y
+✓ Configured ~/.ww/bin in ~/.zshrc
+Open a new terminal to use ww.
+
+Next steps
+  ~/.ww/bin/ww run             Start Wetware now
+  ww run                       Start from a new terminal
+  ~/.ww/bin/ww daemon install  Install as a background service

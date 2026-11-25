@@ -43,7 +43,7 @@ platform. For a subsequent release, the installer retrieves the verifier from
 the immutable R1 root. R1 must therefore remain available. The pinned verifier
 runs `ww install --release`, authenticates the typed descriptor, selects the
 compatible Host and FHS, and checks the reconstructed bytes before installation.
-The installed Host first runs to report its version.
+The installer runs the installed Host with `--version` as a final check. The success summary shows the installation location and the full release CID.
 
 The shell hands the authenticated package to `ww install`. Installation writes
 `~/.ww/bin/ww`, `~/.ww/fhs/boot/kernel.wasm`, `~/.ww/fhs/bin/status.wasm`, and a
@@ -71,6 +71,31 @@ paths when using a nondefault Kubo, for example:
 # First configure the ipfs CLI to reach the intended Kubo daemon.
 sh scripts/install.sh --release <CID> --ipfs-url http://127.0.0.1:55001
 ```
+
+## Find `ww` on PATH
+
+After a successful installation, `scripts/install.sh` checks whether `~/.ww/bin` is
+on `PATH`. If the directory is missing, an interactive installation can offer
+to update a startup file for your shell. The prompt reads from the controlling
+terminal, including when the script arrives through a pipe. Press Enter to
+decline. The prompt requires a foreground job started by a shell with job
+control. A 15-second timeout or end of input also declines. Set
+`WW_NONINTERACTIVE=1` to suppress the prompt in automation.
+
+| Shell | Startup file for future sessions |
+|---|---|
+| Zsh | `.zshrc` under `ZDOTDIR`, or under your home directory by default. |
+| Bash | On macOS, the first existing login file among `~/.bash_profile`, `~/.bash_login`, and `~/.profile`, or a new `~/.bash_profile` if none exists. On Linux, `~/.bashrc` for interactive shells. |
+| Fish | `fish/conf.d/ww-path.fish` under `XDG_CONFIG_HOME`, which defaults to `~/.config`. |
+| Ksh | An existing `.kshrc`, `kshrc`, or `.mkshrc` selected by a literal absolute `ENV` path under your home directory. Paths with shell syntax require manual setup. |
+| POSIX sh, Dash, BusyBox Ash | Manual. The startup file depends on how the shell starts and how the system configures it. |
+| Csh, Tcsh | BSD Csh uses `~/.cshrc`. Tcsh, including a `csh` linked to Tcsh, prefers an existing `~/.tcshrc` and otherwise reads `~/.cshrc`. When the installer cannot identify the `csh` implementation, it prints manual instructions. |
+| Nushell | Manual. Run `$nu.config-path` to locate the active configuration file. |
+
+The installer shows the proposed destination before asking for consent.
+Automatic edits require a destination under your home directory. If the installer
+declines a destination, use the printed command in your shell. After approving an edit, use `~/.ww/bin/ww run` in your
+current shell or open a new terminal and use `ww run`. For an unrecognized shell, run `~/.ww/bin/ww` directly.
 
 ## Separate software and service operations
 

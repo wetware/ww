@@ -12,7 +12,10 @@ import unittest
 from release_auth_fixture import (cid_bytes, cid_text, generate_key, manifest_root,
                                   pb_field, pin_fixture_verifiers, R1_ROOT, sign_manifest, varint)
 
+from test_install_path import piped_terminal
+
 REPO = Path(__file__).resolve().parents[1]
+TERMINAL_CAPTURES = REPO / 'tests/fixtures/installer-output'
 INSTALLER = REPO / 'scripts/install.sh'
 R1_SPKI_SHA256 = 'c15cb2b5a66ab54bba27e39c79da23a3d927b52032b91df3456c8d4146f5b348'
 RELEASE_NAME = 'k51qzi5uqu5dgbw6eyddak3ozm2p2zwet8skgn8qzbwzb90d5obsnnwimvp14i'
@@ -26,7 +29,7 @@ class ReleaseAuthentication(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='ww-release-auth-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.private, self.keys = generate_key(self.root / 'keys')
         self.other_private, self.other_keys = generate_key(self.root / 'other-keys')
         self.release = self.root / 'release'
@@ -91,6 +94,7 @@ esac
 set -eu
 printf '%s\n' "$*" >> "$TEST_EXECUTIONS"
 case "$*" in
+'--version') echo 'ww fixture version' ;;
 'upgrade --recover-only '*) exit "${TEST_RECOVERY_EXIT:-0}" ;;
 *--check*) exit 0 ;;
 'install '*|'perform install '*) mkdir -p "$HOME/.ww/bin"; cp "$0" "$HOME/.ww/bin/ww" ;;
@@ -105,6 +109,10 @@ esac
 set -eu
 printf 'verifier %s\n' "$*" >> "$TEST_VERIFIER_CALLS"
 [ "$1" = install ] || exit 91
+if [ -n "${{TEST_VERIFIER_FAILURE:-}}" ]; then
+  echo "$TEST_VERIFIER_FAILURE" >&2
+  exit 27
+fi
 if [ -n "${{TEST_CAPTURE_KEY:-}}" ]; then
   while [ "$1" != --trusted-release-keys ]; do shift; done
   cp -p "$2" "$TEST_CAPTURE_KEY"
@@ -112,6 +120,11 @@ fi
 mkdir -p "$HOME/.ww/bin"
 cp "$TEST_RELEASE/bin/ww/{path}/ww" "$HOME/.ww/bin/ww"
 chmod +x "$HOME/.ww/bin/ww"
+if [ -n "${{TEST_INSTALL_REPORT:-}}" ]; then
+  echo "$TEST_INSTALL_REPORT"
+else
+  echo '{{"warnings":[]}}'
+fi
 ''')
             verifiers[path] = verifier
             target = self.release / 'bin/ww' / path / 'ww'
@@ -439,6 +452,52 @@ chmod +x "$HOME/.ww/bin/ww"
                 self.assertIn(f'install --release {self.release_cid}', self.verifier_calls.read_text())
                 self.calls.unlink()
                 self.transport.unlink()
+
+    def test_full_installer_terminal_captures(self):
+        # The signed fixture supplies Kubo transport and the native verifier.
+        # The PTY captures echo, combined output and spacing in emission order.
+        installer = self.automatic_fixture()
+        env = dict(self.env, INSTALL_TEST=str(installer), SHELL='/bin/zsh', TERM='xterm')
+        for name in ('CI', 'NO_COLOR', 'NONINTERACTIVE', 'WW_NONINTERACTIVE', 'ZDOTDIR'):
+            env.pop(name, None)
+        config = self.home / '.zshrc'
+        for name in ('accepted', 'declined', 'already-on-path', 'noninteractive'):
+            with self.subTest(name=name):
+                config.write_bytes(b'# existing config')
+                config.chmod(0o600)
+                if name == 'noninteractive':
+                    result = subprocess.run(['sh'], input=installer.read_bytes(),
+                                            env=env, start_new_session=True,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            timeout=30, check=True)
+                    output = result.stdout.decode()
+                elif name == 'already-on-path':
+                    path = str(self.home / '.ww/bin') + os.pathsep + env['PATH']
+                    output = piped_terminal(dict(env, PATH=path), timeout=30)
+                else:
+                    answer = b'y\n' if name == 'accepted' else b'n\n'
+                    output = piped_terminal(env, answer, timeout=30)
+                self.assertEqual(output, (TERMINAL_CAPTURES / (name + '.txt')).read_text())
+                if name == 'accepted':
+                    self.assertIn(b'# Wetware PATH', config.read_bytes())
+                else:
+                    self.assertEqual(config.read_bytes(), b'# existing config')
+
+    def test_native_warning_and_failure_remain_visible(self):
+        note = ('Host, baseline FHS, and identity only. '
+                'Register a daemon separately with ww daemon install.')
+        self.env['TEST_INSTALL_REPORT'] = json.dumps({'warnings': [note, 'fixture install warning']})
+        result = self.run_installer(success=True)
+        self.assertIn('fixture install warning', result.stderr)
+        self.assertNotIn(note, result.stderr)
+        self.assertNotIn('{"warnings"', result.stdout)
+        self.assertNotIn('ww fixture version', result.stdout)
+        self.calls.unlink()
+        self.env['TEST_VERIFIER_FAILURE'] = 'fixture verifier failure'
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 27)
+        self.assertIn('fixture verifier failure', result.stderr)
+        self.assertNotIn('Next steps', result.stdout)
 
     def test_embedded_key_permissions_with_group_writable_umask(self):
         installer = self.automatic_fixture()
