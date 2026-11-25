@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+- Update workspace dependencies affected by RustSec advisories, including Quinn,
+  rustls, and zstd. Remove two obsolete `hickory-proto` audit exceptions.
+
 ### Changed
 - Run the IPFS and Kad integration suites against the configured CI Kubo daemon.
   Required runs fail when the daemon is unavailable.
