@@ -25,7 +25,8 @@ class Boundary(unittest.TestCase):
                 self.assertIn('required', result.stderr)
 
     def test_workflow_has_no_live_lane_or_branch_exception(self):
-        workflow = (ROOT / '.github/workflows/rust.yml').read_text()
+        workflow = '\n'.join((ROOT / '.github/workflows' / name).read_text()
+                             for name in ('rust.yml', 'fast.yml'))
         self.assertNotIn('lthibault/pasted-text-v38', workflow)
         for name in ('run_native_release_integration.py', 'run_native_development_boot.py',
                      'prepare_current_native_release.py --', 'qualify_native_upgrade.py --'):
@@ -34,8 +35,12 @@ class Boundary(unittest.TestCase):
         self.assertNotIn('verify_native_release_inputs.py', workflow)
         self.assertNotIn('fetch_native_release_inputs.py', workflow)
         self.assertIn('python3 tests/test_native_release_inputs.py', workflow)
-        self.assertIn('python3 scripts/check_repository_artifacts.py', workflow)
-        self.assertIn('python3 tests/test_repository_artifacts.py', workflow)
+        checks = './.github/actions/check-lockfiles'
+        for name in ('fast.yml', 'rust.yml'):
+            self.assertIn('uses: ' + checks, (ROOT / '.github/workflows' / name).read_text())
+        action = (ROOT / checks / 'action.yml').read_text()
+        self.assertIn('python3 scripts/check_repository_artifacts.py', action)
+        self.assertIn('python3 tests/test_repository_artifacts.py', action)
 
     def test_historical_pair_command_is_removed(self):
         result = subprocess.run([sys.executable, str(ROOT / 'scripts/prepare_current_native_release.py'),

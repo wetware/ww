@@ -63,27 +63,50 @@ Public CI has no release packager and emits no `release-input.car`.
 The existing tested container image remains a separate raw `tested-image.tar`
 artifact. Its image job still requires the exact tested digest.
 
-### Parallel source-container qualification
+### CI tiers
 
-`validate-source-container` starts after `build-wasm` and consumes the current
-run's `wasm-artifacts/target/fhs`. It builds `Containerfile` with `github.sha`,
-boots the image, checks its revision and canonical FHS bytes, then records
-`github.run_attempt`. Native producers and Host tests can run concurrently.
-The job retains the existing full-qualification trigger and adds no compiler cache.
+| Entry point | Checks and outputs |
+| --- | --- |
+| PRs and pushes to `master` or `staging` (`fast.yml`) | Repository artifacts and lockfiles, formatting, Clippy, Foundry, fuzz corpus, architecture map, offline release and installer controls, standalone standard library, and selected native Rust tests. The `Test` job requires every fast check to succeed. |
+| Full dispatch (`rust.yml`) | Fast checks plus workspace build and Host tests with Kubo and Foundry, WASI P3 fixtures and guest cancellation, canonical FHS, packaged installation and boot, all five native producers, and source and artifact container boots. |
+| Master PRs (`changelog.yml`) | The existing `Require changelog entry` check runs independently. |
 
-`validate-release` joins source qualification, Host tests, WASM and all five
-native producers. Its first step rejects any non-success dependency result and
-any missing or stale source qualification attempt before artifact validation or
-receipt uploads. A partial rerun cannot reuse source qualification from an older
-attempt. Rerun all jobs to qualify a new attempt. Producer provenance checks,
-artifact-container boots, FHS comparisons and private admission remain required.
+`scripts/test_fast_rust.sh` selects native library and integration targets.
+Full Host tests require generated first-party components, the native P3,
+authority, Gate 2B, routing-key and stream-lifecycle probes, and a live Kubo API.
+Full CI checks the downloaded fixture paths before running the workspace suite.
 
-For branch measurements, dispatch `rust.yml` with `validation_only=true`.
-This explicit mode runs the full qualification graph on the selected revision
-and disables Pages generation/deployment and GHCR publication. The IPFS
-publication hold remains unconditional. The default remains `false`; ordinary
-PRs and master release triggers retain their existing scope. A validation-only
-run is measurement evidence, not an official publication authorization.
+### Selecting a producer run
+
+Dispatch `rust.yml` on a topic branch with the reviewed 40-character commit
+SHA in `expected_sha` for a rehearsal. The default `validation_only=true`
+disables Pages and GHCR. A topic branch can point to the intended master SHA.
+For official producer inputs, dispatch on `master` with that exact SHA and
+explicitly set `validation_only=false`. The admission job compares the event
+SHA with the requested SHA before checkout. It rejects tags, master rehearsals
+and image-producing requests on other branches. Master pushes can update
+Pages through `fast.yml`; master image updates require the official dispatch.
+
+The private tag selector requires exactly one successful `rust.yml` push or
+dispatch for the tagged SHA on master before it inspects jobs. Routine checks
+use a separate top-level workflow path. Before an official dispatch, check for
+an existing successful producer run for the SHA, including historical master
+pushes. A second success makes selection ambiguous. Retry a **failed** run
+with a fresh dispatch. Admission, artifact validation and image loading require
+attempt 1. This excludes partial and full reruns that could reuse earlier job
+results or artifacts. Avoid rerunning a successful producer.
+
+After admission and lockfile checks, WASM and native test compilation run in
+parallel with fast checks. Source-container qualification starts after WASM
+production, independently of the five native producers and Host tests.
+`validate-release` requires successful tests, WASM, producers and source boot
+for the current run before comparing bytes, booting artifact containers and
+emitting source receipts. The GHCR job checks the source attempt before
+downloading the digest-verified tested image. Private admission requires
+successful jobs named `Test`, `Validate release packages and container boot`
+and `Build and publish ww-master image`, then verifies the six producer
+artifacts against the revision, run and attempt. Authority to sign and publish
+remains in private infrastructure under the existing holds.
 
 ## Private signed handoff
 

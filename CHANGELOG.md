@@ -11,6 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rustls, and zstd. Remove two obsolete `hickory-proto` audit exceptions.
 
 ### Changed
+- Run fixture-independent checks on pushes and pull requests. Full Host, WASI,
+  container and five-platform qualification now require an exact-SHA dispatch.
 - Run the IPFS and Kad integration suites against the configured CI Kubo daemon.
   Required runs fail when the daemon is unavailable.
 - Run mandatory source-container qualification alongside native release builds,
