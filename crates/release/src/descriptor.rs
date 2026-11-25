@@ -783,6 +783,14 @@ pub struct Consumer {
     poisoned: bool,
 }
 
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        // A concurrent fork can retain the open file description until exec.
+        // Release ownership when the consumer finishes, even during that window.
+        let _ = self.lock.unlock();
+    }
+}
+
 impl Consumer {
     pub fn open(directory: &Path, name: PeerId, keyring: &[u8]) -> Result<Self> {
         ensure!(

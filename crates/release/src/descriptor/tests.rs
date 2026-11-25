@@ -804,6 +804,9 @@ fn crashed_consumer_temporary_is_bounded_and_never_recovery_authority() {
     fixture.accept(&mut consumer, 2, 20).unwrap();
     let temporary = consumer.watermark_path().with_extension("next");
     std::fs::write(&temporary, b"incomplete newer proof").unwrap();
+    // On Unix a fork can retain the open file description until exec.
+    #[cfg(unix)]
+    let _inherited_fd = consumer.lock.try_clone().unwrap();
     drop(consumer);
     let mut consumer = fixture.consumer().unwrap();
     assert_eq!(consumer.accepted_release_sequence(), Some(2));
