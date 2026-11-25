@@ -1,0 +1,16 @@
+name: Check repository artifacts and Cargo lockfiles
+description: Verify committed artifacts and lockfile resolution before compiling
+runs:
+  using: composite
+  steps:
+    - name: Check committed repository artifacts
+      shell: bash
+      run: |
+        python3 scripts/check_repository_artifacts.py
+        python3 tests/test_repository_artifacts.py
+    - uses: dtolnay/rust-toolchain@1.99.1
+    # Always resolve before dependent jobs restore compiler caches or build.
+    - shell: bash
+      run: bash scripts/check_cargo_lockfiles.sh
+    - shell: bash
+      run: bash tests/test_cargo_lockfiles.sh

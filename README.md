@@ -1,6 +1,6 @@
 # Wetware
 
-[![CI](https://github.com/wetware/ww/actions/workflows/rust.yml/badge.svg)](https://github.com/wetware/ww/actions/workflows/rust.yml)
+[![CI](https://github.com/wetware/ww/actions/workflows/fast.yml/badge.svg)](https://github.com/wetware/ww/actions/workflows/fast.yml)
 
 Wetware lets you safely run code you didn't write, don't trust, and cannot see: third-party MCP servers, code your LLM produced at runtime, tools other agents handed you across the swarm. It's a decentralized operating system for multi-tool agent swarms.
 

@@ -1,0 +1,55 @@
+name: Publish architecture map
+
+on: workflow_call
+
+jobs:
+  build-architecture-map:
+    name: Build architecture map
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: 24
+        package-manager-cache: false
+
+    - name: Test map generator
+      run: node --test scripts/generate-architecture-map.test.mjs
+
+    - name: Generate Pages artifact
+      run: |
+        mkdir site
+        node scripts/generate-architecture-map.mjs \
+          --output site \
+          --revision "${{ github.sha }}"
+        test "$(find site -maxdepth 1 -type f | wc -l | tr -d ' ')" = 1
+        test -f site/index.html
+
+    - name: Configure GitHub Pages
+      uses: actions/configure-pages@v5
+
+    - name: Upload Pages artifact
+      uses: actions/upload-pages-artifact@v4
+      with:
+        path: site
+
+  deploy-architecture-map:
+    name: Deploy architecture map
+    if: ${{ needs.build-architecture-map.result == 'success' }}
+    needs: build-architecture-map
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+    - name: Deploy GitHub Pages artifact
+      id: deployment
+      uses: actions/deploy-pages@v4

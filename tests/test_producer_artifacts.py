@@ -161,6 +161,16 @@ class ProducerArtifacts(unittest.TestCase):
                 (root / 'PROVENANCE.json').write_bytes(receipt)
                 producer.checksums(root)
 
+    def test_complete_artifacts_from_another_revision_run_or_attempt_are_rejected(self):
+        for revision, run, attempt in (
+            ('b' * 40, '123', '2'),
+            (self.revision, '456', '2'),
+            (self.revision, '123', '3'),
+        ):
+            with self.subTest(revision=revision, run=run, attempt=attempt):
+                with self.assertRaisesRegex(ValueError, 'producer identity'):
+                    producer.validate_hosts(self.root, revision, run, attempt)
+
     def test_different_valid_fhs_rejected(self):
         root = self.root / 'ww-linux-x86_64'
         (root / 'fhs/bin/status.wasm').write_bytes(b'other-valid-payload')
