@@ -80,6 +80,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pending authenticated selection, compatibility, and native restart admission.
 
 ### Fixed
+- Align shell installer status messages and let Kubo alone render transfer progress.
 - Download producer WASM artifacts after Rust cache restoration so partial-cache
   cleanup cannot remove the FHS inputs before packaging.
 - Installer-test setup now reuses an authenticated package with independent
