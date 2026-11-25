@@ -96,23 +96,19 @@ fn status_variant(base: &[u8], tag: &[u8]) -> (Vec<u8>, cid::Cid) {
     (bytes, cid)
 }
 
-/// Change an executed guest log literal without changing component lengths.
+/// Tag the guest logger prefix without changing component lengths.
 /// A custom section changes identity but cannot prove which PID0 executed.
 fn kernel_variant(tag: char) -> Vec<u8> {
     let mut bytes = required_artifact(KERNEL_WASM_PATH);
-    let original = b"committed readiness";
-    let marker = format!("kernel-{tag} readiness!");
+    let original = b"[kernel]";
+    let marker = format!("[kern-{tag}]");
     assert_eq!(marker.len(), original.len());
     let positions: Vec<_> = bytes
         .windows(original.len())
         .enumerate()
         .filter_map(|(index, value)| (value == original).then_some(index))
         .collect();
-    assert_eq!(
-        positions.len(),
-        1,
-        "kernel readiness literal must be unique"
-    );
+    assert_eq!(positions.len(), 1, "kernel logger prefix must be unique");
     bytes[positions[0]..positions[0] + original.len()].copy_from_slice(marker.as_bytes());
     bytes
 }
@@ -1561,7 +1557,7 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
         wait_for_ready(&client, &ready_url, &mut node).await;
         assert_status_cell(&client, http_addr, &overlay_status_cid, &node).await;
         let initial_root = activated_root(&client, admin_addr, 0).await;
-        wait_for_log(&mut node, "kernel-X readiness!", "").await;
+        wait_for_log(&mut node, "[kern-X][INFO] ready", "").await;
         assert_persistent_peer(&client, http_addr, peer_id).await;
         let initial_identity = assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &kernel).await;
         assert_eq!(initial_identity["kernel_epoch_seq"], 0);
@@ -1590,7 +1586,7 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
                 let initial_registration = route_events(&node.logs(), 500)[0].1;
                 wait_for_route_removal(&mut node, initial_registration).await;
                 assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
-                assert_eq!(count_log_lines(&node.logs(), "kernel-X readiness!"), 1, "cached kernel reused prior readiness");
+                assert_eq!(count_log_lines(&node.logs(), "[kern-X][INFO] ready"), 1, "cached kernel reused prior readiness");
                 assert_eq!(count_log_lines_with(&node.logs(), "Deployment root activated", "seq=1"), 0);
                 println!("LANDING3_B_REVOKED={}", serde_json::json!({"epoch": seq, "blocked_head": h1.cid.to_string(), "identity": version(&client, admin_addr).await}));
                 replacement_release.send(true).unwrap();
@@ -1628,8 +1624,8 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
             assert!(ipfs.ls(&format!("{root_path}/.ww")).await.is_err(), "private state leaked into FHS");
             assert_persistent_peer(&client, http_addr, peer_id).await;
             let identity = assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, seq, &kernel).await;
-            assert_eq!(count_log_lines(&node.logs(), "kernel-X readiness!"), if seq == 1 { 2 } else { 3 });
-            assert!(!node.logs().contains("kernel-A readiness!") && !node.logs().contains("kernel-B readiness!"));
+            assert_eq!(count_log_lines(&node.logs(), "[kern-X][INFO] ready"), if seq == 1 { 2 } else { 3 });
+            assert!(!node.logs().contains("[kern-A][INFO] ready") && !node.logs().contains("[kern-B][INFO] ready"));
             assert_eq!(identity["kernel_cid"], ww::kernel::runtime_cid(&kernel).to_string());
             assert_eq!(identity["kernel_epoch_seq"], seq);
             assert_eq!(identity["kernel_effective_root"], effective.to_string());
@@ -2110,6 +2106,14 @@ mod rust_lifecycle {
         proxy_task.abort();
         let logs = node.logs();
         assert_eq!(exit.code(), Some(0), "unexpected host exit\n{logs}");
+        for (listener, addr) in [("admin", admin_addr), ("WAGI", http_addr)] {
+            let expected = format!("[host][INFO] listening on {addr} ({listener})");
+            assert_eq!(
+                logs.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected one {expected} line\n{logs}"
+            );
+        }
         assert!(
             logs.contains("Kernel exited") && logs.contains("code=0"),
             "host did not report the propagated pid0 exit code\n{logs}"
@@ -2175,7 +2179,7 @@ mod rust_lifecycle {
 
         wait_for_ready(&client, &ready_url, &mut node).await;
         assert_status_cell(&client, http_addr, &cid_a, &node).await;
-        wait_for_log(&mut node, "kernel-A readiness!", "").await;
+        wait_for_log(&mut node, "[kern-A][INFO] ready", "").await;
         let initial_identity =
             assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &kernel_a).await;
         assert_persistent_peer(&client, http_addr, peer_id).await;
@@ -2217,7 +2221,7 @@ mod rust_lifecycle {
         let recovered = wait_for_ready(&client, &ready_url, &mut node).await;
         assert_eq!(recovered["phase"], "ready");
         assert_status_cell(&client, http_addr, &cid_b, &node).await;
-        wait_for_log(&mut node, "kernel-B readiness!", "").await;
+        wait_for_log(&mut node, "[kern-B][INFO] ready", "").await;
         let final_identity =
             assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 1, &kernel_b).await;
         assert_ne!(initial_identity["kernel_cid"], final_identity["kernel_cid"]);
@@ -2528,7 +2532,7 @@ async fn local_targeted_kernel_mount_executes_selected_bytes() {
         .push(format!("{}:/boot/kernel.wasm", kernel_path.display()));
     let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
     wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
-    wait_for_log(&mut node, "kernel-X readiness!", "").await;
+    wait_for_log(&mut node, "[kern-X][INFO] ready", "").await;
     assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &selected).await;
     assert_status_route(&client, http_addr, &node).await;
     node.close_stdin();
@@ -2556,6 +2560,7 @@ async fn bare_installed_boot_from_unrelated_cwd_does_not_import_cwd_or_private_s
     options.cwd = Some(cwd.path().canonicalize().unwrap());
     let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
     wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    wait_for_log(&mut node, "[kernel][INFO] ready", "").await;
     assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &kernel).await;
     let root = activated_root(&client, admin_addr, 0).await;
     let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
@@ -2592,7 +2597,7 @@ async fn explicit_dot_boots_complete_source_without_installation() {
     options.cwd = Some(image.path().canonicalize().unwrap());
     let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
     wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
-    wait_for_log(&mut node, "kernel-A readiness!", "").await;
+    wait_for_log(&mut node, "[kern-A][INFO] ready", "").await;
     assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &selected).await;
     let root = activated_root(&client, admin_addr, 0).await;
     assert_eq!(
@@ -2629,7 +2634,7 @@ async fn kubo_targeted_kernel_mount_reports_verified_source_and_runtime_identity
         .push(format!("/ipfs/{source_cid}:/boot/kernel.wasm"));
     let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
     wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
-    wait_for_log(&mut node, "kernel-B readiness!", "").await;
+    wait_for_log(&mut node, "[kern-B][INFO] ready", "").await;
     let identity = assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &selected).await;
     assert_eq!(identity["kernel_source_cid"], source_cid);
     assert_status_route(&client, http_addr, &node).await;
@@ -2670,7 +2675,7 @@ async fn invalid_selected_kernel_fails_without_installed_or_embedded_fallback() 
             "kernel failure not identified: {logs}"
         );
         assert!(
-            !logs.contains("committed readiness"),
+            !logs.contains("[kernel][INFO] ready"),
             "{case} fell back to installed kernel\n{logs}"
         );
         assert!(
@@ -2705,7 +2710,7 @@ async fn selected_block_failure_driver(status: StatusCode) {
             let epoch1 = EpochRoot::with_kernel(&ipfs, &variant_a, &kernel_a, 1).await;
             let epoch2 = EpochRoot::with_kernel(&ipfs, &variant_b, &kernel_b, 2).await;
             let selected_block =
-                selected_marker_block(&client, kubo_addr, &epoch2.cid, "kernel-B readiness!").await;
+                selected_marker_block(&client, kubo_addr, &epoch2.cid, "[kern-B]").await;
             let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
             atom.set_head(&epoch1.cid).await;
 
@@ -2780,16 +2785,16 @@ async fn selected_block_failure_driver(status: StatusCode) {
             assert!(kubo_pin_is_present(&client, kubo_addr, &hidden_cid).await);
             assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
             println!("LANDING3_H_RETRY_RETENTION={}", serde_json::json!({"failure_status": status.as_u16(), "epoch": 1, "hidden_source": hidden_cid.to_string(), "old_effective": initial_root.to_string(), "identity": version(&client, admin_addr).await}));
-            assert!(!node.logs().contains("kernel-B readiness!"));
+            assert!(!node.logs().contains("[kern-B][INFO] ready"));
             assert_eq!(
-                count_log_lines(&node.logs(), "kernel-A readiness!"),
+                count_log_lines(&node.logs(), "[kern-A][INFO] ready"),
                 1,
                 "previous kernel restarted during retry"
             );
             release_tx.send(true).unwrap();
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_b, &node).await;
-            wait_for_log(&mut node, "kernel-B readiness!", "").await;
+            wait_for_log(&mut node, "[kern-B][INFO] ready", "").await;
             assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 1, &kernel_b).await;
             let final_root = activated_root(&client, admin_addr, 1).await;
             assert_eq!(
@@ -3035,7 +3040,7 @@ async fn invalid_and_corrupted_selected_kernels_close_identity_until_valid_head_
         let valid = EpochRoot::with_kernel(&ipfs, &status, &kernel_b, 42).await;
         let corrupt = EpochRoot::with_kernel(&ipfs, &status, &kernel_x, 43).await;
         let final_head = EpochRoot::with_kernel(&ipfs, &status, &kernel_a, 44).await;
-        let block = selected_marker_block(&client, kubo, &corrupt.cid, "kernel-X readiness!").await;
+        let block = selected_marker_block(&client, kubo, &corrupt.cid, "[kern-X]").await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         let (proxy, corrupt_attempts) = start_corrupt_block_kubo_proxy(listener, kubo, block.to_string());
@@ -3063,8 +3068,8 @@ async fn invalid_and_corrupted_selected_kernels_close_identity_until_valid_head_
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert_eq!(count_log_lines_with(&node.logs(), "Deployment root activated", &format!("seq={seq}")), 0);
-            assert!(!node.logs().contains("kernel-X readiness!"), "corrupted bytes launched PID0");
-            assert!(!node.logs().contains("committed readiness"), "installed baseline became a fallback");
+            assert!(!node.logs().contains("[kern-X][INFO] ready"), "corrupted bytes launched PID0");
+            assert!(!node.logs().contains("[kernel][INFO] ready"), "installed baseline became a fallback");
             atom.set_head(&recovered.cid).await;
             wait_for_log(&mut node, "Advancing deployment epoch", &format!("seq={}", seq + 1)).await;
             wait_for_ready(&client, &ready, &mut node).await;
@@ -3073,8 +3078,8 @@ async fn invalid_and_corrupted_selected_kernels_close_identity_until_valid_head_
             println!("LANDING3_F_H={}", serde_json::json!({"rejected_epoch": seq, "rejected_head": rejected.cid.to_string(), "recovered": identity, "peer_id": peer.to_string()}));
         }
         assert!(corrupt_attempts.load(Ordering::SeqCst) > 0);
-        assert_eq!(count_log_lines(&node.logs(), "kernel-A readiness!"), 2);
-        assert_eq!(count_log_lines(&node.logs(), "kernel-B readiness!"), 1);
+        assert_eq!(count_log_lines(&node.logs(), "[kern-A][INFO] ready"), 2);
+        assert_eq!(count_log_lines(&node.logs(), "[kern-B][INFO] ready"), 1);
         proxy.abort();
     }).await;
 }
@@ -3092,7 +3097,7 @@ async fn superseded_selected_kernel_read_never_launches_obsolete_pid0() {
         let initial = EpochRoot::with_kernel(&ipfs, &status, &kernel_a, 50).await;
         let obsolete = EpochRoot::with_kernel(&ipfs, &status, &kernel_b, 51).await;
         let newest = EpochRoot::with_kernel(&ipfs, &status, &kernel_x, 52).await;
-        let block = selected_marker_block(&client, kubo, &obsolete.cid, "kernel-B readiness!").await;
+        let block = selected_marker_block(&client, kubo, &obsolete.cid, "[kern-B]").await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         let (proxy, mut reached, release) = start_gated_kubo_proxy_for(listener, kubo, block.to_string(), true);
@@ -3114,7 +3119,7 @@ async fn superseded_selected_kernel_read_never_launches_obsolete_pid0() {
             .unwrap_or_else(|| panic!("missing swarm listen address: {swarm_addrs:?}\n{}", node.logs()));
         let swarm_port: u16 = swarm_addr.strip_prefix("/ip4/127.0.0.1/tcp/").unwrap().parse().unwrap();
         assert_ne!(swarm_port, 0, "swarm port was not assigned\n{}", node.logs());
-        wait_for_log(&mut node, "kernel-A readiness!", "").await;
+        wait_for_log(&mut node, "[kern-A][INFO] ready", "").await;
         atom.set_head(&obsolete.cid).await;
         wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
         tokio::time::timeout(INVALIDATION_TIMEOUT, reached.recv()).await
@@ -3124,13 +3129,13 @@ async fn superseded_selected_kernel_read_never_launches_obsolete_pid0() {
         wait_for_log(&mut node, "Advancing deployment epoch", "seq=2").await;
         // A blocked obsolete request must not prevent a newer epoch from becoming ready.
         wait_for_ready(&client, &ready, &mut node).await;
-        wait_for_log(&mut node, "kernel-X readiness!", "").await;
+        wait_for_log(&mut node, "[kern-X][INFO] ready", "").await;
         let identity = assert_kernel_epoch(&client, admin, kubo, &node, 2, &kernel_x).await;
         assert_persistent_peer(&client, http, peer).await;
         release.send(true).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let logs = node.logs();
-        assert!(!logs.contains("kernel-B readiness!"), "obsolete guest executed\n{logs}");
+        assert!(!logs.contains("[kern-B][INFO] ready"), "obsolete guest executed\n{logs}");
         assert_eq!(count_log_lines_with(&logs, "Deployment root activated", "seq=1"), 0);
         assert_eq!(version(&client, admin).await["kernel_epoch_seq"], 2);
         println!("LANDING3_G={}", serde_json::json!({"blocked_leaf": block.to_string(), "obsolete": obsolete.cid.to_string(), "accepted": identity, "peer_id": peer.to_string(), "swarm_listen": swarm_addr}));
@@ -3170,6 +3175,6 @@ async fn missing_or_wrong_type_selected_kernel_has_no_implicit_fallback() {
             "incomplete source started\n{}",
             node.logs()
         );
-        assert!(!node.logs().contains("committed readiness"));
+        assert!(!node.logs().contains("[kernel][INFO] ready"));
     }
 }

@@ -216,12 +216,16 @@ impl NetworkState {
         &self.local_peer_id
     }
 
-    pub async fn add_listen_addr(&self, addr: Vec<u8>) {
+    /// Returns true when the address was newly inserted.
+    pub async fn add_listen_addr(&self, addr: Vec<u8>) -> bool {
         let mut guard = self.inner.write().await;
         if !guard.listen_addrs.contains(&addr) {
             guard.listen_addrs.push(addr);
             drop(guard);
             self.listen_addr_notify.notify_waiters();
+            true
+        } else {
+            false
         }
     }
 
@@ -885,14 +889,14 @@ mod tests {
     async fn test_network_state_add_remove_addr() {
         let state = NetworkState::from_peer_id(vec![1]);
 
-        state.add_listen_addr(vec![10, 20]).await;
-        state.add_listen_addr(vec![30, 40]).await;
+        assert!(state.add_listen_addr(vec![10, 20]).await);
+        assert!(state.add_listen_addr(vec![30, 40]).await);
 
         let snap = state.snapshot().await;
         assert_eq!(snap.listen_addrs.len(), 2);
 
         // Duplicate add is a no-op
-        state.add_listen_addr(vec![10, 20]).await;
+        assert!(!state.add_listen_addr(vec![10, 20]).await);
         let snap = state.snapshot().await;
         assert_eq!(snap.listen_addrs.len(), 2);
 

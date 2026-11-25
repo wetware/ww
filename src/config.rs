@@ -29,7 +29,7 @@ fn default_filter(level: &str) -> String {
 /// Initialize tracing using `RUST_LOG` and `WW_LOG_FORMAT`.
 ///
 /// Default log level depends on context:
-/// - Destination TTY (interactive command): `warn`
+/// - Destination TTY (interactive command): `warn`, with listener announcements at `info`
 /// - Destination non-TTY (daemon/pipe): `info`
 ///
 /// Applied uniformly across all wetware-internal workspace crates
@@ -67,8 +67,13 @@ pub fn init_tracing() -> Option<crate::telemetry::TelemetryGuard> {
 
         let is_terminal = std::io::stderr().is_terminal();
         let level = if is_terminal { "warn" } else { "info" };
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter(level)));
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(format!(
+                "{},{}=info",
+                default_filter(level),
+                crate::logging::LISTENER_TARGET
+            ))
+        });
         let (json, invalid_format) = match std::env::var("WW_LOG_FORMAT").as_deref() {
             Ok("compact") => (false, false),
             Ok("json") => (true, false),

@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rustls, and zstd. Remove two obsolete `hickory-proto` audit exceptions.
 
 ### Changed
+- Report effective Host listener addresses at startup and print `[kernel][INFO] ready` after PID0 commits readiness. JSON logs identify listener announcements with event code 112.
 - Run fixture-independent checks on pushes and pull requests. Full Host, WASI,
   container and five-platform qualification now require an exact-SHA dispatch.
 - Run the IPFS and Kad integration suites against the configured CI Kubo daemon.

@@ -156,7 +156,7 @@ async fn run_kernel(membrane: Membrane) -> Result<(), capnp::Error> {
         .map_err(|error| capnp::Error::failed(format!("{INITIAL_INIT_FAILED}: {error}")))?;
 
     match kernel_ready() {
-        Ok(()) => log::info!("committed readiness"),
+        Ok(()) => log::info!("ready"),
         Err(ReadyError::StaleGeneration) => {
             return Err(capnp::Error::failed(
                 "KERNEL_READY_FAILED: stale generation".into(),

@@ -204,7 +204,8 @@ is absent or empty. JSON never adds ANSI color.
 
 Without a valid `RUST_LOG`, internal targets (`ww`, `atom`, `cache`, `cell`, `ipfs`,
 `membrane`, `rpc`, `stem`) default to `warn` on a terminal and `info` when stderr
-is redirected. A valid `RUST_LOG` replaces these defaults, including target and
+is redirected. The `ww::listener` target defaults to `info` on both, so a terminal
+shows effective bound addresses during startup. A valid `RUST_LOG` replaces these defaults, including target and
 span-field directives. For example:
 
 ```sh
