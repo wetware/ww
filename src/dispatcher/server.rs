@@ -55,7 +55,7 @@ impl crate::services::Service for WagiService {
 
             let listener = tokio::net::TcpListener::from_std(self.listener)?;
             let local_addr = listener.local_addr()?;
-            tracing::info!(%local_addr, "WAGI HTTP server listening");
+            crate::logging::BoundListener::Wagi(local_addr).log();
 
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {

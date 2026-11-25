@@ -1,7 +1,7 @@
 //! Output policy for the Host's existing tracing subscriber.
 //!
 //! Values are untrusted, including `message`, Display/Debug, and span updates.
-//! Only approved numeric/boolean fields and the event catalog reach output.
+//! Listener events also expose the transport-reported local endpoint.
 use std::{error::Error, fmt};
 
 use serde_json::{json, Map, Value};
@@ -18,6 +18,40 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
+pub(crate) const LISTENER_TARGET: &str = "ww::listener";
+
+pub(crate) enum BoundListener<'a> {
+    Admin(std::net::SocketAddr),
+    Wagi(std::net::SocketAddr),
+    Swarm(&'a libp2p::Multiaddr),
+}
+
+impl BoundListener<'_> {
+    pub(crate) fn log(self) {
+        let (listener, address): (_, &dyn fmt::Display) = match &self {
+            Self::Admin(addr) => ("admin", addr),
+            Self::Wagi(addr) => ("wagi", addr),
+            Self::Swarm(addr) if is_direct_endpoint(addr) => ("swarm", addr),
+            Self::Swarm(_) => return,
+        };
+        tracing::info!(target: LISTENER_TARGET,
+            event_code = rpc::observability::EventCode::HostListening as u16,
+            listener, local_addr = address.to_string().as_str(), "listening");
+    }
+}
+
+// A transport may also announce relay reservations. Only direct sockets have
+// a local endpoint to disclose. Never render paths, names, or peer IDs.
+fn is_direct_endpoint(addr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol::*;
+    let mut parts = addr.iter();
+    matches!(parts.next(), Some(Ip4(_) | Ip6(_)))
+        && matches!(
+            (parts.next(), parts.next(), parts.next()),
+            (Some(Tcp(_)), None, None) | (Some(Udp(_)), Some(QuicV1), None)
+        )
+}
+
 const MAX_FIELDS: usize = 32;
 const MAX_CHAIN: usize = 8;
 const MAX_RECORD_BYTES: usize = 16_384;
@@ -27,6 +61,7 @@ const REDACTED: &str = "[redacted]";
 pub(crate) struct Fields {
     values: Map<String, Value>,
     truncated: bool,
+    bound_listener: bool,
 }
 
 impl Fields {
@@ -146,8 +181,20 @@ impl Visit for Fields {
         );
     }
 
-    fn record_str(&mut self, field: &Field, _: &str) {
-        self.insert(field.name(), REDACTED.into());
+    fn record_str(&mut self, field: &Field, value: &str) {
+        let approved = self.bound_listener
+            && match field.name() {
+                "listener" => matches!(value, "admin" | "wagi" | "swarm"),
+                // Bound parser input even if another producer imitates our metadata.
+                "local_addr" if value.len() <= 80 => {
+                    value.parse::<std::net::SocketAddr>().is_ok()
+                        || value.parse::<libp2p::Multiaddr>().is_ok_and(|addr| {
+                            is_direct_endpoint(&addr) && addr.to_string() == value
+                        })
+                }
+                _ => false,
+            };
+        self.insert(field.name(), if approved { value } else { REDACTED }.into());
     }
 
     fn record_debug(&mut self, field: &Field, _: &dyn fmt::Debug) {
@@ -229,7 +276,7 @@ impl<'writer> FormatFields<'writer> for SafeFields {
     ) -> fmt::Result {
         let mut safe = Fields {
             values: serde_json::from_str(&current.fields).map_err(|_| fmt::Error)?,
-            truncated: false,
+            ..Fields::default()
         };
         fields.record(&mut safe);
         current.fields = Value::Object(safe.finish()).to_string();
@@ -252,7 +299,13 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        let mut safe = Fields::default();
+        // Only the typed BoundListener callsite may expose its endpoint.
+        // Keep identically named span fields and other event fields redacted.
+        let mut safe = Fields {
+            bound_listener: event.metadata().target() == LISTENER_TARGET
+                && event.metadata().module_path() == Some(module_path!()),
+            ..Fields::default()
+        };
         event.record(&mut safe);
         let mut fields = safe.finish();
         let contract = fields
@@ -370,4 +423,27 @@ fn compact(record: &Value, ansi: bool) -> String {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_direct_ip_transport_endpoints_can_be_announced() {
+        for (addr, expected) in [
+            ("/ip4/127.0.0.1/tcp/2025", true),
+            ("/ip6/::1/udp/2025/quic-v1", true),
+            ("/unix/private", false),
+            ("/dns4/private.example/tcp/2025", false),
+            ("/ip4/127.0.0.1/tcp/2025/p2p-circuit", false),
+            ("/ip6/::1/udp/2025/quic-v1/webtransport", false),
+        ] {
+            assert_eq!(
+                is_direct_endpoint(&addr.parse().unwrap()),
+                expected,
+                "{addr}"
+            );
+        }
+    }
 }

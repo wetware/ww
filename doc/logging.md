@@ -36,6 +36,7 @@ them. Every recognized event includes numeric `contract_version=1`.
 | 108 | host | start | failed | worker_start_failed | ERROR |
 | 109 | host | compile | failed | worker_panicked | ERROR |
 | 110 | kernel | run | completed | process_exited | INFO |
+| 112 | host | listen | completed | bound | INFO |
 | 200 | cell | run | completed | process_exited | TRACE |
 | 201 | cell | run | failed | process_failed | WARN or ERROR |
 | 202 | cell | teardown | failed | cleanup_failed | ERROR |
@@ -86,6 +87,8 @@ current event span. Compact output retains `field=value` pairs, including numeri
 
 | Optional field | Type | Meaning |
 | --- | --- | --- |
+| `listener` | string | Code 112 listener kind: `admin`, `wagi`, or `swarm` |
+| `local_addr` | string | Code 112 effective IP socket address (HTTP) or direct TCP/QUIC IP multiaddress (swarm) |
 | `owner_id` | integer | Process-local ExecutorPool owner identity |
 | `cell_id` | integer | Process-local ordinary child Cell identity |
 | `rpc_id` | integer | Process-local managed RPC connection identity |
@@ -130,6 +133,12 @@ This policy covers credentials, capability payloads, guest content, filesystem
 paths, protocol names, route prefixes, peer names, CIDs, arbitrary identifiers,
 panic payloads, and error messages. It does not attempt to recognize secrets by
 regular expression. Host-owned literal contract messages remain readable.
+
+Code 112 discloses the local interface address and port. Only the Host listener
+callsite can supply its two string fields. The HTTP services obtain the address
+from the bound socket. The swarm reports a newly active direct IP address from
+the transport. The callsite excludes DNS names, filesystem paths, peer IDs,
+relay reservations, and multiaddresses with additional components.
 
 Record real errors with `error = &error as &dyn std::error::Error`. For `anyhow`,
 use `error = error.as_ref() as &dyn std::error::Error`. `%error`, `?error`, and

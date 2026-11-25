@@ -22,6 +22,7 @@ pub enum EventCode {
     CompilerPanicked = 109,
     KernelExited = 110,
     TelemetryDisabled = 111,
+    HostListening = 112,
     CellExited = 200,
     CellFailed = 201,
     CellCleanupFailed = 202,
@@ -109,6 +110,7 @@ pub fn contract(code: u64) -> Option<Contract> {
             "configuration_or_start_failed",
             "Local trace export disabled: invalid configuration or exporter startup failed",
         ),
+        112 => ("host", "listen", "completed", "bound", "listening"),
         100 => (
             "host",
             "start",

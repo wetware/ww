@@ -836,7 +836,9 @@ impl Net {
                             } else {
                                 tracing::debug!(%address, "Skipping unspecified listen address");
                             }
-                            network_state.add_listen_addr(address.to_vec()).await;
+                            if network_state.add_listen_addr(address.to_vec()).await {
+                                crate::logging::BoundListener::Swarm(&address).log();
+                            }
                         }
                         SwarmEvent::ExpiredListenAddr { address, .. } => {
                             self.swarm.remove_external_address(&address);

@@ -279,6 +279,16 @@ fn json_preserves_typed_fields_and_multiline_errors_in_one_event() {
 }
 
 #[test]
+fn listener_fields_remain_redacted_outside_the_bound_listener_callsite() {
+    let capture = capture(false, &[("WW_LOG_TEST_PROBE", "listener_fields")]);
+    let events = capture.json();
+    assert_eq!(events.len(), 1);
+    assert!(capture.stderr.len() <= 16 * 1024);
+    assert_eq!(events[0]["fields"]["listener"], "[redacted]");
+    assert_eq!(events[0]["fields"]["local_addr"], "[redacted]");
+}
+
+#[test]
 fn json_keeps_only_current_span_with_correct_async_attribution() {
     let capture = capture(false, &[]);
     let events = capture.json();
@@ -510,6 +520,55 @@ fn cli_startup_diagnostics_use_json_stderr_and_leave_stdout_empty() {
         "{stderr}"
     );
     assert!(!stderr.contains('\x1b'), "{stderr}");
+}
+
+#[test]
+fn swarm_listening_event_reports_the_bound_port_once() {
+    let capture = capture(false, &[("WW_LOG_TEST_PROBE", "swarm_listen")]);
+    let bound = capture
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("BOUND="))
+        .unwrap();
+    let events = capture.json();
+    let listeners: Vec<_> = events
+        .iter()
+        .filter(|event| event["target"] == "ww::listener")
+        .collect();
+    assert_eq!(listeners.len(), 1, "{events:?}");
+    let event = listeners[0];
+    assert_eq!(event["level"], "INFO");
+    assert_eq!(event["fields"]["event_code"], 112);
+    assert_eq!(event["fields"]["contract_version"], 1);
+    assert_eq!(event["fields"]["category"], "host");
+    assert_eq!(event["fields"]["operation"], "listen");
+    assert_eq!(event["fields"]["outcome"], "completed");
+    assert_eq!(event["fields"]["reason"], "bound");
+    assert_eq!(event["fields"]["message"], "listening");
+    assert_eq!(event["fields"]["listener"], "swarm");
+    assert_eq!(event["fields"]["local_addr"], bound);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_shows_swarm_listening_unless_filtered() {
+    let probe = ("WW_LOG_TEST_PROBE", "swarm_listen");
+    let terminal = capture(true, &[probe, ("NO_COLOR", "1")]);
+    let bound = terminal
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("BOUND="))
+        .unwrap();
+    assert!(
+        terminal
+            .stderr
+            .lines()
+            .any(|line| line.contains("listening") && line.contains(bound)),
+        "{}",
+        terminal.stderr
+    );
+    let quiet = capture(true, &[probe, ("RUST_LOG", "warn")]);
+    assert!(!quiet.stderr.contains("listening"), "{}", quiet.stderr);
 }
 
 #[test]
@@ -832,16 +891,23 @@ fn logging_probe() {
     }
     println!("{STDOUT_MARKER}");
     let probe = std::env::var("WW_LOG_TEST_PROBE");
+    if probe.as_deref() == Ok("listener_fields") {
+        tracing::info!(target: "ww::listener", event_code = rpc::observability::EventCode::HostListening as u16,
+            listener = "untrusted label", local_addr = "untrusted address".repeat(4096).as_str(), "listening");
+        return;
+    }
     if matches!(
         probe.as_deref(),
-        Ok("rpc" | "stream" | "vat_listener" | "owners" | "children")
+        Ok("rpc" | "stream" | "vat_listener" | "owners" | "children" | "swarm_listen")
     ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(tokio::task::LocalSet::new().run_until(async {
-            if probe.as_deref() == Ok("rpc") {
+            if probe.as_deref() == Ok("swarm_listen") {
+                swarm_listen_probe().await;
+            } else if probe.as_deref() == Ok("rpc") {
                 rpc_correlation_probe().await;
             } else if probe.as_deref() == Ok("vat_listener") {
                 vat_listener_correlation_probe().await;
@@ -1116,6 +1182,45 @@ impl authority::system_capnp::executor::Server for StreamProbe {
         release.await.unwrap();
         Err(capnp::Error::failed("controlled stream probe error".into()))
     }
+}
+
+async fn swarm_listen_probe() {
+    let bind = |address| {
+        ww::host::Net::new(
+            vec![address],
+            libp2p::identity::Keypair::generate_ed25519(),
+            None,
+            Vec::new(),
+        )
+    };
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!(
+        "/ip4/127.0.0.1/tcp/{}",
+        occupied.local_addr().unwrap().port()
+    );
+    assert!(
+        bind(address.parse().unwrap()).is_err(),
+        "occupied port accepted"
+    );
+
+    let net = bind("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+    let state = rpc::NetworkState::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let observe = async {
+        let bound = libp2p::Multiaddr::try_from(state.wait_for_listen_addr().await).unwrap();
+        let port = match bound.iter().last().unwrap() {
+            libp2p::multiaddr::Protocol::Tcp(port) => port,
+            other => panic!("unexpected listener protocol: {other:?}"),
+        };
+        assert_ne!(port, 0);
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        println!("BOUND={bound}");
+        drop(tx);
+    };
+    let (result, ()) = tokio::join!(net.run(state.clone(), rx), observe);
+    result.unwrap();
 }
 
 fn memory_swarm() -> libp2p::Swarm<libp2p_stream::Behaviour> {

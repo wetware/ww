@@ -117,6 +117,10 @@ fn normal_startup_reaches_listener_with_damaged_native_metadata() {
                 && (stderr.contains("Address already in use") || stderr.contains("address in use")),
             "ordinary startup did not reach listener (damaged={damaged}): {stderr}"
         );
+        assert!(
+            !stderr.contains("ww::listener"),
+            "occupied admin port announced: {stderr}"
+        );
         if damaged {
             assert_eq!(
                 std::fs::read(home.join(".ww/host-upgrade.json")).unwrap(),
