@@ -708,9 +708,8 @@ def matches_caller(shell_path):
         names = {"csh": ("csh", "tcsh", "bsd-csh"), "ksh": ("ksh", "ksh93", "mksh")}
         return (executable.resolve(strict=True).name in names.get(shell, (shell,))
                 and shell_path.samefile(executable))
-    except (ImportError, AttributeError, OSError):
-        pass
-    return False
+    except (ImportError, AttributeError, OSError, RuntimeError):
+        return False
 
 
 def consent(destination):
