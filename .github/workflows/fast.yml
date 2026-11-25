@@ -110,6 +110,7 @@ jobs:
         bash tests/test_deploy_context.sh
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
+        python3 tests/test_install_path.py
         python3 tests/test_release_auth.py
         python3 tests/test_producer_artifacts.py
         bash -n tests/test_container_boot.sh

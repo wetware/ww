@@ -72,6 +72,30 @@ paths when using a nondefault Kubo, for example:
 sh scripts/install.sh --release <CID> --ipfs-url http://127.0.0.1:55001
 ```
 
+## Find `ww` on PATH
+
+After a successful installation, `scripts/install.sh` checks whether `~/.ww/bin` is
+on `PATH`. If the directory is missing, an interactive installation can offer
+to update a startup file for your shell. The prompt reads from the controlling
+terminal, including when the script arrives through a pipe. Press Enter to
+decline. The prompt requires a foreground job started by a shell with job control. A 15-second timeout or end of input also declines. Set `WW_NONINTERACTIVE=1` to suppress the prompt in automation.
+
+| Shell | Startup file for future sessions |
+|---|---|
+| Zsh | `.zshrc` under `ZDOTDIR`, or under your home directory by default. |
+| Bash | On macOS, the first existing login file among `~/.bash_profile`, `~/.bash_login`, and `~/.profile`, or a new `~/.bash_profile` if none exists. On Linux, `~/.bashrc` for interactive shells. |
+| Fish | `fish/conf.d/ww-path.fish` under `XDG_CONFIG_HOME`, which defaults to `~/.config`. |
+| Ksh | An existing `.kshrc`, `kshrc`, or `.mkshrc` selected by a literal absolute `ENV` path under your home directory. Paths with shell syntax require manual setup. |
+| POSIX sh, Dash, BusyBox Ash | Manual. The startup file depends on how the shell starts and how the system configures it. |
+| Csh, Tcsh | Csh uses `~/.cshrc`. Tcsh uses `~/.tcshrc` when it exists and `~/.cshrc` otherwise. |
+| Nushell | Manual. Run `$nu.config-path` to locate the active configuration file. |
+
+The installer shows the proposed destination before asking for consent.
+Automatic edits require a destination under your home directory. If the installer
+declines a destination, use the printed command in your shell. To use `ww`
+immediately after approving an edit, open a new shell or run the printed command
+in your current shell. For an unrecognized shell, run `~/.ww/bin/ww` directly.
+
 ## Separate software and service operations
 
 | Command | Effect |

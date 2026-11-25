@@ -440,6 +440,19 @@ chmod +x "$HOME/.ww/bin/ww"
                 self.calls.unlink()
                 self.transport.unlink()
 
+    def test_piped_install_without_terminal_preserves_shell_configuration(self):
+        installer = self.automatic_fixture()
+        config = self.home / '.zshrc'
+        config.write_bytes(b'# existing config')
+        for _ in range(2):
+            result = subprocess.run(['sh'], input=installer.read_text(), text=True,
+                                    env=dict(self.env, SHELL='/bin/zsh'), start_new_session=True,
+                                    capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('For the current session', result.stdout)
+            self.assertNotIn('Add Wetware to your PATH?', result.stdout + result.stderr)
+            self.assertEqual(config.read_bytes(), b'# existing config')
+
     def test_embedded_key_permissions_with_group_writable_umask(self):
         installer = self.automatic_fixture()
         observed = self.root / 'observed-key'
