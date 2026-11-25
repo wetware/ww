@@ -67,14 +67,42 @@ artifact. Its image job still requires the exact tested digest.
 
 | Entry point | Checks and outputs |
 | --- | --- |
-| PRs and pushes to `master` or `staging` (`fast.yml`) | Repository artifacts and lockfiles, formatting, Clippy, Foundry, fuzz corpus, architecture map, offline release and installer controls, standalone standard library, and selected native Rust tests. The `Test` job requires every fast check to succeed. |
+| PRs and pushes to `master` or `staging` (`fast.yml`) | Repository artifacts and lockfiles, formatting, Clippy, Foundry, fuzz corpus, architecture map, offline release and installer controls, standalone standard library, selected native Rust tests, and a required Wasmtime P3 job. The `Test` job requires every fast check to succeed. |
 | Full dispatch (`rust.yml`) | Fast checks plus workspace build and Host tests with Kubo and Foundry, WASI P3 fixtures and guest cancellation, canonical FHS, packaged installation and boot, all five native producers, and source and artifact container boots. |
 | Master PRs (`changelog.yml`) | The existing `Require changelog entry` check runs independently. |
 
-`scripts/test_fast_rust.sh` selects native library and integration targets.
-Full Host tests require generated first-party components, the native P3,
-authority, Gate 2B, routing-key and stream-lifecycle probes, and a live Kubo API.
-Full CI checks the downloaded fixture paths before running the workspace suite.
+#### Test selection
+
+Run these suites on every ordinary PR and eligible push. Changes to WIT, the
+guest ABI, the toolchain, host imports and shared dependencies all receive
+the same runtime coverage.
+
+| Tier | Selection | Regression detected |
+| --- | --- | --- |
+| Fast Rust | Native library and integration targets for `auth`, `routing-key`, `wetware-authority`, `wetware-membrane`, `ww-cache`, `ipfs`, `release`, `rpc`, `system` and `discovery`. Run three ignored RPC quota tests in separate processes. | Includes guest session cleanup, discovery, RPC ownership, capability checks, decoding and release signature checks. |
+| Fast P3 | Run `make test-p3-fixture` followed by `make test-guest-session-cancel` on the same runner. Both reuse the native `cell` test build. | Six tests instantiate a generated component and exercise transport ordering, backpressure, flush, failure, Store-owner abort and filesystem cleanup. Four tests exercise guest cancellation and normal completion with a surviving Store, sibling work and reentry. |
+| Full Host | Run the workspace suite against the validated first-party guests and probes. | Discovery and stream integration exercise the production Executor and loopback listeners. Authority and Gate 2B probes exercise process grants. Kubo-backed tests exercise DAGs, pins and interoperability. Atom chain integration uses Foundry. |
+| Full release | Test the installed Host and canonical FHS, verify five platform packages and boot source and artifact containers. | Detects incorrect packaged bytes, installation failures and discrepancies between producers. |
+
+Prefer a deterministic test that exercises a distinct runtime failure mode
+and fits measured PR wall time and runner cost. The two Fast P3 suites use
+generated components and local endpoints. Neither requires live Kubo or
+the canonical FHS. The routing-key probe covers a narrower synchronous
+import. The Launcher, stream and discovery integration tests also need a
+Host build. Retain these tests in Full pending a measurement of their
+incremental cost. Full also runs the release library with the `package` feature.
+
+Update [the selection inventory](../scripts/check_fast_selection.py) when adding a
+deferred Cargo test target or a guest fixture. The selected native packages
+automatically pick up ordinary library and integration tests. Review
+new cases in deferred targets individually. Move eligible cases into routine
+coverage when practical. Check selected ignored tests with libtest discovery
+so a stale selector cannot pass with zero tests. Measure new suites with the
+required `Test` result, the sum of job durations, and the cache status.
+
+Full dispatch runs both P3 suites in its existing WASM producer before staging
+the FHS. Full Host checks the downloaded fixture paths before execution.
+Fast results alone confer no authority to sign or publish.
 
 ### Selecting a producer run
 

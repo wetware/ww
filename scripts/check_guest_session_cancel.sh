@@ -17,7 +17,10 @@ target_dir="${P3_SESSION_TARGET_DIR:-$repo_root/target/guest-session-cancel}"
 fixture=tests/fixtures/guest-session-cancel
 observer=wetware:session-cancel/observer@0.1.0
 
+manifests=()
 for component in child parent; do
+  manifest="$fixture/$component/Cargo.toml"
+  manifests+=("$manifest")
   imports=(
     --allow-import "$observer"
     --allow-import wasi:cli/environment@0.3.0
@@ -43,7 +46,7 @@ for component in child parent; do
   fi
   bash "$script_dir/build_wasip3_component.sh" \
     --name "guest-session-cancel-$component" \
-    --manifest "$fixture/$component/Cargo.toml" \
+    --manifest "$manifest" \
     --artifact "guest_session_cancel_$component" \
     --target-dir "$target_dir" \
     --output "$target_dir/$component.wasm" \
@@ -58,6 +61,7 @@ artifact="$target_dir/composed.wasm"
 test -s "$artifact"
 
 if [[ "$build_only" == false ]]; then
+  selector="$(python3 "$script_dir/check_fast_selection.py" p3 "${manifests[@]}")"
   WW_RPC_SESSION_P3_FIXTURE="$artifact" \
-    cargo test -p cell p3_guest_session_ --locked -- --ignored --test-threads=1 --nocapture
+    cargo test -p cell "$selector" --locked -- --ignored --test-threads=1 --nocapture
 fi

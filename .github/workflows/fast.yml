@@ -116,6 +116,7 @@ jobs:
         bash tests/test_deploy_context.sh
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
+        python3 tests/test_fast_selection.py
         python3 tests/test_install_path.py
         python3 tests/test_release_auth.py
         python3 tests/test_producer_artifacts.py
@@ -313,16 +314,49 @@ jobs:
     - name: Run fixture-independent Rust tests
       run: bash scripts/test_fast_rust.sh
 
+  fast-p3:
+    name: WASI P3 component tests
+    needs: lockfiles
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      P3_TARGET_DIR: ${{ github.workspace }}/target/p3
+      P3_SESSION_TARGET_DIR: ${{ github.workspace }}/target/p3
+    steps:
+    # Full dispatch executes both targets in the required build-wasm producer.
+    - uses: actions/checkout@v5
+      if: github.event_name != 'workflow_dispatch'
+      with:
+        submodules: recursive
+
+    - uses: ./.github/actions/setup-wasi-p3
+      if: github.event_name != 'workflow_dispatch'
+
+    - uses: Swatinem/rust-cache@v2
+      if: github.event_name != 'workflow_dispatch'
+      with:
+        key: fast-p3
+
+    - name: Run native P3 fixture
+      if: github.event_name != 'workflow_dispatch'
+      run: make test-p3-fixture
+
+    - name: Run guest RPC session cancellation
+      if: github.event_name != 'workflow_dispatch'
+      run: make test-guest-session-cancel
+
   test:
     name: Test
-    needs: [lockfiles, fmt, clippy, solidity, fast-rust, fuzz-corpus, test-stdlib, test-architecture-map]
+    needs: [lockfiles, fmt, clippy, solidity, fast-rust, fast-p3, fuzz-corpus, test-stdlib, test-architecture-map]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
     - name: Require all fast checks
       env:
         RESULTS: ${{ toJSON(needs) }}
-      run: jq -e 'length == 8 and all(.[]; .result == "success")' <<< "$RESULTS"
+      run: jq -e 'length == 9 and all(.[]; .result == "success")' <<< "$RESULTS"
 
   pages:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.changes.outputs.architecture_map == 'true'

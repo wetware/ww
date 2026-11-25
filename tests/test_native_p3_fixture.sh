@@ -56,6 +56,20 @@ if [[ " $* " == *" --target wasm32-wasip3 "* ]]; then
   artifact="$CARGO_TARGET_DIR/wasm32-wasip3/release/native_p3_fixture.wasm"
   mkdir -p "$(dirname "$artifact")"
   printf 'component' >"$artifact"
+elif [[ " $* " == *" --list "* ]]; then
+  # This test isolates tool-version/import validation. Supply a complete
+  # libtest listing; test_fast_selection.py exercises discovery failures.
+  python3 - <<'PYTHON'
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, "scripts")
+from check_fast_selection import MANUAL_CELL_CASES, P3_CASES
+for prefix, cases in P3_CASES.items():
+    for case in cases:
+        print(f"{prefix}{case}: test")
+for case in MANUAL_CELL_CASES:
+    print(f"{case}: test")
+PYTHON
 fi
 EOF
 
