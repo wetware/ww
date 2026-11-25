@@ -43,7 +43,7 @@ platform. For a subsequent release, the installer retrieves the verifier from
 the immutable R1 root. R1 must therefore remain available. The pinned verifier
 runs `ww install --release`, authenticates the typed descriptor, selects the
 compatible Host and FHS, and checks the reconstructed bytes before installation.
-The installed Host first runs to report its version.
+The installer runs the installed Host with `--version` as a final check. The success summary shows the installation location and the full release CID.
 
 The shell hands the authenticated package to `ww install`. Installation writes
 `~/.ww/bin/ww`, `~/.ww/fhs/boot/kernel.wasm`, `~/.ww/fhs/bin/status.wasm`, and a
@@ -78,7 +78,9 @@ After a successful installation, `scripts/install.sh` checks whether `~/.ww/bin`
 on `PATH`. If the directory is missing, an interactive installation can offer
 to update a startup file for your shell. The prompt reads from the controlling
 terminal, including when the script arrives through a pipe. Press Enter to
-decline. The prompt requires a foreground job started by a shell with job control. A 15-second timeout or end of input also declines. Set `WW_NONINTERACTIVE=1` to suppress the prompt in automation.
+decline. The prompt requires a foreground job started by a shell with job
+control. A 15-second timeout or end of input also declines. Set
+`WW_NONINTERACTIVE=1` to suppress the prompt in automation.
 
 | Shell | Startup file for future sessions |
 |---|---|
@@ -92,9 +94,8 @@ decline. The prompt requires a foreground job started by a shell with job contro
 
 The installer shows the proposed destination before asking for consent.
 Automatic edits require a destination under your home directory. If the installer
-declines a destination, use the printed command in your shell. To use `ww`
-immediately after approving an edit, open a new shell or run the printed command
-in your current shell. For an unrecognized shell, run `~/.ww/bin/ww` directly.
+declines a destination, use the printed command in your shell. After approving an edit, use `~/.ww/bin/ww run` in your
+current shell or open a new terminal and use `ww run`. For an unrecognized shell, run `~/.ww/bin/ww` directly.
 
 ## Separate software and service operations
 

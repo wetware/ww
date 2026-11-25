@@ -434,7 +434,7 @@ fi
 if "$RECOVER"; then
   status '⚗️' 'Recovering the recorded Host transaction...'
 else
-  status '⚗️' 'Installing wetware...'
+  status '⚗️' 'Installing Wetware...'
 fi
 
 # --- Select immutable release ---
@@ -559,6 +559,7 @@ from pathlib import Path
 import pwd
 import re
 import select
+import shutil
 import stat
 import sys
 
@@ -670,28 +671,49 @@ def consent(destination):
             group = os.getpgrp()
             if os.tcgetpgrp(tty.fileno()) != group or os.getpgid(int(sys.argv[2])) == group:
                 return False
-            tty.write(f"Startup file: {ascii(str(destination))}\nAdd Wetware to your PATH? [y/N] ".encode())
+            tty.write(f"Startup file  {destination}\nAdd Wetware to your shell PATH? [y/N] ".encode())
             ready, _, _ = select.select([tty], [], [], 15)
             if not ready:
                 tty.write(b"\n")
                 return False
-            return tty.read(256).strip().lower() in (b"y", b"yes")
+            answer = tty.read(256)
+            if not answer:
+                tty.write(b"\n")
+            return answer.strip().lower() in (b"y", b"yes")
     except OSError:
         return False
+
+
+def next_steps(available=False, configured=False, leading_blank=True):
+    ww = "ww" if available else "~/.ww/bin/ww"
+    steps = [(ww + " run", "Start Wetware now")]
+    if configured:
+        steps.append(("ww run", "Start from a new terminal"))
+    steps.append((ww + " daemon install", "Install as a background service"))
+    print("\nNext steps" if leading_blank else "Next steps")
+    for cmd, description in steps:
+        print(f"  {cmd:<27}  {description}")
 
 
 def configure():
     home = Path(os.environ["HOME"])
     bin_dir = home / ".ww/bin"
     if ":" in str(bin_dir):
-        print("The installation path contains a colon. Run ~/.ww/bin/ww directly.")
+        print("The installation path contains a colon.")
+        next_steps()
         return
     for entry in os.get_exec_path():
         try:
-            if bin_dir.samefile(entry or "."):
-                return
+            present = bin_dir.samefile(entry or ".")
         except OSError:
-            pass
+            continue
+        if present:
+            resolved = shutil.which("ww")
+            available = resolved is not None and os.path.samefile(resolved, bin_dir / "ww")
+            if not available:
+                print("Another ww takes precedence on PATH. Use the installed path below.")
+            next_steps(available=available, leading_blank=not available)
+            return
 
     shell_path = os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell
     shell = Path(shell_path).name
@@ -705,32 +727,41 @@ def configure():
     elif shell in ("sh", "ash", "dash", "busybox", "bash", "ksh", "ksh93", "mksh", "zsh"):
         command = 'case ":${PATH}:" in *":$HOME/.ww/bin:"*) ;; *) export PATH="$HOME/.ww/bin:$PATH" ;; esac'
     else:
-        print("Run ~/.ww/bin/ww directly, or add ~/.ww/bin to PATH in your shell configuration.")
+        print("To use ww by name, add ~/.ww/bin to PATH in your shell configuration.")
+        next_steps()
         return
 
     if destination and home.is_absolute() and home in destination.parents and ".." not in destination.parts:
-        if consent(destination):
+        name = "~/" + str(destination.relative_to(home))
+        if not name.isascii() or not name.isprintable():
+            name = ascii(name)
+        if consent(name):
             try:
                 append_config(home, destination, command + " # Wetware PATH")
-                print("Open a new shell session to use ww.")
+                print(f"✓ Configured ~/.ww/bin in {name}")
+                print("Open a new terminal to use ww.")
+                next_steps(configured=True)
+                return
             except (ValueError, OSError) as error:
                 print(f"Could not configure PATH: {ascii(str(error))}")
         else:
-            print(f"For future sessions, you can add the command below to {ascii(str(destination))}.")
+            print(f"For future sessions, you can add the command below to {name}.")
     elif shell == "nu":
         print("For future sessions, add the command below to the file named by $nu.config-path.")
     else:
         print("Startup files depend on your shell configuration. Choose your own startup file for persistence.")
-    print("For the current session, run:\n  " + command)
+    immediate = 'export PATH="$HOME/.ww/bin:$PATH"' if command.startswith("case ") else command
+    print("For the current session, run:\n  " + immediate)
+    next_steps()
 
 
 configure()
 PYTHON
 }
 
-status '>' "Fetching verified Host..."
+status '>' 'Fetching verified Host...'
 fetch_verified "$BIN_PATH" "${WW_TMPDIR}/ww"
-status '+' "Fetched verified Host"
+status '✓' 'Host verified'
 
 if "$RECOVER"; then
   chmod +x "${WW_TMPDIR}/ww"
@@ -740,14 +771,13 @@ if "$RECOVER"; then
   exit 0
 fi
 
-status '>' "Fetching verified FHS payloads..."
 mkdir -p "${WW_TMPDIR}/fhs/boot" "${WW_TMPDIR}/fhs/bin"
 fetch_verified "fhs/boot/kernel.wasm" "${WW_TMPDIR}/fhs/boot/kernel.wasm"
 fetch_verified "fhs/bin/status.wasm" "${WW_TMPDIR}/fhs/bin/status.wasm"
 if [ -n "$expected_channel" ] || [ "$RELEASE_CID" = "$BOOTSTRAP_CID" ]; then
   verify_descriptor
 fi
-status '+' "Fetched verified package"
+status '✓' 'FHS verified'
 
 # These hashes come from the independently verified R1 manifest. The
 # selected release cannot choose the executable that validates its descriptor.
@@ -764,9 +794,27 @@ if [ "$RELEASE_CID" != "$BOOTSTRAP_CID" ]; then
 fi
 [ "$(file_sha256 "$verifier")" = "$verifier_hash" ] || die "R1 verifier checksum mismatch"
 chmod +x "$verifier"
+# The pinned verifier reports warnings separately from changed files and digests.
+report=$WW_TMPDIR/install-report.json
 "$verifier" install --release "$RELEASE_CID" --trusted-release-keys "$TRUSTED_RELEASE_KEYS" \
-  --ipfs-url "$BOOTSTRAP_IPFS_URL"
-"${WW_HOME}/bin/ww" --version
-printf '\nInstalled Wetware. Start the Host with ~/.ww/bin/ww run.\n'
+  --ipfs-url "$BOOTSTRAP_IPFS_URL" --json > "$report" || {
+    result=$?
+    cat "$report" >&2
+    exit "$result"
+  }
+python3 -I - "$report" <<'PYTHON' >&2 || cat "$report" >&2
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as report:
+    for warning in json.load(report)["warnings"]:
+        # R1 includes the routine installation scope in its warnings array.
+        if warning != "Host, baseline FHS, and identity only. Register a daemon separately with ww daemon install.":
+            print(warning)
+PYTHON
+"${WW_HOME}/bin/ww" --version > /dev/null
+printf '\n'
+if "$show_progress"; then printf '✓ '; fi
+printf 'Wetware installed successfully!\n\n  Location  ~/.ww\n  Release   %s\n\n' "$RELEASE_CID"
 configure_path || printf '%s\n' 'Run ~/.ww/bin/ww directly or add ~/.ww/bin to PATH.'
 }

@@ -1,20 +1,60 @@
 """Exercise the signed installer's post-install step without fetching a release."""
 import errno
+import fcntl
 import os
 from pathlib import Path
 import pty
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import tempfile
 import sys
+import termios
 import time
 import unittest
 
 
 INSTALLER = Path(__file__).resolve().parents[1] / 'scripts/install.sh'
-PROMPT = b'Add Wetware to your PATH? [y/N]'
+PROMPT = b'Add Wetware to your shell PATH? [y/N]'
+
+
+def piped_terminal(environment, answer=None, interactive_caller=True, timeout=5):
+    """Pipe INSTALL_TEST into sh with an independent 100-column controlling terminal."""
+    pid, master = pty.fork()
+    if pid == 0:
+        fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
+        flag = '-ic' if interactive_caller else '-c'
+        os.execve('/bin/bash', ['bash', '--noprofile', '--norc', flag,
+                                'cat "$INSTALL_TEST" | /bin/sh'], environment)
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            wait = deadline - time.monotonic()
+            if wait <= 0 or not select.select([master], [], [], wait)[0]:
+                raise AssertionError('installer blocked: ' + output.decode(errors='replace'))
+            try:
+                data = os.read(master, 65536)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                break
+            if not data:
+                break
+            output.extend(data)
+            if answer is not None and PROMPT in output:
+                os.write(master, answer)
+                answer = None
+    finally:
+        os.close(master)
+        if time.monotonic() >= deadline:
+            os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+    if os.waitstatus_to_exitcode(status) != 0:
+        raise AssertionError(output)
+    return output.decode(errors='replace').replace('\r\n', '\n')
 
 
 class InstallerPath(unittest.TestCase):
@@ -49,37 +89,7 @@ class InstallerPath(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout + result.stderr
 
-        pid, master = pty.fork()
-        if pid == 0:
-            flag = '-ic' if interactive_caller else '-c'
-            os.execve('/bin/bash', ['bash', '--noprofile', '--norc', flag,
-                                    'cat "$INSTALL_TEST" | /bin/sh'], environment)
-        output = bytearray()
-        deadline = time.monotonic() + timeout
-        try:
-            while True:
-                wait = deadline - time.monotonic()
-                if wait <= 0 or not select.select([master], [], [], wait)[0]:
-                    self.fail('installer blocked: ' + output.decode(errors='replace'))
-                try:
-                    data = os.read(master, 65536)
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
-                    break
-                if not data:
-                    break
-                output.extend(data)
-                if answer is not None and PROMPT in output:
-                    os.write(master, answer)
-                    answer = None
-        finally:
-            os.close(master)
-            if time.monotonic() >= deadline:
-                os.kill(pid, signal.SIGKILL)
-            _, status = os.waitpid(pid, 0)
-        self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
-        return output.decode(errors='replace').replace('\r\n', '\n')
+        return piped_terminal(environment, answer, interactive_caller, timeout)
 
     def assert_ww_runs(self, shell, args, **env):
         binary = shutil.which(shell)
@@ -148,6 +158,18 @@ class InstallerPath(unittest.TestCase):
         self.assertNotIn(PROMPT.decode(), output)
         self.assertEqual(list(self.home.iterdir()), [self.home / '.ww'])
 
+    def test_shadowed_installed_command(self):
+        earlier = self.home / 'bin'
+        earlier.mkdir()
+        shadow = earlier / 'ww'
+        shadow.write_text('#!/bin/sh\nexit 1\n')
+        shadow.chmod(0o700)
+        path = os.pathsep.join((str(earlier), str(self.bin), self.env['PATH']))
+        output = self.install(PATH=path)
+        self.assertNotIn(PROMPT.decode(), output)
+        self.assertIn('~/.ww/bin/ww run', output)
+        self.assertNotIn('  ww run', output)
+
     def test_shell_specific_startup_files(self):
         bash_config = '.bash_profile' if sys.platform == 'darwin' else '.bashrc'
         for shell, config, args, environment in [
@@ -210,6 +232,23 @@ class InstallerPath(unittest.TestCase):
                 output = self.install(answer=b'y\n', ZDOTDIR=str(directory))
                 self.assertIn('.ww/bin', output)
                 self.assertEqual(list(external.iterdir()), [])
+
+    def test_short_write_restores_existing_config(self):
+        config = self.home / '.zshrc'
+        original = b'# Existing settings\n'
+        config.write_bytes(original)
+        config.chmod(0o600)
+        # A real short write leaves five bytes on the descriptor. The installer
+        # must truncate those bytes without touching the pre-existing content.
+        short_write = 'write = os.write\nos.write = lambda fd, data: write(fd, data[:5])'
+        self.script_path.write_text(self.script.replace('\nconfigure()\n',
+                                                        '\n' + short_write + '\nconfigure()\n'))
+        output = self.install(answer=b'y\n')
+        self.assertIn('incomplete startup file write', output)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertNotIn('✓ Configured', output)
+        self.assertIn('export PATH', output)
+        self.assertIn('~/.ww/bin/ww run', output)
 
     def test_refuses_symlink_and_unwritable_file(self):
         config = self.home / '.zshrc'
