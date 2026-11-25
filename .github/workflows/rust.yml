@@ -1,16 +1,16 @@
 name: Rust CI/CD
 
 on:
-  push:
-    branches: [ "master", "staging" ]
-  pull_request:
-    branches: [ "master", "staging" ]
   workflow_dispatch:
     inputs:
+      expected_sha:
+        description: Exact commit SHA expected at the selected ref
+        type: string
+        required: true
       validation_only:
         description: Run full qualification without image publication or Pages deployment
         type: boolean
-        default: false
+        default: true
 
 # Serialize release-producing runs per ref so image + IPNS publication from
 # different commits cannot interleave. Retain every pending run. The durable
@@ -26,269 +26,38 @@ env:
   WW_BUILD_GIT_SHA: ${{ github.sha }}
 
 jobs:
-  # === Path-based change detection (master push only) ===
-
-  changes:
-    name: Detect changes
-    if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/master')
-      || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-    outputs:
-      std: ${{ steps.filter.outputs.std }}
-      host: ${{ steps.filter.outputs.host }}
-      architecture_map: ${{ steps.filter.outputs.architecture_map }}
-    steps:
-    - uses: actions/checkout@v5
-    - uses: dorny/paths-filter@v4
-      id: filter
-      with:
-        filters: |
-          std:
-            - 'std/**'
-            - 'crates/guest/**'
-            - 'examples/**'
-            - 'scripts/build_wasip3_component.sh'
-            - 'scripts/check_first_party_wasip3.sh'
-            - 'scripts/check_native_p3_fixture.sh'
-            - 'tests/fixtures/stream-lifecycle-probe/**'
-            - 'rust-toolchain.toml'
-          host:
-            - 'src/**'
-            - 'crates/**'
-            - 'capnp/**'
-            - 'Cargo.toml'
-            - 'Cargo.lock'
-            - 'build.rs'
-            - 'Containerfile*'
-            - '.dockerignore'
-            - 'Makefile'
-            - 'scripts/**'
-            - 'tests/**'
-            - '.github/workflows/**'
-            - '.github/actions/**'
-          architecture_map:
-            - 'diagrams/architecture-map.json'
-            - 'diagrams/architecture-map.template.html'
-            - 'scripts/generate-architecture-map.mjs'
-            - 'scripts/generate-architecture-map.test.mjs'
-            - 'src/**'
-            - 'crates/**'
-            - 'std/**'
-            - 'Cargo.toml'
-            - 'Cargo.lock'
-            - 'README.md'
-            - 'doc/architecture.md'
-            - 'doc/capabilities.md'
-            - '.github/workflows/rust.yml'
-
-  # === Always-run checks (PRs and pushes) ===
-
-  lockfiles:
-    name: Check committed Cargo lockfiles
+  admission:
+    name: Check full qualification request
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
-    - name: Check committed repository artifacts
+    - name: Require an exact revision and eligible ref
+      env:
+        EXPECTED_SHA: ${{ inputs.expected_sha }}
+        VALIDATION_ONLY: ${{ inputs.validation_only }}
       run: |
-        python3 scripts/check_repository_artifacts.py
-        python3 tests/test_repository_artifacts.py
-    - uses: dtolnay/rust-toolchain@1.99.1
-    # Always resolve before dependent jobs restore compiler caches or build.
-    - run: bash scripts/check_cargo_lockfiles.sh
-    - run: bash tests/test_cargo_lockfiles.sh
-
-  test-architecture-map:
-    name: Test architecture map
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v5
-
-    - name: Set up Node.js
-      uses: actions/setup-node@v6
-      with:
-        node-version: 24
-        package-manager-cache: false
-
-    - name: Test map generator
-      run: node --test scripts/generate-architecture-map.test.mjs
-
-  fmt:
-    name: Check formatting
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v5
-      with:
-        submodules: recursive
-        fetch-depth: 0
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.99.1
-      with:
-        components: rustfmt
-
-    - name: cargo fmt --all -- --check
-      run: |
-        cargo fmt --all -- --check
-        cargo fmt --manifest-path std/kernel/Cargo.toml -- --check
-        cargo fmt --manifest-path tests/fixtures/native-p3/Cargo.toml -- --check
-        cargo fmt --manifest-path tests/fixtures/stream-lifecycle-probe/Cargo.toml -- --check
-        cargo fmt --manifest-path tests/fixtures/gate2b-root/Cargo.toml -- --check
-
-    - name: Check IPFS release publish scripts
-      run: |
-        bash tests/test_ipfs_release_publish.sh
-        bash tests/test_ipfs_release_publish_runtime.sh
-        bash tests/test_native_p3_fixture.sh
-        bash tests/test_release_ancestry.sh
-        bash tests/test_deploy_context.sh
-        bash tests/test_deploy_verify.sh
-        bash tests/test_release_workflow.sh
-        python3 tests/test_release_auth.py
-        python3 tests/test_producer_artifacts.py
-        bash -n tests/test_container_boot.sh
-        if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/install.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh tests/test_container_boot.sh
+        test "$GITHUB_EVENT_NAME" = workflow_dispatch
+        test "$GITHUB_RUN_ATTEMPT" = 1
+        test "$GITHUB_SHA" = "$EXPECTED_SHA"
+        if [[ "$GITHUB_REF" == refs/heads/master ]]; then
+          test "$VALIDATION_ONLY" = false
+        else
+          [[ "$GITHUB_REF" == refs/heads/* && "$VALIDATION_ONLY" == true ]]
         fi
-
-    - name: Check offline native qualification controls
-      run: |
-        python3 tests/test_native_release_inputs.py
-        python3 tests/test_qualify_native_upgrade.py
-        python3 tests/test_prepare_current_native_release.py
-        python3 tests/test_native_release_integration.py
-        python3 tests/test_native_release_provisioner.py
-        python3 tests/test_native_development_boot.py
-        python3 tests/test_native_qualification_boundary.py
-
-    - uses: actions/setup-go@v6
-      with:
-        go-version-file: tests/publication-negative-control/go.mod
-        cache-dependency-path: tests/publication-negative-control/go.sum
-
-    - name: Reproduce delayed older Boxo writes
-      working-directory: tests/publication-negative-control
-      run: go test -count=1 .
-
-  fuzz-corpus:
-    name: Fuzz corpus regressions
-    needs: lockfiles
-    runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: nightly-2026-08-30
-    steps:
     - uses: actions/checkout@v5
+    - uses: ./.github/actions/check-lockfiles
 
-    - name: Install pinned Rust nightly
-      uses: dtolnay/rust-toolchain@nightly
-      with:
-        toolchain: nightly-2026-08-30
-
-    - uses: Swatinem/rust-cache@v2
-      with:
-        key: fuzz-corpus
-        workspaces: fuzz -> target
-
-    - name: Install cargo-fuzz
-      run: cargo install cargo-fuzz --version 0.13.2 --locked
-
-    - uses: ./.github/actions/setup-capnp
-
-    # cargo-fuzz 0.13.2 cannot forward --locked. The lockfiles job checks the
-    # separate fuzz workspace before this lane; see doc/dependencies/lockfiles.md.
-    - name: Build fuzz targets
-      run: |
-        cargo fuzz build fuzz_kubo_ls_response
-        cargo fuzz build fuzz_kubo_mfs_ls_response
-        cargo fuzz build fuzz_composer_dagpb_decode
-        cargo fuzz build fuzz_composer_unixfs_metadata
-        cargo fuzz build fuzz_kubo_dag_import_response
-
-    # Checked-in corpus replay is deterministic regression testing. Mutation
-    # fuzzing remains a manual, bounded campaign.
-    - name: Replay checked-in fuzz corpus
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        for target in \
-          fuzz_kubo_ls_response \
-          fuzz_kubo_mfs_ls_response \
-          fuzz_composer_dagpb_decode \
-          fuzz_composer_unixfs_metadata \
-          fuzz_kubo_dag_import_response
-        do
-          seeds=()
-          while IFS= read -r -d '' seed; do
-            seeds+=("$seed")
-          done < <(git ls-files -z -- "fuzz/corpus/${target}")
-
-          if (( ${#seeds[@]} == 0 )); then
-            echo "No checked-in seeds found for ${target}" >&2
-            exit 1
-          fi
-
-          echo "Replaying ${#seeds[@]} checked-in seeds for ${target}"
-          WW_FUZZ_SEMANTIC_REPLAY=1 cargo fuzz run "$target" "${seeds[@]}"
-        done
-
-  clippy:
-    name: Clippy
-    needs: lockfiles
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v5
-      with:
-        submodules: recursive
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.99.1
-      with:
-        components: clippy
-
-    - uses: ./.github/actions/setup-capnp
-
-    - uses: Swatinem/rust-cache@v2
-
-    - name: cargo clippy (host workspace)
-      run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  solidity:
-    name: Solidity (Foundry)
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v5
-      with:
-        submodules: recursive
-
-    - name: Install Foundry
-      uses: foundry-rs/foundry-toolchain@v1
-      with:
-        # Pin a specific Foundry version so foundryup skips the
-        # `api.github.com/repos/foundry-rs/foundry/releases/latest` API
-        # call (the `latest`/`stable` channels hit it unconditionally
-        # and get 403 rate-limited on shared Actions IPs). The action
-        # does not accept a `token` input, so this is the canonical
-        # workaround. Bump periodically.
-        version: v1.7.1
-
-    - name: Check formatting
-      working-directory: contracts/stem
-      run: forge fmt --check
-
-    - name: Build contracts
-      working-directory: contracts/stem
-      run: forge build --sizes
-
-    - name: Run tests
-      working-directory: contracts/stem
-      run: forge test -vvv
+  checks:
+    needs: admission
+    uses: ./.github/workflows/fast.yml
+    permissions:
+      contents: read
+      pull-requests: read
+      pages: write
+      id-token: write
 
   build:
     name: Build ww binary
-    needs: lockfiles
+    needs: admission
     runs-on: ubuntu-latest
     env:
       # Bound Host linker resource use; keep these settings equal in test-host.
@@ -318,7 +87,7 @@ jobs:
 
   build-wasm:
     name: Build native wasm32-wasip3 components
-    needs: lockfiles
+    needs: admission
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -466,6 +235,12 @@ jobs:
       run: |
         test -s std/kernel/bin/main.wasm
         test -s std/status/bin/status.wasm
+        test -s examples/counter/bin/counter.wasm
+        test -s examples/oracle/bin/oracle.wasm
+        test -s examples/snap-hello-rs/bin/snap-hello-rs.wasm
+        test -s target/fhs/boot/kernel.wasm
+        test -s target/fhs/bin/status.wasm
+        test -s target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm
         test -s examples/echo/bin/echo.wasm
         test -s examples/discovery/bin/discovery.wasm
         test -s target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm
@@ -494,14 +269,6 @@ jobs:
         df -h . "$RUNNER_TEMP"
         free -h
         if [ -d target ]; then du -sh target; fi
-
-    - name: Validate process-wide outbound limits
-      # Each ignored quota test owns the entire process budget while it runs.
-      # Keep these in separate processes from ordinary concurrent tests.
-      run: |
-        cargo test -p rpc --lib outbound::tests::process_owner_limit_spans_threads_and_recovers_after_idempotent_close --locked -- --ignored --exact
-        cargo test -p rpc --lib outbound::tests::default_budget_bounds_work_across_registry_recreation --locked -- --ignored --exact
-        cargo test -p rpc --lib outbound::tests::explicit_host_budgets_cannot_bypass_process_limit --locked -- --ignored --exact
 
     - name: Validate actual packaged installation and startup
       run: |
@@ -548,113 +315,31 @@ jobs:
     - name: Validate public release package library
       run: cargo test --locked -p release --features package
 
-  test-stdlib:
-    name: Test standalone standard library
-    # Native unit tests do not consume the host build or WASM artifacts.
-    needs: lockfiles
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v5
-      with:
-        submodules: recursive
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.99.1
-
-    - uses: ./.github/actions/setup-capnp
-
-    - uses: Swatinem/rust-cache@v2
-      with:
-        key: stdlib
-        workspaces: |
-          crates/wagi-guest -> target
-          std/kernel -> target
-          std/status -> target
-
-    - name: Run standalone standard-library tests
-      run: |
-        cargo test --locked --manifest-path crates/wagi-guest/Cargo.toml
-        cargo test --locked --manifest-path std/kernel/Cargo.toml
-        cargo test --locked --manifest-path std/status/Cargo.toml
-
   test:
-    # Preserve the required branch-protection check for both test suites.
+    # Private admission checks this exact job name.
     name: Test
-    needs: [test-host, test-stdlib]
+    needs: [checks, test-host]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
     - name: Require both test suites to pass
       env:
         HOST_RESULT: ${{ needs.test-host.result }}
-        STDLIB_RESULT: ${{ needs.test-stdlib.result }}
-      run: test "$HOST_RESULT" = success && test "$STDLIB_RESULT" = success
+        CHECKS_RESULT: ${{ needs.checks.result }}
+      run: test "$HOST_RESULT" = success && test "$CHECKS_RESULT" = success
 
-  build-architecture-map:
-    name: Build architecture map
-    if: >-
-      !inputs.validation_only && (github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/master'
-          && needs.changes.outputs.architecture_map == 'true'))
-    needs: [changes, fmt, clippy, solidity, build, test, test-architecture-map]
-    runs-on: ubuntu-latest
+  pages:
+    if: ${{ !inputs.validation_only }}
+    needs: test
+    uses: ./.github/workflows/architecture-map.yml
     permissions:
       contents: read
-      pages: read
-    steps:
-    - uses: actions/checkout@v5
-
-    - name: Set up Node.js
-      uses: actions/setup-node@v6
-      with:
-        node-version: 24
-        package-manager-cache: false
-
-    - name: Test map generator
-      run: node --test scripts/generate-architecture-map.test.mjs
-
-    - name: Generate Pages artifact
-      run: |
-        mkdir site
-        node scripts/generate-architecture-map.mjs \
-          --output site \
-          --revision "${{ github.sha }}"
-        test "$(find site -maxdepth 1 -type f | wc -l | tr -d ' ')" = 1
-        test -f site/index.html
-
-    - name: Configure GitHub Pages
-      uses: actions/configure-pages@v5
-
-    - name: Upload Pages artifact
-      uses: actions/upload-pages-artifact@v4
-      with:
-        path: site
-
-  deploy-architecture-map:
-    name: Deploy architecture map
-    if: ${{ needs.build-architecture-map.result == 'success' }}
-    needs: build-architecture-map
-    runs-on: ubuntu-latest
-    permissions:
       pages: write
       id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-    - name: Deploy GitHub Pages artifact
-      id: deployment
-      uses: actions/deploy-pages@v4
-
-  # === Master-only: fan out after checks pass ===
 
   build-binaries:
     name: Build ${{ matrix.artifact }}
-    if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/master'
-          && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
-    needs: [changes, fmt, clippy, solidity, build, build-wasm]
+    needs: [build, build-wasm]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -760,12 +445,7 @@ jobs:
   # Source compilation consumes only canonical WASM, not native producer outputs.
   validate-source-container:
     name: Validate source container boot
-    if: >-
-      (github.ref == 'refs/heads/master'
-       && (github.event_name == 'workflow_dispatch'
-           || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
-      || (github.event_name == 'workflow_dispatch' && inputs.validation_only)
-    needs: [changes, build-wasm]
+    needs: build-wasm
     runs-on: ubuntu-latest
     outputs:
       qualified_attempt: ${{ steps.qualification.outputs.attempt }}
@@ -797,14 +477,8 @@ jobs:
 
   validate-release:
     name: Validate release packages and container boot
-    if: >-
-      always() && (
-      (github.ref == 'refs/heads/master'
-       && (github.event_name == 'workflow_dispatch'
-           || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
-      || (github.event_name == 'workflow_dispatch' && inputs.validation_only)
-      )
-    needs: [changes, test, build-binaries, build-wasm, validate-source-container]
+    if: ${{ always() && needs.admission.result == 'success' }}
+    needs: [admission, test, build-binaries, build-wasm, validate-source-container]
     runs-on: ubuntu-latest
     steps:
     # Run even when a prerequisite is skipped/cancelled; reject before uploads.
@@ -817,6 +491,7 @@ jobs:
         PRODUCER_RESULT: ${{ needs.build-binaries.result }}
         WASM_RESULT: ${{ needs.build-wasm.result }}
       run: |
+        test "$RUN_ATTEMPT" = 1
         test "$SOURCE_RESULT" = success
         test "$SOURCE_ATTEMPT" = "$RUN_ATTEMPT"
         test "$TEST_RESULT" = success
@@ -886,17 +561,17 @@ jobs:
       !cancelled() && !inputs.validation_only && github.ref == 'refs/heads/master'
       && needs.test.result == 'success' && needs.validate-release.result == 'success'
       && needs.validate-source-container.result == 'success'
-      && needs.validate-source-container.outputs.qualified_attempt == github.run_attempt
-      && (github.event_name == 'workflow_dispatch'
-          || (github.event_name == 'push' && github.ref == 'refs/heads/master'
-              && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')))
-    needs: [changes, test, validate-release, validate-source-container]
+    needs: [test, validate-release, validate-source-container]
     runs-on: ubuntu-latest
     environment: master
     permissions:
       contents: read
       packages: write
     steps:
+    - name: Reject a partial rerun before loading the image
+      env:
+        SOURCE_ATTEMPT: ${{ needs.validate-source-container.outputs.qualified_attempt }}
+      run: test "$GITHUB_RUN_ATTEMPT" = 1 && test "$SOURCE_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: tested-image.tar
@@ -929,7 +604,7 @@ jobs:
 
   publish:
     name: Publish to IPFS
-    needs: [changes, test, validate-release, release_image]
+    needs: [test, validate-release, release_image]
     # Public CI produces validated artifacts. Official release operations moved
     # to the private operator repository. Preserve the existing publication hold.
     # Historical writers require the separate fence in doc/legacy-publication-hold.md.
