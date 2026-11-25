@@ -391,16 +391,42 @@ pub(crate) fn bounded_metadata(value: &str) -> String {
         .collect()
 }
 
+// Render operator summaries from the same validated fields used by JSON.
+fn compact_summary(fields: &Value) -> Option<String> {
+    if fields["event_code"].as_u64()? != rpc::observability::EventCode::HostListening as u64 {
+        return None;
+    }
+    let addr = fields["local_addr"].as_str()?;
+    if addr == REDACTED {
+        return None;
+    }
+    let kind = match fields["listener"].as_str()? {
+        "admin" => "admin",
+        "wagi" => "WAGI",
+        "swarm" if addr.ends_with("/quic-v1") => "swarm QUIC",
+        "swarm" if addr.contains("/tcp/") => "swarm TCP",
+        _ => return None,
+    };
+    Some(format!("listening on {addr} ({kind})"))
+}
+
 fn compact(record: &Value, ansi: bool) -> String {
     use fmt::Write;
-    let mut text = format!("{} ", record["timestamp"].as_str().unwrap());
-    if ansi {
-        text.push_str("\x1b[1m");
+    let (bold, reset) = if ansi {
+        ("\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    let level = record["level"].as_str().unwrap();
+    let fields = &record["fields"];
+    if let Some(summary) = compact_summary(fields) {
+        let category = fields["category"].as_str().unwrap();
+        return format!("[{category}][{bold}{level}{reset}] {summary}");
     }
-    text.push_str(record["level"].as_str().unwrap());
-    if ansi {
-        text.push_str("\x1b[0m");
-    }
+    let mut text = format!(
+        "{} {bold}{level}{reset}",
+        record["timestamp"].as_str().unwrap()
+    );
     let _ = write!(
         text,
         " {}:{}: ",

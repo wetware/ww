@@ -82,7 +82,9 @@ Cell dependency on RPC. The subscriber resolves these codes through the same cat
 Each JSON record contains `timestamp`, `level`, `target`, `line`, and `fields`.
 `timestamp` is UTC wall time. `line` and `target` identify the source callsite;
 neither is a stable event identifier. `span`, when present, describes only the
-current event span. Compact output retains `field=value` pairs, including numeric
+current event span. For listener announcements, compact output renders
+`[host][INFO] listening on <local_addr> (<kind>)`. JSON retains the full code 112
+record. For other events, compact output retains `field=value` pairs, including numeric
 `event_code=N`, and renders the same safe human message.
 
 | Optional field | Type | Meaning |

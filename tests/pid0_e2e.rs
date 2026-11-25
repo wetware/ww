@@ -2106,17 +2106,12 @@ mod rust_lifecycle {
         proxy_task.abort();
         let logs = node.logs();
         assert_eq!(exit.code(), Some(0), "unexpected host exit\n{logs}");
-        for (listener, addr) in [("admin", admin_addr), ("wagi", http_addr)] {
-            let fields = format!(r#"listener="{listener}""#);
-            let address = format!(r#"local_addr="{addr}""#);
+        for (listener, addr) in [("admin", admin_addr), ("WAGI", http_addr)] {
+            let expected = format!("[host][INFO] listening on {addr} ({listener})");
             assert_eq!(
-                logs.lines()
-                    .filter(|line| line.contains("ww::listener")
-                        && line.contains(&fields)
-                        && line.contains(&address))
-                    .count(),
+                logs.lines().filter(|line| *line == expected).count(),
                 1,
-                "expected one listening event for {listener} at {addr}\n{logs}"
+                "expected one {expected} line\n{logs}"
             );
         }
         assert!(
