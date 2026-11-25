@@ -99,9 +99,6 @@ class InstallerPath(unittest.TestCase):
                                  cwd=self.home)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn('ww-from-test-home', run.stdout)
-            if shell == 'tcsh':
-                path = run.stdout.splitlines()[-2]
-                self.assertEqual(path.split(':').count(str(self.bin)), 1)
 
     def test_piped_zsh_opt_in_preserves_bytes_mode_and_repeated_install(self):
         config = self.home / '.zshrc'
@@ -178,8 +175,6 @@ class InstallerPath(unittest.TestCase):
             ('zsh', 'dot/.zshrc', ['-ic', 'ww'], {'ZDOTDIR': str(self.home / 'dot')}),
             ('fish', 'config/fish/conf.d/ww-path.fish', ['-ic', 'ww'],
              {'XDG_CONFIG_HOME': str(self.home / 'config')}),
-            ('csh', '.cshrc', ['-ic', 'ww'], {}),
-            ('tcsh', '.tcshrc', ['-ic', 'source "$HOME/.tcshrc"; printenv PATH; ww'], {}),
         ]:
             with self.subTest(shell=shell):
                 dest = self.home / config
@@ -194,6 +189,58 @@ class InstallerPath(unittest.TestCase):
                 self.assertIn(PROMPT.decode(), output)
                 self.assertIn('.ww/bin', dest.read_text(), output)
                 self.assert_ww_runs(shell, args, **environment)
+
+    def test_csh_startup_precedence(self):
+        tcsh = Path('/bin/tcsh')
+        shells = [shell for shell in (Path('/bin/csh'), tcsh, Path('/bin/bsd-csh'))
+                  if shell.is_file()]
+        if not shells:
+            self.skipTest('Csh and Tcsh unavailable')
+        cshrc = self.home / '.cshrc'
+        tcshrc = self.home / '.tcshrc'
+        original = b'# existing settings\n'
+        for shell in shells:
+            for existing in [(cshrc, tcshrc), (cshrc,), (tcshrc,), ()]:
+                with self.subTest(shell=shell, existing=[p.name for p in existing]):
+                    for config in (cshrc, tcshrc):
+                        config.unlink(missing_ok=True)
+                        if config in existing:
+                            config.write_bytes(original)
+                            config.chmod(0o600)
+                    uses_tcsh = tcsh.is_file() and shell.samefile(tcsh)
+                    selected = tcshrc if uses_tcsh and tcshrc in existing else cshrc
+                    other = cshrc if selected == tcshrc else tcshrc
+                    output = self.install(SHELL=str(shell), answer=b'y\n')
+                    self.assertIn('✓ Configured ~/.ww/bin in ~/' + selected.name, output)
+                    self.assertIn(b'# Wetware PATH', selected.read_bytes())
+                    if other in existing:
+                        self.assertEqual(other.read_bytes(), original)
+                    else:
+                        self.assertFalse(other.exists())
+
+                    # First resolve ww through normal interactive startup. Read
+                    # the selected file a second time, then check PATH and ww.
+                    command = f'ww; source "$HOME/{selected.name}"; printenv PATH; ww'
+                    result = subprocess.run([shell, '-ic', command], env=dict(self.env, SHELL=str(shell)),
+                                            text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    lines = result.stdout.splitlines()
+                    self.assertEqual(lines.count('ww-from-test-home'), 2, result.stderr)
+                    self.assertEqual(lines[-2].split(':').count(str(self.bin)), 1)
+
+    def test_unknown_csh_with_tcshrc_uses_manual_guidance(self):
+        shell = self.home / 'csh'
+        shell.write_text('#!/bin/sh\ntouch "$HOME/unexpected-execution"\n')
+        shell.chmod(0o700)
+        for name in ('.tcshrc', '.cshrc'):
+            (self.home / name).write_text('# existing settings')
+        output = self.install(SHELL=str(shell), answer=b'y\n')
+        self.assertNotIn(PROMPT.decode(), output)
+        self.assertIn('set path =', output)
+        self.assertNotIn('✓ Configured', output)
+        self.assertFalse((self.home / 'unexpected-execution').exists())
+        for name in ('.tcshrc', '.cshrc'):
+            self.assertEqual((self.home / name).read_text(), '# existing settings')
 
     def test_ksh_existing_env(self):
         home = self.home.rename(self.home.parent / 'ksh-home')

@@ -634,7 +634,8 @@ def append_config(home, destination, command):
                 raise OSError("incomplete startup file write")
 
 
-def startup_file(shell, home):
+def startup_file(shell_path, home):
+    shell = shell_path.name
     if shell == "zsh":
         return Path(os.environ.get("ZDOTDIR", str(home))) / ".zshrc"
     if shell == "bash":
@@ -652,7 +653,17 @@ def startup_file(shell, home):
         if (path.name in (".kshrc", "kshrc", ".mkshrc") and path.is_absolute()
                 and re.fullmatch(r"[a-zA-Z0-9_./-]+", str(path)) and os.path.lexists(path)):
             return path
-    if shell in ("csh", "tcsh"):
+    if shell == "csh" and shell_path.is_absolute():
+        # macOS hard-links csh to tcsh. Linux can select either implementation
+        # through alternatives. Identify the binary without executing SHELL.
+        for binary in ("/bin/tcsh", "/bin/bsd-csh", "/usr/bin/tcsh", "/usr/bin/bsd-csh"):
+            try:
+                if shell_path.samefile(binary):
+                    shell = Path(binary).name
+                    break
+            except OSError:
+                continue
+    if shell in ("tcsh", "bsd-csh"):
         if shell == "tcsh" and os.path.lexists(home / ".tcshrc"):
             return home / ".tcshrc"
         return home / ".cshrc"
@@ -715,12 +726,12 @@ def configure():
             next_steps(available=available, leading_blank=not available)
             return
 
-    shell_path = os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell
-    shell = Path(shell_path).name
-    destination = startup_file(shell, home)
+    shell_path = Path(os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell)
+    shell = shell_path.name
+    destination = startup_file(shell_path, home)
     if shell == "fish":
         command = 'contains -- "$HOME/.ww/bin" $PATH; or set -gx PATH "$HOME/.ww/bin" $PATH'
-    elif shell in ("tcsh", "csh"):
+    elif shell in ("tcsh", "csh", "bsd-csh"):
         command = 'if ( ":${PATH}:" !~ *":${HOME}/.ww/bin:"* ) set path = ( "$HOME/.ww/bin" $path:q )'
     elif shell == "nu":
         command = "$env.PATH = ($env.PATH | prepend ($env.HOME | path join '.ww' 'bin'))"

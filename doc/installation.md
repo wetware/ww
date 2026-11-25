@@ -89,7 +89,7 @@ control. A 15-second timeout or end of input also declines. Set
 | Fish | `fish/conf.d/ww-path.fish` under `XDG_CONFIG_HOME`, which defaults to `~/.config`. |
 | Ksh | An existing `.kshrc`, `kshrc`, or `.mkshrc` selected by a literal absolute `ENV` path under your home directory. Paths with shell syntax require manual setup. |
 | POSIX sh, Dash, BusyBox Ash | Manual. The startup file depends on how the shell starts and how the system configures it. |
-| Csh, Tcsh | Csh uses `~/.cshrc`. Tcsh uses `~/.tcshrc` when it exists and `~/.cshrc` otherwise. |
+| Csh, Tcsh | BSD Csh uses `~/.cshrc`. Tcsh, including a `csh` linked to Tcsh, prefers an existing `~/.tcshrc` and otherwise reads `~/.cshrc`. When the installer cannot identify the `csh` implementation, it prints manual instructions. |
 | Nushell | Manual. Run `$nu.config-path` to locate the active configuration file. |
 
 The installer shows the proposed destination before asking for consent.
