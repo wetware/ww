@@ -1,9 +1,10 @@
 //! Integration tests for Kademlia DHT plumbing.
 //!
-//! Requires a running IPFS (Kubo) node. The API endpoint is read from the
-//! `IPFS_API_URL` environment variable, defaulting to `http://127.0.0.1:5001`.
-//!
-//! Tests skip gracefully when the node is unreachable.
+//! Host CI supplies `WW_TEST_KUBO_ADDR` and requires a reachable daemon with
+//! `WW_TEST_REQUIRE_KUBO=1`. Local runs also accept `IPFS_API_URL`.
+
+#[path = "support/kubo.rs"]
+mod kubo;
 
 use libp2p::kad;
 
@@ -11,16 +12,59 @@ use libp2p::kad;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn ipfs_api_url() -> String {
-    std::env::var("IPFS_API_URL").unwrap_or_else(|_| "http://127.0.0.1:5001".to_string())
-}
+/// Connect an ephemeral peer so an isolated test daemon has a real swarm entry.
+async fn connected_peers(client: &ww::ipfs::HttpClient) -> Vec<(String, String)> {
+    use futures::StreamExt;
+    use libp2p::swarm::{dial_opts::DialOpts, SwarmEvent};
+    use std::time::Duration;
 
-fn ipfs_client() -> ww::ipfs::HttpClient {
-    ww::ipfs::HttpClient::new(ipfs_api_url())
-}
+    let info = client.kubo_info().await.expect("Kubo identity");
+    let mut peer = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            Default::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .expect("peer TCP transport")
+        .with_quic()
+        .with_behaviour(|_| libp2p::swarm::dummy::Behaviour)
+        .expect("peer behaviour")
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(10)))
+        .build();
+    let peer_id = peer.local_peer_id().to_string();
+    let addresses = info
+        .swarm_addrs
+        .iter()
+        .map(|addr| addr.parse().expect("Kubo swarm address"))
+        .collect();
+    peer.dial(
+        DialOpts::peer_id(info.peer_id.parse().expect("Kubo peer ID"))
+            .addresses(addresses)
+            .build(),
+    )
+    .expect("dial test Kubo");
 
-async fn ipfs_available() -> bool {
-    ipfs_client().kubo_info().await.is_ok()
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match peer.select_next_some().await {
+                SwarmEvent::ConnectionEstablished { .. } => break,
+                SwarmEvent::OutgoingConnectionError { error, .. } => {
+                    panic!("dial test Kubo: {error}")
+                }
+                _ => {}
+            }
+        }
+        loop {
+            let peers = client.swarm_peers().await.expect("swarm_peers");
+            if peers.iter().any(|(id, _)| id == &peer_id) {
+                return peers;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Kubo did not report the connected fixture peer")
 }
 
 /// Parse raw `(String, String)` swarm peers into typed `(PeerId, Multiaddr)`.
@@ -54,12 +98,11 @@ fn fresh_kad() -> (libp2p::PeerId, kad::Behaviour<kad::store::MemoryStore>) {
 /// swarm address. This is the first call `Net::new` makes.
 #[tokio::test]
 async fn test_kubo_info_valid_identity() {
-    if !ipfs_available().await {
-        eprintln!("Skipping: Kubo not reachable");
+    let Some(client) = kubo::client().await else {
         return;
-    }
+    };
 
-    let info = ipfs_client().kubo_info().await.expect("kubo_info");
+    let info = client.kubo_info().await.expect("kubo_info");
 
     let peer_id: libp2p::PeerId = info
         .peer_id
@@ -90,12 +133,11 @@ async fn test_kubo_info_valid_identity() {
 /// connected peers.
 #[tokio::test]
 async fn test_swarm_peers_populate_routing_table() {
-    if !ipfs_available().await {
-        eprintln!("Skipping: Kubo not reachable");
+    let Some(client) = kubo::client().await else {
         return;
-    }
+    };
 
-    let raw = ipfs_client().swarm_peers().await.expect("swarm_peers");
+    let raw = connected_peers(&client).await;
     assert!(!raw.is_empty(), "Kubo should have connected swarm peers");
 
     let peers = parse_peers(raw);
@@ -129,12 +171,11 @@ async fn test_swarm_peers_populate_routing_table() {
 /// populate the routing table the same way.
 #[tokio::test]
 async fn test_kubo_bootstrap_entry() {
-    if !ipfs_available().await {
-        eprintln!("Skipping: Kubo not reachable");
+    let Some(client) = kubo::client().await else {
         return;
-    }
+    };
 
-    let info = ipfs_client().kubo_info().await.expect("kubo_info");
+    let info = client.kubo_info().await.expect("kubo_info");
     let kubo_pid: libp2p::PeerId = info.peer_id.parse().expect("parse kubo peer id");
 
     // Use the first parseable multiaddr.  Strip any trailing `/p2p/<id>`
@@ -178,12 +219,10 @@ async fn test_kubo_bootstrap_entry() {
 /// returned by Kubo's `add` endpoint are valid Kad keys.
 #[tokio::test]
 async fn test_real_cid_to_kad_record_key() {
-    if !ipfs_available().await {
-        eprintln!("Skipping: Kubo not reachable");
+    let Some(client) = kubo::client().await else {
         return;
-    }
+    };
 
-    let client = ipfs_client();
     let cid_str = client
         .add_bytes(b"kad integration test payload")
         .await
@@ -216,12 +255,10 @@ async fn test_real_cid_to_kad_record_key() {
 /// Verify that distinct CIDs produce distinct Kad keys (collision sanity).
 #[tokio::test]
 async fn test_distinct_cids_produce_distinct_kad_keys() {
-    if !ipfs_available().await {
-        eprintln!("Skipping: Kubo not reachable");
+    let Some(client) = kubo::client().await else {
         return;
-    }
+    };
 
-    let client = ipfs_client();
     let cid_a = client.add_bytes(b"payload-a").await.expect("add a");
     let cid_b = client.add_bytes(b"payload-b").await.expect("add b");
 
@@ -242,12 +279,11 @@ async fn test_distinct_cids_produce_distinct_kad_keys() {
 /// entries than the raw list.
 #[tokio::test]
 async fn test_swarm_peers_dedup_by_peer_id() {
-    if !ipfs_available().await {
-        eprintln!("Skipping: Kubo not reachable");
+    let Some(client) = kubo::client().await else {
         return;
-    }
+    };
 
-    let raw = ipfs_client().swarm_peers().await.expect("swarm_peers");
+    let raw = connected_peers(&client).await;
     let total = raw.len();
 
     let mut seen = std::collections::HashSet::new();
@@ -270,4 +306,9 @@ async fn test_swarm_peers_dedup_by_peer_id() {
     );
 
     eprintln!("OK: {} raw entries → {} unique peers", total, unique.len(),);
+}
+
+#[test]
+fn required_kubo_cannot_skip_kad_operations() {
+    kubo::assert_required_kubo_fails("test_kubo_info_valid_identity");
 }
