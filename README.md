@@ -19,16 +19,21 @@ model running inside the cell.
 
 ## Run an authenticated release
 
-Production signing, IPFS publication, DNSLink and `/install` activation remain
-held. The public `/install` endpoint is in maintenance; it is not a working
-bootstrap path. The commands below use `scripts/install.sh` from a reviewed
-checkout and require an available signed release CID, independently provisioned
-public trust, and running Kubo. See [installation](doc/installation.md).
+The canonical installer command for macOS and GNU/Linux on ARM64 and x86-64 is:
 
 ```sh
-sh scripts/install.sh --release "$RELEASE_CID"
+curl -fsSL https://wetware.run/install.sh | sh
+```
+
+**Deployment pending.** The public redirect still serves the explicit-CID installer at
+`2842c69d3fdb1fe52da492358175e257bbd4b01d`. To use zero-argument installation
+before cutover, run `sh scripts/install.sh` from this reviewed revision.
+Install Kubo, start its daemon, and put Python 3 and OpenSSL 3.x or 4.x on
+`PATH`. See [installation and trust](doc/installation.md).
+
+```sh
 # Start in the foreground; query /status from another terminal.
-ww run --http-listen 127.0.0.1:2080
+"$HOME/.ww/bin/ww" run --http-listen 127.0.0.1:2080
 # In another terminal: curl http://localhost:2080/status
 ```
 
@@ -58,17 +63,13 @@ narrow `Membrane` containing only `peerId` and `Stat`.
 
 ### Install
 
-Use a reviewed checkout and the signed-release prerequisites above. Before
-running the command, set `RELEASE_CID` to the selected signed release and provision
-the independent release keyring. Production activation remains held; the command
-does not supply a release or trust anchor.
+To select an immutable release explicitly, supply its CID and a provisioned
+public keyring:
 
-```bash
-sh scripts/install.sh --release "$RELEASE_CID"
+```sh
+sh scripts/install.sh --release "$RELEASE_CID" --trusted-release-keys /trusted/path/release-keys
 ```
 
-The installer authenticates and installs the Host, baseline FHS, and identity.
-The shell installer requires an explicit release CID.
 For existing installations, `ww upgrade` supports authenticated IPNS selection
 with an independently configured release identity and public keyring.
 Installation does not register a daemon or configure name publication. Register

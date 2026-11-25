@@ -21,7 +21,7 @@ run_install() {
 test_help() {
   output=$(run_install --help)
   echo "$output" | grep -q "Usage:" || { echo "FAIL: --help missing Usage"; return 1; }
-  echo "$output" | grep -q "\-\-version" || { echo "FAIL: --help missing --version"; return 1; }
+  echo "$output" | grep -q "\-\-release" || { echo "FAIL: --help missing --release"; return 1; }
   if echo "$output" | grep -q "\-\-prefix"; then echo "FAIL: obsolete --prefix advertised"; return 1; fi
   echo "PASS: --help"
 }

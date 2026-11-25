@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Real Host installer tests. Only IPFS transport uses a local fixture."""
 import argparse
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -13,7 +15,7 @@ import tempfile
 import unittest
 from release_auth_fixture import (bootstrap_arguments, cid_text, generate_key,
                                   manifest_root, package_release,
-                                  ReleaseMetadataServer, sign_manifest)
+                                  pin_fixture_verifiers, R1_ROOT, ReleaseMetadataServer, sign_manifest)
 
 REPO = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
@@ -32,6 +34,20 @@ PAYLOADS = [HOST_PATH, 'fhs/boot/kernel.wasm', 'fhs/bin/status.wasm']
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def package_file_cid(spool, root, path):
+    # The fixture producer emits named DAG-PB links with fixed-width CIDv1
+    # SHA-256 hashes. Walk only our locally generated package directories.
+    cid = root
+    for name in path.split('/'):
+        block = (spool / 'blocks' / cid).read_bytes()
+        component = name.encode()
+        link = rb'\x0a\x24(.{36})' + re.escape(bytes([18, len(component)]) + component + b'\x18')
+        matches = re.findall(link, block, re.DOTALL)
+        assert len(matches) == 1, (path, name)
+        cid = 'b' + base64.b32encode(matches[0]).decode().lower().rstrip('=')
+    return cid
 
 
 class Installation(unittest.TestCase):
@@ -65,6 +81,9 @@ class Installation(unittest.TestCase):
         package = package_release(cls.package_tool, release, cls.seed / 'spool',
                                   private, trusted_keys, cls.targets,
                                   command_runner=cls.package_command)
+        cls.installer = pin_fixture_verifiers(REPO / 'scripts/install.sh',
+                                             Path(cls.tools.name) / 'install.sh',
+                                             {HOST_PATH.removeprefix('bin/ww/').removesuffix('/ww'): BINARY})
         cls.seed_cid = package['root']
         shutil.copyfile(cls.seed / 'spool/blocks' / cls.seed_cid, cls.seed / 'root.block')
 
@@ -101,6 +120,7 @@ case "$1" in
     [ "$2" = get ] && [ "$3" = "$TEST_RELEASE_CID" ] || exit 91
     cat "$TEST_ROOT_BLOCK" ;;
   cat)
+    if [ "$2" = "/ipfs/$TEST_VERIFIER_ROOT/$TEST_HOST_PATH" ]; then cat "$TEST_VERIFIER"; exit; fi
     prefix=/ipfs/$TEST_RELEASE_CID/
     case "$2" in "$prefix"*) ;; *) exit 91 ;; esac
     p=${2#"$prefix"}
@@ -118,6 +138,7 @@ esac
                     if not k.startswith(('WW_', 'IPFS_'))}
         self.env.update(HOME=str(self.home), TEST_RELEASE=str(self.release), TEST_RELEASE_CID=self.release_cid,
                         TEST_ROOT_BLOCK=str(self.root / 'root.block'),
+                        TEST_VERIFIER_ROOT=R1_ROOT, TEST_HOST_PATH=HOST_PATH, TEST_VERIFIER=str(BINARY),
                         PATH=str(self.stubs) + os.pathsep + os.environ['PATH'],
                         NO_COLOR='1', WW_CWASM_DIR=str(self.root / 'cwasm'),
                         IPFS_API=self.metadata.endpoint, IPFS_ROUTING_API='http://127.0.0.1:1')
@@ -127,6 +148,8 @@ esac
             shutil.copyfile(self.seed / 'release' / name, self.release / name)
         shutil.copyfile(self.seed / 'root.block', self.root / 'root.block')
         self.release_cid = self.seed_cid
+        self.artifact_cids = {name: package_file_cid(self.seed / 'spool', self.release_cid, name)
+                              for name in PAYLOADS}
         self.publish_metadata()
 
     def checksums(self, valid_payload=True):
@@ -135,6 +158,8 @@ esac
                                       self.private, self.trusted_keys, self.targets,
                                       command_runner=self.package_command)
             self.release_cid = package['root']
+            self.artifact_cids = {name: package_file_cid(self.root / 'spool', self.release_cid, name)
+                                  for name in PAYLOADS}
             (self.root / 'root.block').write_bytes(
                 (self.root / 'spool/blocks' / self.release_cid).read_bytes())
             self.publish_metadata()
@@ -167,12 +192,14 @@ esac
             ('/api/v0/block/get', self.descriptor_cid):
                 (self.release / 'RELEASE-DESCRIPTOR.cbor').read_bytes(),
             ('/api/v0/block/get', self.release_cid): (self.root / 'root.block').read_bytes()})
+        for name, cid in self.artifact_cids.items():
+            self.metadata.routes['/api/v0/cat', '/ipfs/' + cid] = self.release / name
         if hasattr(self, 'env'):
             self.env['TEST_RELEASE_CID'] = self.release_cid
 
     def install(self, success=True):
         before_requests = len(self.metadata.requests)
-        result = subprocess.run(['sh', str(REPO / 'scripts/install.sh'),
+        result = subprocess.run(['sh', str(self.installer),
                                  '--release', self.release_cid,
                                  '--trusted-release-keys', str(self.trusted_keys)], env=self.env,
                                 text=True, capture_output=True, timeout=120)
@@ -182,8 +209,8 @@ esac
                         for name in ('CHECKSUMS.txt', 'CHECKSUMS.txt.sig', 'RELEASE-DESCRIPTOR')]
             expected += [('/api/v0/block/get', self.descriptor_cid),
                          ('/api/v0/block/get', self.release_cid)]
-            # Both --check and actual installation authenticate independently.
-            self.assertEqual(self.metadata.requests[before_requests:], expected * 2)
+            expected += [('/api/v0/cat', '/ipfs/' + self.artifact_cids[name]) for name in PAYLOADS]
+            self.assertEqual(self.metadata.requests[before_requests:], expected)
             retention = json.loads((self.home / '.ww/host-upgrade-retained.json').read_text())
             self.assertEqual(retention['version'], 3)
             self.assertIsNone(retention['previous'])
@@ -375,6 +402,15 @@ esac
         self.assertIn('/CHECKSUMS.txt', result.stderr)
         self.assertEqual(self.metadata.requests, [])
         self.assert_native_refusal_preserved(before)
+
+    def test_corrupt_native_artifact_refused_before_install(self):
+        # Shell transport supplies intact payloads. The independent verifier
+        # must authenticate the bytes that it receives from the native API.
+        self.metadata.routes['/api/v0/cat', '/ipfs/' + self.artifact_cids[HOST_PATH]] = b'corrupt'
+        before = self.snapshot()
+        self.install(False)
+        self.assert_native_refusal_preserved(before)
+        self.assertFalse((self.home / '.ww/bin/ww').exists())
 
     def test_native_descriptor_binding_failure_preserves_home(self):
         # The shell's manifest membership proof remains valid. Only native

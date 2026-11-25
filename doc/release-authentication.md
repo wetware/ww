@@ -1,8 +1,7 @@
 # Authenticated release manifests
 
-Status: implementation prepared for #412; production activation is **NO-GO**.
-No release key has been provisioned by this change. IPFS publication remains
-under the unconditional workflow hold. This document grants no operational authority.
+R1 `v0.1.1` uses the release key below. Distribution of the zero-argument
+installer through the production redirect requires separate approval.
 
 ## Trust and wire format
 
@@ -31,16 +30,17 @@ value: prefix `302a300506032b6570032100`, then the 32-byte public key. Duplicate
 keys, extra lines, invalid encodings, and small-order keys are rejected.
 The second key exists only for a bounded operator-managed rotation.
 
-The installer reads `/etc/wetware/release-keys` by default. An operator can use
-`--trusted-release-keys /absolute/path` for a separately provisioned keyring.
-The installer never fetches a keyring from IPFS and never trusts a public key
-because it accompanies a signature. Do not point this option at downloaded
-release content. A missing local keyring fails closed.
+A separately provisioned keyring at `/etc/wetware/release-keys` or a path
+selected with `--trusted-release-keys` takes precedence over embedded trust.
+Automatic bootstrap uses the embedded R1 key when no local keyring is configured.
+The installer never obtains a key from release content.
+Explicit selection, recovery, and offline manifest verification require an
+external keyring.
 
-Trust bootstrap requires an independently obtained installer and keyring.
-Fetching the installer itself from an attacker-controlled release tree defeats
-this boundary. A trusted source checkout or authenticated distribution channel
-must supply the installer. The installer requires OpenSSL 3.x or 4.x with
+The installer distributes the release key, expected IPNS identity, and four R1
+verifier digests over HTTPS.
+Compromise of the HTTPS origin, redirect target, or reviewed installer can
+replace both verification code and key. The installer requires OpenSSL 3.x or 4.x with
 Ed25519 support. Unsupported OpenSSL/LibreSSL fails closed. On macOS, place a
 trusted OpenSSL installation on `PATH`; the OS-provided tool might be LibreSSL.
 
@@ -152,8 +152,7 @@ signature file and remain vulnerable; retire them through the trusted installer
 distribution channel. New installers reject unsigned historic releases even
 when explicitly pinned. Rebuild or separately audit and re-authorize historic
 bytes if recovery requires them. Do not add a temporary skip-verification flag.
-Until the first signed release and trust distribution are ready, distributing
-this new installer as the default would strand users. That cutover is NO-GO.
+Updating the public installer redirect requires separate deployment approval.
 
 ## #738 descriptor binding
 
@@ -175,10 +174,10 @@ The frozen binding order is:
 `AuthenticatedRelease` verifies the signature, binding bytes, descriptor CID,
 schema, and manifest artifact bindings. Selection checks platform and Host/PID0
 compatibility. Artifact verification checks exact reconstructed bytes before use.
-The shell installer keeps its signed-manifest staging path during migration;
-it does not interpret descriptors or persist consumer freshness state. Automatic
-discovery is disabled. Recovery delegates typed verification to the staged Host
-only after independently verifying root-to-manifest membership and Host bytes.
+After the shell authenticates the staged manifest and payloads,
+the pinned R1 verifier authenticates and interprets the typed descriptor before installation.
+Zero-argument bootstrap verifies the raw IPNS record locally. A first-time
+consumer can accept an older valid record and has no global freshness proof.
 
 The Rust consumer records raw signed IPNS evidence and the signed release proof
 in one locked durable watermark. IPNS sequence and release sequence are separate

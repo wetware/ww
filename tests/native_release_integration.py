@@ -417,7 +417,7 @@ def run_lane(args, home, paths):
         suite('host-install', [sys.executable, REPO / 'tests/test_host_install.py', '-v'], 21, 900)
         del runner.env['WW_TEST_BINARY'], runner.env['WW_TEST_FHS']
         suite('installer', [sys.executable, REPO / 'tests/test_install.py', '--binary', binary,
-                           '--fhs', fhs, '--package-tool', paths['package_tool'], '-v'], 14, 900)
+                           '--fhs', fhs, '--package-tool', paths['package_tool'], '-v'], 15, 900)
         boot_stdout = run('installed-boot', [sys.executable, REPO / 'tests/test_installed_boot.py', binary, fhs,
                           '--authenticated', '--package-tool', paths['package_tool'],
                           '--producer-provenance', inputs / 'a/PROVENANCE.json',
