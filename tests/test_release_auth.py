@@ -432,10 +432,10 @@ chmod +x "$HOME/.ww/bin/ww"
                 self.auto_install(installer, success=True)
                 transport = self.transport.read_text().splitlines()
                 self.assertIn(f'name get {RELEASE_NAME}', transport)
-                self.assertIn(f'cat /ipfs/{self.release_cid}/bin/ww/{path}/ww', transport)
+                self.assertIn(f'cat /ipfs/{self.release_cid}/bin/ww/{path}/ww --progress=false', transport)
                 calls = self.calls.read_text().splitlines()
                 self.assertEqual(calls, ['--version'])
-                self.assertIn(f'cat /ipfs/{R1_ROOT}/bin/ww/{path}/ww', transport)
+                self.assertIn(f'cat /ipfs/{R1_ROOT}/bin/ww/{path}/ww --progress=false', transport)
                 self.assertIn(f'install --release {self.release_cid}', self.verifier_calls.read_text())
                 self.calls.unlink()
                 self.transport.unlink()
@@ -641,10 +641,10 @@ chmod +x "$HOME/.ww/bin/ww"
                     f'upgrade --recover-only --release {self.release_cid} '
                     f'--ipfs-url http://localhost:5001 --timeout-secs 15 --trusted-release-keys {self.keys}'])
                 self.assertEqual(self.transport.read_text().splitlines(), [
-                    'id', f'cat /ipfs/{self.release_cid}/CHECKSUMS.txt',
-                    f'cat /ipfs/{self.release_cid}/CHECKSUMS.txt.sig',
+                    'id', f'cat /ipfs/{self.release_cid}/CHECKSUMS.txt --progress=false',
+                    f'cat /ipfs/{self.release_cid}/CHECKSUMS.txt.sig --progress=false',
                     f'block get {self.release_cid}',
-                    f'cat /ipfs/{self.release_cid}/bin/ww/{path}/ww'])
+                    f'cat /ipfs/{self.release_cid}/bin/ww/{path}/ww --progress=false'])
                 self.calls.unlink()
                 self.transport.unlink()
 

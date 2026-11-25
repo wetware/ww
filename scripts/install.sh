@@ -23,87 +23,36 @@ WW_TMPDIR=""
 
 # --- TTY detection & output helpers ---
 
-IS_TTY=false
-if [ -t 1 ]; then
-  IS_TTY=true
+# Kubo owns live transfer output. Each shell message ends on its own line.
+show_progress=false
+if [ -t 2 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then
+  # Kubo truncates the rate and percentage when its counters fill the row.
+  size=$(stty size <&2 2>/dev/null) || size=""
+  columns=${size##* }
+  case "$columns" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$columns" -ge 64 ]; then show_progress=true; fi ;;
+  esac
+fi
+if ! "$show_progress"; then
+  # Kubo's diagnostic logger selects color independently of its transfer bar.
+  case "${GOLOG_LOG_FMT:-${IPFS_LOGGING_FMT:-}}" in
+    json) ;;
+    *) export GOLOG_LOG_FMT=nocolor ;;
+  esac
 fi
 
-SPINNER_PID=""
-
-_spinner_frame() {
-  case $(($1 % 10)) in
-    0) printf '\342\240\213' ;;  # ⠋
-    1) printf '\342\240\231' ;;  # ⠙
-    2) printf '\342\240\271' ;;  # ⠹
-    3) printf '\342\240\270' ;;  # ⠸
-    4) printf '\342\240\274' ;;  # ⠼
-    5) printf '\342\240\264' ;;  # ⠴
-    6) printf '\342\240\246' ;;  # ⠦
-    7) printf '\342\240\247' ;;  # ⠧
-    8) printf '\342\240\207' ;;  # ⠇
-    9) printf '\342\240\217' ;;  # ⠏
-  esac
-}
-
-# Start a spinner with a message.  Usage: spin "Doing thing..."
-spin() {
-  if $IS_TTY; then
-    _spin_msg="$1"
-    (
-      i=0
-      while true; do
-        frame=$(_spinner_frame $i)
-        printf '\r  %s %s' "$frame" "$_spin_msg" >&2
-        i=$((i + 1))
-        sleep 0.1
-      done
-    ) &
-    SPINNER_PID=$!
+status() {
+  if "$show_progress"; then
+    # The tab aligns text after either a one- or two-column heading icon.
+    printf '%s\t%s\n' "$1" "$2" >&2
   else
-    printf '%s' "$1" >&2
+    printf '%s\n' "$2" >&2
   fi
 }
 
-# Stop spinner and show success.  Usage: spin_ok "Done thing"
-spin_ok() {
-  if $IS_TTY; then
-    if [ -n "$SPINNER_PID" ]; then
-      kill "$SPINNER_PID" 2>/dev/null || true
-      wait "$SPINNER_PID" 2>/dev/null || true
-      SPINNER_PID=""
-    fi
-    printf '\r\033[K  \342\234\223 %s\n' "$1" >&2
-  else
-    printf ' ok\n' >&2
-  fi
-}
-
-# Stop spinner and show failure.  Usage: spin_fail "Failed thing"
-spin_fail() {
-  if $IS_TTY; then
-    if [ -n "$SPINNER_PID" ]; then
-      kill "$SPINNER_PID" 2>/dev/null || true
-      wait "$SPINNER_PID" 2>/dev/null || true
-      SPINNER_PID=""
-    fi
-    printf '\r\033[K  \342\234\227 %s\n' "$1" >&2
-  else
-    printf ' FAILED: %s\n' "$1" >&2
-  fi
-}
-
-# Dim warning (single line, non-fatal)
-warn() {
-  if $IS_TTY; then
-    printf '  \033[2m%s\033[0m\n' "$1" >&2
-  else
-    printf '  %s\n' "$1" >&2
-  fi
-}
-
-# Fatal error
 die() {
-  spin_fail "$1"
+  printf 'Error: %s\n' "$1" >&2
   shift
   for line in "$@"; do
     printf '  %s\n' "$line" >&2
@@ -111,12 +60,7 @@ die() {
   exit 1
 }
 
-# Clean up spinner on exit
 cleanup() {
-  if [ -n "$SPINNER_PID" ]; then
-    kill "$SPINNER_PID" 2>/dev/null || true
-    wait "$SPINNER_PID" 2>/dev/null || true
-  fi
   rm -rf "${WW_TMPDIR:-}"
 }
 trap cleanup EXIT
@@ -176,7 +120,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --release)
       if [ $# -lt 2 ] || [ -z "$2" ]; then
-        echo "Error: --release requires a CID argument"; exit 1
+        die "--release requires a CID argument"
       fi
       RELEASE_CID="$2"; shift 2 ;;
     --recover) RECOVER=true; shift ;;
@@ -204,7 +148,7 @@ while [ $# -gt 0 ]; do
       echo "  --timeout-secs Positive native recovery operation budget; required with --recover"
       exit 0
       ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    *) die "Unknown option: $1" ;;
   esac
 done
 
@@ -488,11 +432,9 @@ fi
 
 # --- Header ---
 if "$RECOVER"; then
-  printf 'Recovering the recorded Host transaction...\n'
-elif $IS_TTY; then
-  printf '\n\342\232\227\357\270\217  Installing wetware...\n'
+  status '⚗️' 'Recovering the recorded Host transaction...'
 else
-  printf 'Installing wetware...\n'
+  status '⚗️' 'Installing wetware...'
 fi
 
 # --- Select immutable release ---
@@ -515,11 +457,11 @@ IPFS_BASE="/ipfs/${RELEASE_CID}"
 
 # Authenticate all staged bytes before executing the selected Host.
 BIN_PATH="bin/ww/${OS_NAME}/${ARCH_NAME}/ww"
-if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt" > "${WW_TMPDIR}/CHECKSUMS.txt"; then
+if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt" --progress="$show_progress" > "${WW_TMPDIR}/CHECKSUMS.txt"; then
   die "Could not fetch required CHECKSUMS.txt"
 fi
 
-if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt.sig" > "${WW_TMPDIR}/CHECKSUMS.txt.sig"; then
+if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt.sig" --progress="$show_progress" > "${WW_TMPDIR}/CHECKSUMS.txt.sig"; then
   die "Could not fetch required CHECKSUMS.txt.sig"
 fi
 verify_manifest "${WW_TMPDIR}/CHECKSUMS.txt" "${WW_TMPDIR}/CHECKSUMS.txt.sig"
@@ -529,9 +471,9 @@ fetch_verified() {
   package_path="$1"
   staged_path="$2"
   if [ "$#" -eq 3 ]; then
-    fetch_bounded "$3" cat "${IPFS_BASE}/${package_path}"
+    fetch_bounded "$3" cat "${IPFS_BASE}/${package_path}" --progress=false
   else
-    ipfs cat "${IPFS_BASE}/${package_path}"
+    ipfs cat "${IPFS_BASE}/${package_path}" --progress="$show_progress"
   fi > "$staged_path" || die "Could not fetch mandatory payload: ${package_path}"
   [ -s "$staged_path" ] || die "Mandatory payload is empty: ${package_path}"
   expected=$(awk -v path="$package_path" '
@@ -605,9 +547,9 @@ if type(version) is not int or version != 1 or fields["channel"] != sys.argv[2]:
 PY
 }
 
-spin "Fetching verified Host..."
+status '>' "Fetching verified Host..."
 fetch_verified "$BIN_PATH" "${WW_TMPDIR}/ww"
-spin_ok "Fetched verified Host"
+status '+' "Fetched verified Host"
 
 if "$RECOVER"; then
   chmod +x "${WW_TMPDIR}/ww"
@@ -617,14 +559,14 @@ if "$RECOVER"; then
   exit 0
 fi
 
-spin "Fetching verified FHS payloads..."
+status '>' "Fetching verified FHS payloads..."
 mkdir -p "${WW_TMPDIR}/fhs/boot" "${WW_TMPDIR}/fhs/bin"
 fetch_verified "fhs/boot/kernel.wasm" "${WW_TMPDIR}/fhs/boot/kernel.wasm"
 fetch_verified "fhs/bin/status.wasm" "${WW_TMPDIR}/fhs/bin/status.wasm"
 if [ -n "$expected_channel" ] || [ "$RELEASE_CID" = "$BOOTSTRAP_CID" ]; then
   verify_descriptor
 fi
-spin_ok "Fetched verified package"
+status '+' "Fetched verified package"
 
 # These hashes come from the independently verified R1 manifest. The
 # selected release cannot choose the executable that validates its descriptor.
@@ -637,7 +579,7 @@ esac
 verifier=$WW_TMPDIR/ww
 if [ "$RELEASE_CID" != "$BOOTSTRAP_CID" ]; then
   verifier=$WW_TMPDIR/r1-verifier
-  ipfs cat "/ipfs/$BOOTSTRAP_CID/$BIN_PATH" > "$verifier" || die "Could not fetch R1 verifier"
+  ipfs cat "/ipfs/$BOOTSTRAP_CID/$BIN_PATH" --progress="$show_progress" > "$verifier" || die "Could not fetch R1 verifier"
 fi
 [ "$(file_sha256 "$verifier")" = "$verifier_hash" ] || die "R1 verifier checksum mismatch"
 chmod +x "$verifier"
