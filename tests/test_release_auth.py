@@ -553,7 +553,9 @@ chmod +x "$HOME/.ww/bin/ww"
 
     def test_release_rejects_paths_and_malformed_cids_before_transport(self):
         for value in ('test-release', '/ipfs/' + self.release_cid, '/ipns/untrusted',
-                      self.release_cid + '/other', self.release_cid + '?query', ' ', '--recover'):
+                      self.release_cid + '/other', self.release_cid + '?query',
+                      self.release_cid[:-1], self.release_cid + 'a', self.release_cid[:-1] + '0',
+                      self.release_cid + '\n' + self.release_cid, ' ', '--recover'):
             with self.subTest(value=value):
                 self.refuse_before_transport(['--release', value])
 

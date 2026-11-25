@@ -81,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - Align shell installer status messages and let Kubo alone render transfer progress.
+- Accept valid explicit release CIDs in the shell installer with Debian 12's default `mawk`.
 - Download producer WASM artifacts after Rust cache restoration so partial-cache
   cleanup cannot remove the FHS inputs before packaging.
 - Installer-test setup now reuses an authenticated package with independent

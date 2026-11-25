@@ -395,7 +395,7 @@ fi
 
 if [ -n "$RELEASE_CID" ]; then
   printf '%s\n' "$RELEASE_CID" | awk '
-    /^bafybei[a-z2-7]{52}$/ { valid=1 }
+    length($0) == 59 && /^bafybei[a-z2-7]+$/ { valid=1 }
     END { exit !(NR == 1 && valid) }
   ' || die "--release requires one canonical CIDv1 DAG-PB SHA-256 release root, without a path or query."
 elif [ -e "$WW_HOME/release-consumer" ] || [ -L "$WW_HOME/release-consumer" ]; then
