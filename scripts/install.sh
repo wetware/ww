@@ -443,6 +443,7 @@ expected_channel=""
 if [ -z "$RELEASE_CID" ]; then
   expected_channel=$RELEASE_IPNS
   # Resolve and validate the official signed record before selecting any bytes.
+  status '>' 'Resolving signed release...'
   RELEASE_CID=$(discover_release) || die "Could not authenticate ww-release IPNS record"
   if ! "$KEYS_EXPLICIT" && [ ! -e "$TRUSTED_RELEASE_KEYS" ] && [ ! -L "$TRUSTED_RELEASE_KEYS" ]; then
     key_directory=${TRUSTED_RELEASE_KEYS%/*}
@@ -457,6 +458,7 @@ IPFS_BASE="/ipfs/${RELEASE_CID}"
 
 # Authenticate all staged bytes before executing the selected Host.
 BIN_PATH="bin/ww/${OS_NAME}/${ARCH_NAME}/ww"
+status '>' 'Verifying release manifest...'
 if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt" --progress="$show_progress" > "${WW_TMPDIR}/CHECKSUMS.txt"; then
   die "Could not fetch required CHECKSUMS.txt"
 fi
@@ -466,6 +468,7 @@ if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt.sig" --progress="$show_progress" > "${
 fi
 verify_manifest "${WW_TMPDIR}/CHECKSUMS.txt" "${WW_TMPDIR}/CHECKSUMS.txt.sig"
 verify_release_binding
+status '✓' 'Release manifest verified'
 
 fetch_verified() {
   package_path="$1"
@@ -623,7 +626,7 @@ def append_config(home, destination, command):
                 if terminated:
                     newline = b"\r\n" if existing.endswith(b"\r\n") else b"\n"
                 if existing.rstrip(b"\r\n") == line:
-                    return
+                    return False
             addition = (b"" if terminated else newline) + line + newline
             # Append in one write. A short write can only add a prefix of our
             # command. Roll back that prefix if nobody else has appended since.
@@ -632,6 +635,7 @@ def append_config(home, destination, command):
                 if os.fstat(fd).st_size == info.st_size + written:
                     os.ftruncate(fd, info.st_size)
                 raise OSError("incomplete startup file write")
+            return True
 
 
 def startup_file(shell_path, home):
@@ -695,12 +699,10 @@ def consent(destination):
         return False
 
 
-def next_steps(available=False, configured=False, leading_blank=True):
+def next_steps(available=False, leading_blank=True):
     ww = "ww" if available else "~/.ww/bin/ww"
-    steps = [(ww + " run", "Start Wetware now")]
-    if configured:
-        steps.append(("ww run", "Start from a new terminal"))
-    steps.append((ww + " daemon install", "Install as a background service"))
+    steps = [(ww + " run", "Start Wetware"),
+             (ww + " daemon install", "Install as a background service")]
     print("\nNext steps" if leading_blank else "Next steps")
     for cmd, description in steps:
         print(f"  {cmd:<27}  {description}")
@@ -743,15 +745,28 @@ def configure():
         return
 
     if destination and home.is_absolute() and home in destination.parents and ".." not in destination.parts:
-        name = "~/" + str(destination.relative_to(home))
-        if not name.isascii() or not name.isprintable():
+        relative = str(destination.relative_to(home))
+        name = "~/" + relative
+        printable = name.isascii() and name.isprintable()
+        if not printable:
             name = ascii(name)
         if consent(name):
             try:
-                append_config(home, destination, command + " # Wetware PATH")
-                print(f"✓ Configured ~/.ww/bin in {name}")
-                print("Open a new terminal to use ww.")
-                next_steps(configured=True)
+                added = append_config(home, destination, command + " # Wetware PATH")
+                if added:
+                    print(f"✓ Added ~/.ww/bin to {name}")
+                else:
+                    print(f"~/.ww/bin is already configured in {name}")
+                if printable:
+                    # Keep tilde expansion and escape metacharacters in the literal suffix.
+                    path = "~/" + re.sub(r"([^A-Za-z0-9_./-])", r"\\\1", relative)
+                    reload_command = "." if shell in ("ksh", "ksh93", "mksh") else "source"
+                    print(f"\nTo use ww in this terminal:\n  {reload_command} {path}")
+                    print("\nOr open a new terminal.")
+                    next_steps(available=True)
+                else:
+                    print("Open a new terminal to use ww by name.")
+                    next_steps()
                 return
             except (ValueError, OSError) as error:
                 print(f"Could not configure PATH: {ascii(str(error))}")
@@ -770,7 +785,7 @@ configure()
 PYTHON
 }
 
-status '>' 'Fetching verified Host...'
+status '>' 'Fetching Host...'
 fetch_verified "$BIN_PATH" "${WW_TMPDIR}/ww"
 status '✓' 'Host verified'
 

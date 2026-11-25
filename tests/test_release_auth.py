@@ -238,6 +238,7 @@ fi
                     self.assertFalse(self.calls.exists(), 'substituted candidate executed')
                 self.assertIn('manifest binding' if original_root else 'root CID mismatch',
                               result.stderr)
+                self.assertNotIn('Release manifest verified', result.stderr)
                 self.assertNotIn('/bin/ww/', self.transport.read_text(),
                                  'binding failure reached candidate download')
 
@@ -483,11 +484,22 @@ fi
                 else:
                     self.assertEqual(config.read_bytes(), b'# existing config')
 
+    def test_plain_startup_stages_in_limited_terminals(self):
+        installer = self.automatic_fixture()
+        env = dict(self.env, INSTALL_TEST=str(installer), SHELL='/bin/zsh', TERM='xterm', CI='1')
+        env.pop('NO_COLOR', None)
+        stages = (TERMINAL_CAPTURES / 'noninteractive.txt').read_text().split('\n\n', 1)[0]
+        for columns, overrides in ((40, {}), (100, {'NO_COLOR': ''}), (100, {'TERM': 'dumb'})):
+            with self.subTest(columns=columns, overrides=overrides):
+                output = piped_terminal(dict(env, **overrides), timeout=30, columns=columns)
+                self.assertEqual(output.split('\n\n', 1)[0], stages)
+
     def test_native_warning_and_failure_remain_visible(self):
         note = ('Host, baseline FHS, and identity only. '
                 'Register a daemon separately with ww daemon install.')
         self.env['TEST_INSTALL_REPORT'] = json.dumps({'warnings': [note, 'fixture install warning']})
         result = self.run_installer(success=True)
+        self.assertNotIn('Resolving signed release', result.stderr)
         self.assertIn('fixture install warning', result.stderr)
         self.assertNotIn(note, result.stderr)
         self.assertNotIn('{"warnings"', result.stdout)
@@ -512,7 +524,9 @@ fi
         installer = self.automatic_fixture()
         valid = self.discovery.read_bytes()
         malformed = [b'', b'{', b'x' * 10241]
-        for changes in ({"Valid": False}, {"Valid": 1}, {"Name": "wrong signer"}):
+        for changes in ({"Valid": False, "Reason": "record is expired"},
+                        {"Valid": False, "Reason": "signature verification failed"},
+                        {"Valid": 1}, {"Name": "wrong signer"}):
             verdict = dict(self.inspection["Validation"], **changes)
             malformed.append(json.dumps(dict(self.inspection, Validation=verdict)).encode())
         for path in ("/ipns/" + RELEASE_NAME, "/ipfs/" + self.release_cid + "/child",
@@ -521,13 +535,19 @@ fi
         for index, data in enumerate(malformed):
             with self.subTest(case=index):
                 self.discovery.write_bytes(data)
-                self.auto_install(installer)
+                result = self.auto_install(installer)
+                self.assertNotIn('Verifying release manifest', result.stderr)
                 self.assertFalse(any(op.startswith(('cat ', 'block '))
                                      for op in self.transport.read_text().splitlines()))
                 self.transport.unlink()
         self.discovery.write_bytes(valid)
         self.env['TEST_RESOLVE_STATUS'] = '1'
-        self.auto_install(installer)
+        result = self.auto_install(installer)
+        self.assertEqual(result.stderr.splitlines(), [
+            'Installing Wetware...', 'Resolving signed release...',
+            'Error: Cannot fetch ww-release. Check Kubo connectivity and support for ipfs name get.',
+            'Error: Could not authenticate ww-release IPNS record',
+        ])
         self.assertNotIn('cat ', self.transport.read_text())
 
     def test_signed_release_for_another_channel_cannot_start_verifier(self):
@@ -603,7 +623,11 @@ fi
         self.auto_install(installer)
         sign_manifest(self.other_private, self.manifest)
         (self.release / 'release-keys').write_bytes(self.other_keys.read_bytes())
-        self.auto_install(installer)
+        result = self.auto_install(installer)
+        self.assertEqual(result.stderr.splitlines(), [
+            'Installing Wetware...', 'Resolving signed release...', 'Verifying release manifest...',
+            'Error: Release manifest authentication failed',
+        ])
         self.signature.write_bytes(signature)
         (self.release / 'bin/ww/linux/x86_64/ww').write_bytes(b'changed executable')
         result = self.auto_install(installer)

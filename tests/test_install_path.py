@@ -20,11 +20,11 @@ INSTALLER = Path(__file__).resolve().parents[1] / 'scripts/install.sh'
 PROMPT = b'Add Wetware to your shell PATH? [y/N]'
 
 
-def piped_terminal(environment, answer=None, interactive_caller=True, timeout=5):
-    """Pipe INSTALL_TEST into sh with an independent 100-column controlling terminal."""
+def piped_terminal(environment, answer=None, interactive_caller=True, timeout=5, columns=100):
+    """Pipe INSTALL_TEST into sh with an independent controlling terminal."""
     pid, master = pty.fork()
     if pid == 0:
-        fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
+        fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack('HHHH', 24, columns, 0, 0))
         flag = '-ic' if interactive_caller else '-c'
         os.execve('/bin/bash', ['bash', '--noprofile', '--norc', flag,
                                 'cat "$INSTALL_TEST" | /bin/sh'], environment)
@@ -100,6 +100,9 @@ class InstallerPath(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn('ww-from-test-home', run.stdout)
 
+    def activation(self, output):
+        return output.split('To use ww in this terminal:\n  ', 1)[1].splitlines()[0]
+
     def test_piped_zsh_opt_in_preserves_bytes_mode_and_repeated_install(self):
         config = self.home / '.zshrc'
         original = b'# existing: \xff\r\n# last line'
@@ -111,7 +114,8 @@ class InstallerPath(unittest.TestCase):
         self.assertTrue(edited.startswith(original))
         self.assertGreater(len(edited), len(original))
         self.assertEqual(config.stat().st_mode & 0o777, 0o640)
-        self.install(answer=b'yes\n')
+        repeated = self.install(answer=b'yes\n')
+        self.assertIn('~/.ww/bin is already configured in ~/.zshrc', repeated)
         self.assertEqual(config.read_bytes(), edited)
         self.assert_ww_runs('zsh', ['-ic', 'ww'])
 
@@ -170,11 +174,10 @@ class InstallerPath(unittest.TestCase):
     def test_shell_specific_startup_files(self):
         bash_config = '.bash_profile' if sys.platform == 'darwin' else '.bashrc'
         for shell, config, args, environment in [
-            ('bash', bash_config, ['--noprofile', '--norc', '-c',
-                                   '. "$HOME/' + bash_config + '"; ww'], {}),
-            ('zsh', 'dot/.zshrc', ['-ic', 'ww'], {'ZDOTDIR': str(self.home / 'dot')}),
-            ('fish', 'config/fish/conf.d/ww-path.fish', ['-ic', 'ww'],
-             {'XDG_CONFIG_HOME': str(self.home / 'config')}),
+            ('bash', bash_config, ['--noprofile', '--norc', '-ic'], {}),
+            ('zsh', "dot $a;'!/.zshrc", ['-fic'], {'ZDOTDIR': str(self.home / "dot $a;'!")}),
+            ('fish', "config $a;'!/fish/conf.d/ww-path.fish", ['--no-config', '-ic'],
+             {'XDG_CONFIG_HOME': str(self.home / "config $a;'!")}),
         ]:
             with self.subTest(shell=shell):
                 dest = self.home / config
@@ -188,7 +191,11 @@ class InstallerPath(unittest.TestCase):
                 output = self.install(SHELL='/bin/' + shell, answer=b'yes\n', **environment)
                 self.assertIn(PROMPT.decode(), output)
                 self.assertIn('.ww/bin', dest.read_text(), output)
-                self.assert_ww_runs(shell, args, **environment)
+                activation = self.activation(output)
+                self.assertTrue(activation.startswith('source ~/'), activation)
+                self.assert_ww_runs(shell, [*args, activation + '\nww'], **environment)
+                if shell != 'bash':
+                    self.assert_ww_runs(shell, ['-ic', 'ww'], **environment)
 
     def test_csh_startup_precedence(self):
         tcsh = Path('/bin/tcsh')
@@ -211,12 +218,16 @@ class InstallerPath(unittest.TestCase):
                     selected = tcshrc if uses_tcsh and tcshrc in existing else cshrc
                     other = cshrc if selected == tcshrc else tcshrc
                     output = self.install(SHELL=str(shell), answer=b'y\n')
-                    self.assertIn('✓ Configured ~/.ww/bin in ~/' + selected.name, output)
+                    self.assertIn('✓ Added ~/.ww/bin to ~/' + selected.name, output)
                     self.assertIn(b'# Wetware PATH', selected.read_bytes())
                     if other in existing:
                         self.assertEqual(other.read_bytes(), original)
                     else:
                         self.assertFalse(other.exists())
+
+                    activation = self.activation(output)
+                    self.assertEqual(activation, 'source ~/' + selected.name)
+                    self.assert_ww_runs(str(shell), ['-fc', activation + '\nww'])
 
                     # First resolve ww through normal interactive startup. Read
                     # the selected file a second time, then check PATH and ww.
@@ -237,7 +248,7 @@ class InstallerPath(unittest.TestCase):
         output = self.install(SHELL=str(shell), answer=b'y\n')
         self.assertNotIn(PROMPT.decode(), output)
         self.assertIn('set path =', output)
-        self.assertNotIn('✓ Configured', output)
+        self.assertNotIn('✓ Added', output)
         self.assertFalse((self.home / 'unexpected-execution').exists())
         for name in ('.tcshrc', '.cshrc'):
             self.assertEqual((self.home / name).read_text(), '# existing settings')
@@ -249,9 +260,23 @@ class InstallerPath(unittest.TestCase):
         config = home / '.kshrc'
         self.assertNotIn(PROMPT.decode(), self.install())
         config.touch(mode=0o600)
-        self.assertIn(PROMPT.decode(), self.install(answer=b'y\n'))
+        output = self.install(answer=b'y\n')
+        self.assertIn(PROMPT.decode(), output)
+        activation = self.activation(output)
+        self.assertEqual(activation, '. ~/.kshrc')
+        self.assert_ww_runs('ksh', ['-c', activation + '\nww'])
         self.assertIn('.ww/bin', config.read_text())
         self.assert_ww_runs('ksh', ['-ic', 'ww'])
+
+    def test_nonprintable_startup_path_uses_new_terminal_fallback(self):
+        directory = self.home / 'line\nbreak'
+        output = self.install(answer=b'y\n', ZDOTDIR=str(directory))
+        self.assertIn('✓ Added', output)
+        self.assertIn('Open a new terminal', output)
+        self.assertNotIn('To use ww in this terminal:', output)
+        self.assertNotIn('  ww run', output)
+        self.assertIn('~/.ww/bin/ww run', output)
+        self.assertIn('# Wetware PATH', (directory / '.zshrc').read_text())
 
     def test_manual_shells(self):
         for shell in ['sh', 'dash', 'ash', 'nu']:
@@ -293,7 +318,7 @@ class InstallerPath(unittest.TestCase):
         output = self.install(answer=b'y\n')
         self.assertIn('incomplete startup file write', output)
         self.assertEqual(config.read_bytes(), original)
-        self.assertNotIn('✓ Configured', output)
+        self.assertNotIn('✓ Added', output)
         self.assertIn('export PATH', output)
         self.assertIn('~/.ww/bin/ww run', output)
 

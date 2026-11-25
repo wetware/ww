@@ -1,5 +1,8 @@
 ⚗️	Installing Wetware...
->	Fetching verified Host...
+>	Resolving signed release...
+>	Verifying release manifest...
+✓	Release manifest verified
+>	Fetching Host...
 ✓	Host verified
 ✓	FHS verified
 
@@ -9,5 +12,5 @@
   Release   bafybeid3rced2tilxswelc5qfic7oeeezjtprua6xtw467xfyywwql4fbe
 
 Next steps
-  ww run                       Start Wetware now
+  ww run                       Start Wetware
   ww daemon install            Install as a background service

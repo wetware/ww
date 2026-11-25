@@ -1,5 +1,8 @@
 ⚗️	Installing Wetware...
->	Fetching verified Host...
+>	Resolving signed release...
+>	Verifying release manifest...
+✓	Release manifest verified
+>	Fetching Host...
 ✓	Host verified
 ✓	FHS verified
 
@@ -15,5 +18,5 @@ For the current session, run:
   export PATH="$HOME/.ww/bin:$PATH"
 
 Next steps
-  ~/.ww/bin/ww run             Start Wetware now
+  ~/.ww/bin/ww run             Start Wetware
   ~/.ww/bin/ww daemon install  Install as a background service

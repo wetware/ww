@@ -1,5 +1,8 @@
 ⚗️	Installing Wetware...
->	Fetching verified Host...
+>	Resolving signed release...
+>	Verifying release manifest...
+✓	Release manifest verified
+>	Fetching Host...
 ✓	Host verified
 ✓	FHS verified
 
@@ -10,10 +13,13 @@
 
 Startup file  ~/.zshrc
 Add Wetware to your shell PATH? [y/N] y
-✓ Configured ~/.ww/bin in ~/.zshrc
-Open a new terminal to use ww.
+✓ Added ~/.ww/bin to ~/.zshrc
+
+To use ww in this terminal:
+  source ~/.zshrc
+
+Or open a new terminal.
 
 Next steps
-  ~/.ww/bin/ww run             Start Wetware now
-  ww run                       Start from a new terminal
-  ~/.ww/bin/ww daemon install  Install as a background service
+  ww run                       Start Wetware
+  ww daemon install            Install as a background service
