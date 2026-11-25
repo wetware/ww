@@ -234,11 +234,24 @@ require('\npermissions:\n  contents: read\n\n' in fast, 'shared checks must defa
 for job, body in fast_jobs.items():
     if job != 'pages':
         require('pages: write' not in body and 'id-token: write' not in body, 'publishing permissions on ' + job)
-checks = 'lockfiles fmt clippy solidity fast-rust fuzz-corpus test-stdlib test-architecture-map'
+checks = 'lockfiles fmt clippy solidity fast-rust fast-p3 fuzz-corpus test-stdlib test-architecture-map'
 verify_needs(fast_jobs, 'test', checks)
 require(set(fast_jobs) == set(checks.split()) | {'test', 'changes', 'pages'}, 'unexpected job in fast tier')
 for check in checks.split():
     require('\n    if:' not in fast_jobs[check], f'fast check may be skipped: {check}')
+verify_needs(fast_jobs, 'fast-p3', 'lockfiles')
+# The dispatch caller executes both suites in the required WASM producer.
+# On PRs and pushes the fast job must execute both in order, on one runner.
+p3_commands = ['make test-p3-fixture', 'make test-guest-session-cancel']
+for body, expected_conditions in [(fast_jobs['fast-p3'], ["github.event_name != 'workflow_dispatch'"]),
+                                  (jobs['build-wasm'], [])]:
+    steps = re.split(r'^    - ', body, flags=re.M)[1:]
+    fixture_steps = [step for step in steps if any(f'      run: {cmd}\n' in step for cmd in p3_commands)]
+    require([run_block(step) for step in fixture_steps] == p3_commands, 'incomplete or reordered P3 coverage')
+    for step in fixture_steps:
+        require(re.findall(r'^      if: (.+)$', step, re.M) == expected_conditions,
+                'incorrect P3 fixture condition')
+        require('continue-on-error:' not in step, 'P3 fixture failures must fail the job')
 verify_needs(fast_jobs, 'pages', 'changes test')
 require("if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.changes.outputs.architecture_map == 'true'" in fast_jobs['pages'],
         'fast workflow Pages deployment requires a matching master push')

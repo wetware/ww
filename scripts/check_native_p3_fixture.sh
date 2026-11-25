@@ -7,10 +7,11 @@ cd "$repo_root"
 
 target_dir="${P3_TARGET_DIR:-$repo_root/target/native-p3-fixture}"
 artifact="$target_dir/wasm32-wasip3/release/native_p3_fixture.wasm"
+manifest=tests/fixtures/native-p3/Cargo.toml
 
 "$script_dir/build_wasip3_component.sh" \
   --name "native P3 fixture" \
-  --manifest tests/fixtures/native-p3/Cargo.toml \
+  --manifest "$manifest" \
   --artifact native_p3_fixture \
   --target-dir "$target_dir" \
   --allow-import wetware:transport/connection@0.2.0 \
@@ -31,5 +32,6 @@ artifact="$target_dir/wasm32-wasip3/release/native_p3_fixture.wasm"
   --allow-import wasi:filesystem/types@0.3.0 \
   --allow-import wasi:filesystem/preopens@0.3.0
 
+selector="$(python3 "$script_dir/check_fast_selection.py" p3 "$manifest")"
 WW_NATIVE_P3_FIXTURE="$artifact" \
-  cargo test -p cell 'p3::tests::p3_' --locked -- --ignored --test-threads=1
+  cargo test -p cell "$selector" --locked -- --ignored --test-threads=1
