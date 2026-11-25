@@ -462,7 +462,7 @@ fi
         for name in ('CI', 'NO_COLOR', 'NONINTERACTIVE', 'WW_NONINTERACTIVE', 'ZDOTDIR'):
             env.pop(name, None)
         config = self.home / '.zshrc'
-        for name in ('accepted', 'declined', 'already-on-path', 'noninteractive'):
+        for name in ('accepted', 'bash-with-tcsh', 'declined', 'already-on-path', 'noninteractive'):
             with self.subTest(name=name):
                 config.write_bytes(b'# existing config')
                 config.chmod(0o600)
@@ -472,12 +472,18 @@ fi
                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                             timeout=30, check=True)
                     output = result.stdout.decode()
+                elif name == 'accepted':
+                    if not Path('/bin/zsh').exists():
+                        self.skipTest('Zsh unavailable')
+                    output = piped_terminal(env, b'y\n', timeout=30, caller='/bin/zsh')
+                elif name == 'bash-with-tcsh':
+                    output = piped_terminal(dict(env, SHELL='/bin/tcsh'), b'y\n', timeout=30)
+                    self.assertIn(b'# Wetware PATH', (self.home / '.cshrc').read_bytes())
                 elif name == 'already-on-path':
                     path = str(self.home / '.ww/bin') + os.pathsep + env['PATH']
                     output = piped_terminal(dict(env, PATH=path), timeout=30)
                 else:
-                    answer = b'y\n' if name == 'accepted' else b'n\n'
-                    output = piped_terminal(env, answer, timeout=30)
+                    output = piped_terminal(env, b'n\n', timeout=30)
                 self.assertEqual(output, (TERMINAL_CAPTURES / (name + '.txt')).read_text())
                 if name == 'accepted':
                     self.assertIn(b'# Wetware PATH', config.read_bytes())

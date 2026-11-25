@@ -14,7 +14,7 @@
 Startup file  ~/.zshrc
 Add Wetware to your shell PATH? [y/N] n
 For future sessions, you can add the command below to ~/.zshrc.
-For the current session, run:
+In zsh, run:
   export PATH="$HOME/.ww/bin:$PATH"
 
 Next steps

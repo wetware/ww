@@ -674,6 +674,45 @@ def startup_file(shell_path, home):
     return None
 
 
+def foreground_pipeline(tty, caller):
+    # A job-control shell gives its foreground pipeline a separate process group.
+    group = os.getpgrp()
+    return caller > 1 and os.tcgetpgrp(tty.fileno()) == group and os.getpgid(caller) != group
+
+
+def matches_caller(shell_path):
+    # SHELL selects the startup file. Identify the installer shell's parent
+    # separately before suggesting that the user reload that file here.
+    caller = int(sys.argv[2])
+    shell = shell_path.name
+    if (not shell_path.is_absolute() or sys.argv[1] != "interactive"
+            or not all(os.isatty(fd) for fd in (1, 2)) or caller <= 1
+            or shell in ("sh", "ash", "busybox")):
+        return False
+    try:
+        with open("/dev/tty", "rb", buffering=0) as tty:
+            if not foreground_pipeline(tty, caller) or os.getsid(caller) != os.getsid(0):
+                return False
+        if sys.platform == "darwin":
+            import ctypes
+            path = ctypes.create_string_buffer(4096)  # PROC_PIDPATHINFO_MAXSIZE
+            proc_pidpath = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath
+            if proc_pidpath(caller, path, len(path)) <= 0:
+                return False
+            executable = Path(os.fsdecode(path.value))
+        elif sys.platform.startswith("linux"):
+            executable = Path(f"/proc/{caller}/exe")
+        else:
+            return False
+        # The configured path may itself be a misleadingly named symlink.
+        names = {"csh": ("csh", "tcsh", "bsd-csh"), "ksh": ("ksh", "ksh93", "mksh")}
+        return (executable.resolve(strict=True).name in names.get(shell, (shell,))
+                and shell_path.samefile(executable))
+    except (ImportError, AttributeError, OSError):
+        pass
+    return False
+
+
 def consent(destination):
     if (sys.argv[1] != "interactive" or not all(os.isatty(fd) for fd in (1, 2))
             or os.environ.get("TERM", "dumb") == "dumb"
@@ -681,10 +720,7 @@ def consent(destination):
         return False
     try:
         with open("/dev/tty", "r+b", buffering=0) as tty:
-            # An interactive job-control shell gives its foreground pipeline a
-            # separate process group. An unattended script can inherit a TTY.
-            group = os.getpgrp()
-            if os.tcgetpgrp(tty.fileno()) != group or os.getpgid(int(sys.argv[2])) == group:
+            if not foreground_pipeline(tty, int(sys.argv[2])):
                 return False
             tty.write(f"Startup file  {destination}\nAdd Wetware to your shell PATH? [y/N] ".encode())
             ready, _, _ = select.select([tty], [], [], 15)
@@ -744,6 +780,7 @@ def configure():
         next_steps()
         return
 
+    current_shell = matches_caller(shell_path)
     if destination and home.is_absolute() and home in destination.parents and ".." not in destination.parts:
         relative = str(destination.relative_to(home))
         name = "~/" + relative
@@ -761,9 +798,10 @@ def configure():
                     # Keep tilde expansion and escape metacharacters in the literal suffix.
                     path = "~/" + re.sub(r"([^A-Za-z0-9_./-])", r"\\\1", relative)
                     reload_command = "." if shell in ("ksh", "ksh93", "mksh") else "source"
-                    print(f"\nTo use ww in this terminal:\n  {reload_command} {path}")
+                    heading = "To use ww in this terminal:" if current_shell else f"In {shell}, run:"
+                    print(f"\n{heading}\n  {reload_command} {path}")
                     print("\nOr open a new terminal.")
-                    next_steps(available=True)
+                    next_steps(available=current_shell)
                 else:
                     print("Open a new terminal to use ww by name.")
                     next_steps()
@@ -777,7 +815,8 @@ def configure():
     else:
         print("Startup files depend on your shell configuration. Choose your own startup file for persistence.")
     immediate = 'export PATH="$HOME/.ww/bin:$PATH"' if command.startswith("case ") else command
-    print("For the current session, run:\n  " + immediate)
+    heading = "For the current session, run:" if current_shell else f"In {shell}, run:"
+    print(f"{heading}\n  {immediate}")
     next_steps()
 
 

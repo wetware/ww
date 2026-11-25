@@ -20,14 +20,14 @@ INSTALLER = Path(__file__).resolve().parents[1] / 'scripts/install.sh'
 PROMPT = b'Add Wetware to your shell PATH? [y/N]'
 
 
-def piped_terminal(environment, answer=None, interactive_caller=True, timeout=5, columns=100):
+def piped_terminal(environment, answer=None, interactive_caller=True, timeout=5, columns=100, caller='/bin/bash'):
     """Pipe INSTALL_TEST into sh with an independent controlling terminal."""
     pid, master = pty.fork()
     if pid == 0:
         fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack('HHHH', 24, columns, 0, 0))
         flag = '-ic' if interactive_caller else '-c'
-        os.execve('/bin/bash', ['bash', '--noprofile', '--norc', flag,
-                                'cat "$INSTALL_TEST" | /bin/sh'], environment)
+        options = ['--noprofile', '--norc'] if caller == '/bin/bash' else ['-f']
+        os.execve(caller, [caller, *options, flag, 'cat "$INSTALL_TEST" | /bin/sh'], environment)
     output = bytearray()
     deadline = time.monotonic() + timeout
     try:
@@ -100,8 +100,16 @@ class InstallerPath(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn('ww-from-test-home', run.stdout)
 
-    def activation(self, output):
-        return output.split('To use ww in this terminal:\n  ', 1)[1].splitlines()[0]
+    def activation(self, output, configured_shell=None):
+        if configured_shell is None:
+            heading = 'To use ww in this terminal:'
+        else:
+            self.assertNotIn('To use ww in this terminal:', output)
+            self.assertNotIn('  ww run', output)
+            self.assertIn('~/.ww/bin/ww run', output)
+            heading = f'In {configured_shell}, run:'
+        self.assertIn(heading, output)
+        return output.split(heading + '\n  ', 1)[1].splitlines()[0]
 
     def test_piped_zsh_opt_in_preserves_bytes_mode_and_repeated_install(self):
         config = self.home / '.zshrc'
@@ -191,7 +199,7 @@ class InstallerPath(unittest.TestCase):
                 output = self.install(SHELL='/bin/' + shell, answer=b'yes\n', **environment)
                 self.assertIn(PROMPT.decode(), output)
                 self.assertIn('.ww/bin', dest.read_text(), output)
-                activation = self.activation(output)
+                activation = self.activation(output, None if shell == 'bash' else shell)
                 self.assertTrue(activation.startswith('source ~/'), activation)
                 self.assert_ww_runs(shell, [*args, activation + '\nww'], **environment)
                 if shell != 'bash':
@@ -225,7 +233,7 @@ class InstallerPath(unittest.TestCase):
                     else:
                         self.assertFalse(other.exists())
 
-                    activation = self.activation(output)
+                    activation = self.activation(output, shell.name)
                     self.assertEqual(activation, 'source ~/' + selected.name)
                     self.assert_ww_runs(str(shell), ['-fc', activation + '\nww'])
 
@@ -238,6 +246,13 @@ class InstallerPath(unittest.TestCase):
                     lines = result.stdout.splitlines()
                     self.assertEqual(lines.count('ww-from-test-home'), 2, result.stderr)
                     self.assertEqual(lines[-2].split(':').count(str(self.bin)), 1)
+
+    def test_login_shell_path_with_misleading_name(self):
+        shell = self.home / 'tcsh'
+        shell.symlink_to('/bin/bash')
+        output = self.install(SHELL=str(shell), answer=b'y\n')
+        self.assertIn('✓ Added ~/.ww/bin to ~/.cshrc', output)
+        self.assertEqual(self.activation(output, 'tcsh'), 'source ~/.cshrc')
 
     def test_unknown_csh_with_tcshrc_uses_manual_guidance(self):
         shell = self.home / 'csh'
@@ -262,7 +277,7 @@ class InstallerPath(unittest.TestCase):
         config.touch(mode=0o600)
         output = self.install(answer=b'y\n')
         self.assertIn(PROMPT.decode(), output)
-        activation = self.activation(output)
+        activation = self.activation(output, 'ksh')
         self.assertEqual(activation, '. ~/.kshrc')
         self.assert_ww_runs('ksh', ['-c', activation + '\nww'])
         self.assertIn('.ww/bin', config.read_text())

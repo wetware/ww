@@ -12,7 +12,7 @@ Wetware installed successfully!
   Release   bafybeid3rced2tilxswelc5qfic7oeeezjtprua6xtw467xfyywwql4fbe
 
 For future sessions, you can add the command below to ~/.zshrc.
-For the current session, run:
+In zsh, run:
   export PATH="$HOME/.ww/bin:$PATH"
 
 Next steps
