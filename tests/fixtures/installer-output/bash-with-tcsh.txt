@@ -1,0 +1,25 @@
+⚗️	Installing Wetware...
+>	Resolving signed release...
+>	Verifying release manifest...
+✓	Release manifest verified
+>	Fetching Host...
+✓	Host verified
+✓	FHS verified
+
+✓ Wetware installed successfully!
+
+  Location  ~/.ww
+  Release   bafybeid3rced2tilxswelc5qfic7oeeezjtprua6xtw467xfyywwql4fbe
+
+Startup file  ~/.cshrc
+Add Wetware to your shell PATH? [y/N] y
+✓ Added ~/.ww/bin to ~/.cshrc
+
+In tcsh, run:
+  source ~/.cshrc
+
+Or open a new terminal.
+
+Next steps
+  ~/.ww/bin/ww run             Start Wetware
+  ~/.ww/bin/ww daemon install  Install as a background service

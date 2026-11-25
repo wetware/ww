@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Run real WASI P3 transport, filesystem and guest cancellation tests on ordinary PRs. Fast Rust also runs the native `system` and `discovery` suites (#823).
+- Show progress during signed release discovery and manifest verification. After
+  PATH setup, show how to use Wetware in the current shell.
 - Report effective Host listener addresses at startup and print `[kernel][INFO] ready` after PID0 commits readiness. JSON logs identify listener announcements with event code 112.
 - Run fixture-independent checks on pushes and pull requests. Full Host, WASI,
   container and five-platform qualification now require an exact-SHA dispatch.
